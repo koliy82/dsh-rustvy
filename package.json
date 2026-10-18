@@ -1,0 +1,70 @@
+{
+  "name": "dsh-rustvy",
+  "version": "1.0.0",
+  "description": "Rustvy for DeepSeek Harness: vendor marks in the model picker, and a model list kept in step with what the provider actually serves — the host half mirrors the catalog and logos to loopback and regenerates the pi-ai route's models from the route's own endpoint, showing the drift before anything is written.",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "icon": "assets/icon.svg",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "harness-plugin",
+    "rustvy",
+    "dsh-rustvy",
+    "model-picker",
+    "model-icons",
+    "model-list",
+    "model-sync",
+    "llm-pi-ai",
+    "vendor-logo",
+    "web-gui",
+    "ui"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Koliy82/dsh-rustvy.git"
+  },
+  "homepage": "https://github.com/Koliy82/dsh-rustvy#readme",
+  "bugs": {
+    "url": "https://github.com/Koliy82/dsh-rustvy/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "lib",
+    "client",
+    "locale",
+    "assets",
+    "cordis.patch.yml",
+    "install.ps1",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepublishOnly": "node scripts/prepublish-check.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+# Зависимости — у пакета их нет в рантайме, это защита от случайной установки
+node_modules/
+
+# Продукты сборки и упаковки
+dist/
+*.tgz
+.npm-cache/
+
+# Логи
+*.log
+npm-debug.log*
+
+# Секреты: ключ не должен попасть в репозиторий, как и зеркало каталога
+.env
+.env.*
+!.env.example
+.credentials.yaml
+
+# Состояние редактора и ОС
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Черновики
+tmp/
+.tmp/
+coverage/
+PUBLISHING.md

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Rustvy">
+  <rect width="64" height="64" rx="14" fill="#5A67D8"/>
+  <g fill="#FFFFFF">
+    <rect x="14" y="15" width="9" height="9" rx="2.5"/>
+    <rect x="14" y="28" width="9" height="9" rx="2.5" opacity="0.82"/>
+    <rect x="14" y="41" width="9" height="9" rx="2.5" opacity="0.64"/>
+  </g>
+  <g fill="#FFFFFF">
+    <rect x="28" y="17.5" width="22" height="4" rx="2" opacity="0.95"/>
+    <rect x="28" y="30.5" width="15" height="4" rx="2" opacity="0.7"/>
+    <rect x="28" y="43.5" width="19" height="4" rx="2" opacity="0.5"/>
+  </g>
+</svg>

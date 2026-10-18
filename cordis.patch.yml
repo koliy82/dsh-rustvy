@@ -1,0 +1,26 @@
+# dsh bundle patch: inserts the Rustvy host half into a profile's layer stack.
+#
+# The row names the package rather than a file inside it, and that is load
+# bearing for two reasons:
+#
+#   - The plugin manager reads a row's display text with `metaOf(row.name, …)`,
+#     which resolves `<specifier>/locale/en.json` and `<specifier>/package.json`
+#     and skips any specifier that is not a bare package name. A row written as
+#     `./lib/live.js` therefore shows up in Settings → Plugins as that path, with
+#     no title, no description and no icon. Naming the package is what makes the
+#     row read "Rustvy".
+#   - A bare specifier resolves through the profile's own module resolution, so
+#     it stays correct on any machine, in any profile, and under any install
+#     method — a file path only works while the loader's base URL happens to be
+#     this package's directory.
+#
+# What naming the package costs: the harness caches one ES module per resolved
+# URL and never evicts that cache for a profile plugin, so the resolved entry
+# (`lib/index.js`, the package main) is read once per process. That entry is a
+# stable bootstrap whose whole job is to import the implementation through a
+# cache-busting `?rev=` query and import it again whenever the files on disk
+# change — so `lib/host.js`, `lib/models.js` and `lib/net.js` still reload live
+# with no restart, and only an edit to the bootstrap itself needs one.
+- insert:
+    - id: dsh-rustvy
+      name: dsh-rustvy
