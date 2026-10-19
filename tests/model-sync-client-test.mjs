@@ -8,36 +8,179 @@ function check(label, ok, detail) {
 }
 
 /* ------------------------------- DOM stub ------------------------------- */
-function element(tag) {
-  return {
+// The key section in the model picker is plain DOM this half owns, so a stub
+// that answers every `querySelectorAll` with `[]` would prove nothing about it.
+// What follows is a small real tree: elements hold children and a parent link,
+// `classList` reads the `class` attribute, and the selector engine understands
+// exactly the shapes this half writes — a tag, `.class`, `[attr]`, `[attr="v"]`
+// and `[attr*="v"]`, comma-separated, matched against descendants or against the
+// ancestor chain for `closest`. Anything else matches nothing, which is the same
+// answer a browser gives for a selector the tree does not contain.
+
+function parseSelector(selector) {
+  return String(selector).split(',').map(part => part.trim()).filter(part => part !== '' && part !== '*').map(part => {
+    const compound = { tag: null, classes: [], attrs: [] }
+    const pattern = /([a-zA-Z][\w-]*)|\.([-\w]+)|\[([-\w]+)(?:([~^$*|]?=)"?([^\]"]*)"?)?\]/gu
+    for (const found of part.matchAll(pattern)) {
+      if (found[1] !== undefined) compound.tag = found[1].toUpperCase()
+      else if (found[2] !== undefined) compound.classes.push(found[2])
+      else compound.attrs.push({ name: found[3], op: found[4], value: found[5] })
+    }
+    return compound
+  })
+}
+
+function matchCompound(node, compound) {
+  if (compound.tag !== null && node.tagName !== compound.tag) return false
+  for (const name of compound.classes) {
+    if (!node.classList.contains(name)) return false
+  }
+  for (const attr of compound.attrs) {
+    const held = node.attributes[attr.name]
+    if (held === undefined || held === null) return false
+    if (attr.op === undefined) continue
+    if (attr.op === '=') { if (String(held) !== attr.value) return false } else if (attr.op === '*=') {
+      if (!String(held).includes(attr.value)) return false
+    } else if (attr.op === '^=') {
+      if (!String(held).startsWith(attr.value)) return false
+    }
+  }
+  return true
+}
+
+function matchesSelector(node, selector) {
+  return parseSelector(selector).some(compound => matchCompound(node, compound))
+}
+
+/** Every descendant in document order, parents before children. */
+function descendants(node, out = []) {
+  for (const child of node.children) {
+    out.push(child)
+    descendants(child, out)
+  }
+  return out
+}
+
+function stubElement(tag) {
+  const node = {
     tagName: String(tag).toUpperCase(),
-    style: {},
+    nodeType: 1,
     children: [],
+    parentNode: null,
     attributes: {},
-    textContent: '',
+    style: { setProperty() {}, removeProperty() {} },
+    /**
+     * `dataset` really writes `data-*` attributes, the way a browser reflects it.
+     * A stub that kept it in a separate object would let the code under test
+     * believe it had marked a row when nothing an inspector — or a CSS selector,
+     * or this test — could see had been written.
+     */
+    get dataset() {
+      const owner = this
+      const nameOf = key => `data-${String(key).replace(/[A-Z]/gu, letter => `-${letter.toLowerCase()}`)}`
+      return new Proxy({}, {
+        get: (_target, key) => (typeof key === 'string' ? owner.attributes[nameOf(key)] : undefined),
+        set: (_target, key, value) => { owner.setAttribute(nameOf(key), value); return true },
+        has: (_target, key) => owner.attributes[nameOf(key)] !== undefined,
+        deleteProperty: (_target, key) => { owner.removeAttribute(nameOf(key)); return true },
+        ownKeys: () => Object.keys(owner.attributes).filter(name => name.startsWith('data-')),
+        getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }),
+      })
+    },
+    listeners: {},
     value: '',
-    setAttribute(k, v) { this.attributes[k] = v },
-    removeAttribute(k) { delete this.attributes[k] },
-    appendChild(node) { this.children.push(node); return node },
-    remove() {},
+    innerHTML: '',
+    type: undefined,
+    title: undefined,
+    get classList() {
+      const names = String(this.attributes.class ?? '').split(/\s+/u).filter(name => name !== '')
+      return {
+        contains: name => names.includes(name),
+        add: name => { if (!names.includes(name)) this.setAttribute('class', [...names, name].join(' ')) },
+        remove: name => this.setAttribute('class', names.filter(held => held !== name).join(' ')),
+      }
+    },
+    get className() { return String(this.attributes.class ?? '') },
+    set className(value) { this.setAttribute('class', value) },
+    get firstChild() { return this.children[0] ?? null },
+    get nextElementSibling() {
+      const held = this.parentNode?.children ?? []
+      return held[held.indexOf(this) + 1] ?? null
+    },
+    contains(other) { return other === this || descendants(this).includes(other) },
+    get textContent() {
+      return this.children.map(child => (child.nodeType === 3 ? child.text : child.textContent)).join('') + (this._text ?? '')
+    },
+    set textContent(value) { this.children = []; this._text = String(value) },
+    setAttribute(name, value) { this.attributes[name] = String(value) },
+    getAttribute(name) { return this.attributes[name] ?? null },
+    removeAttribute(name) { delete this.attributes[name] },
+    hasAttribute(name) { return this.attributes[name] !== undefined },
+    matches(selector) { return matchesSelector(this, selector) },
+    closest(selector) {
+      for (let node2 = this; node2 !== null && node2 !== undefined; node2 = node2.parentNode) {
+        if (node2.nodeType === 1 && matchesSelector(node2, selector)) return node2
+      }
+      return null
+    },
+    querySelectorAll(selector) { return descendants(this).filter(node2 => matchesSelector(node2, selector)) },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null },
+    appendChild(child) {
+      child.parentNode?.children.splice(child.parentNode.children.indexOf(child), 1)
+      child.parentNode = this
+      this.children.push(child)
+      return child
+    },
+    insertBefore(child, ref) {
+      child.parentNode?.children.splice(child.parentNode.children.indexOf(child), 1)
+      child.parentNode = this
+      const at = ref === null || ref === undefined ? -1 : this.children.indexOf(ref)
+      if (at < 0) this.children.push(child)
+      else this.children.splice(at, 0, child)
+      return child
+    },
+    remove() {
+      const held = this.parentNode?.children ?? []
+      const at = held.indexOf(this)
+      if (at >= 0) held.splice(at, 1)
+      this.parentNode = null
+    },
     select() {},
     blur() {},
-    querySelectorAll() { return [] },
-    addEventListener() {},
-    removeEventListener() {},
+    focus() {},
+    addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn) },
+    removeEventListener(type, fn) {
+      const held = this.listeners[type] ?? []
+      const at = held.indexOf(fn)
+      if (at >= 0) held.splice(at, 1)
+    },
+    /** Run this node's own handlers for one type, with a minimal event object. */
+    fire(type, extra = {}) {
+      const event = { type, target: this, preventDefault() {}, stopPropagation() {}, ...extra }
+      for (const fn of [...(this.listeners[type] ?? [])]) fn(event)
+      return event
+    },
   }
+  return node
 }
-const documentStub = {
-  head: element('head'),
-  documentElement: element('html'),
-  body: element('body'),
-  createElement: element,
-  createTextNode: text => ({ text }),
-  getElementById: () => null,
-  querySelectorAll: () => [],
-  addEventListener() {},
-  removeEventListener() {},
-  execCommand: () => true,
+
+const textNode = text => ({ nodeType: 3, text: String(text), textContent: String(text), children: [], parentNode: null, remove() {} })
+
+const documentStub = stubElement('html')
+documentStub.head = stubElement('head')
+documentStub.body = stubElement('body')
+documentStub.documentElement = documentStub
+documentStub.createElement = stubElement
+documentStub.createTextNode = textNode
+documentStub.getElementById = () => null
+documentStub.appendChild(documentStub.head)
+documentStub.appendChild(documentStub.body)
+
+/** Every listener registered on one target, so a test can fire a document event. */
+function fireOn(target, type) {
+  const event = { type, target, preventDefault() {}, stopPropagation() {} }
+  for (const fn of [...(target.listeners[type] ?? [])]) fn(event)
+  return event
 }
 const YAML_TEXT = '- id: llm-pi-ai\n  name: "@deepseek-ai/dsh-llm-pi-ai"\n  config:\n    providers:\n      rustvy:\n        models:\n          - id: ahmia-v7-pro\n            name: Ahmia 7 Pro\n'
 const requests = []
@@ -92,12 +235,108 @@ const STATE = {
 }
 globalThis.document = documentStub
 globalThis.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return [] } }
+
+/* --------------------------- API-key fixtures --------------------------- */
+// Exactly the shape `docs/api-keys.md` specifies, plus the fields the host half
+// added on top of it: never a value, only a mask and a fingerprint, and per key
+// the route it owns, whether that route is in the profile, how many models it
+// serves and how many chats chose it.
+const KEY_ONE = {
+  id: 'k1', label: 'Основной', ref: 'RUSTVY_API_KEY', route: 'rustvy', displayName: 'rustvy',
+  primary: true, present: true, installed: true, models: 12, masked: 'sk-…f8', fingerprint: '9f2c1a7b',
+  createdAt: '2026-10-19T15:00:00.000Z', sessions: 3,
+}
+const KEY_TWO = {
+  id: 'k2', label: 'Второй', ref: 'RUSTVY_API_KEY_2', route: 'rustvy-k2', displayName: 'rustvy · ключ 2',
+  primary: false, present: true, installed: true, models: 12, masked: 'sk-…12', fingerprint: '4b7e0d31',
+  createdAt: '2026-10-19T16:00:00.000Z', sessions: 1,
+}
+const KEYS_FIXTURE = {
+  ok: true, enabled: true, credentials: true, editor: true,
+  route: 'rustvy', entryId: 'llm-pi-ai', baseURL: 'https://rustvy.xyz/v1',
+  packageName: '@deepseek-ai/dsh-llm-pi-ai', modelsUrl: 'https://rustvy.xyz/v1/models',
+  maxKeys: 12,
+  defaultKeyId: 'k1', keys: [KEY_ONE, KEY_TWO],
+  hiddenGroups: ['rustvy · ключ 2', 'rustvy · ключ 3'],
+  routes: { missing: [], stale: [] },
+  routing: { seen: 7, applied: 5 },
+  fallback: null,
+  picks: 1,
+  paths: { keys: 'C:\\profile\\.dsh-rustvy\\keys.json', picks: 'C:\\profile\\.dsh-rustvy\\session-keys.json' },
+  error: null,
+}
+let KEYS = structuredClone(KEYS_FIXTURE)
+/** `sessionId → keyId`, the host's own map; `null` means "the default". */
+const SESSION_KEYS = { 's-1': null }
+/** `'ok'`, or `'missing'` to answer 404 with an empty body like an older host half. */
+let KEYS_MODE = 'ok'
+
+/** One host-side key mutation, answered with a fresh list plus the result field. */
+function mutateKeys(body) {
+  const find = id => KEYS.keys.find(key => key.id === id)
+  if (body.action === 'add') {
+    const id = `k${KEYS.keys.length + 1}`
+    KEYS.keys.push({
+      ...KEY_TWO, id, sessions: 0, primary: false,
+      label: body.label === '' || body.label === undefined ? undefined : body.label,
+      ref: `RUSTVY_API_KEY_${id.slice(1)}`,
+      route: `rustvy-${id}`,
+      displayName: `rustvy · ${id}`,
+      masked: 'sk-…00',
+    })
+    return { ...KEYS, added: id }
+  }
+  if (body.action === 'remove') {
+    if (find(body.id)?.primary === true) {
+      return { ok: false, error: 'основной ключ не удаляется: он владеет маршрутом профиля' }
+    }
+    KEYS.keys = KEYS.keys.filter(key => key.id !== body.id)
+    return { ...KEYS, removed: body.id }
+  }
+  if (body.action === 'rename') {
+    const target = find(body.id)
+    if (target !== undefined) target.label = body.label
+    return { ...KEYS, updated: body.id }
+  }
+  if (body.action === 'set') return { ...KEYS, updated: body.id }
+  if (body.action === 'repair') {
+    // What the host does: rewrite the routes it is missing, then answer with a
+    // list in which every key is installed and nothing is missing.
+    for (const key of KEYS.keys) key.installed = true
+    KEYS.routes = { missing: [], stale: KEYS.routes?.stale ?? [] }
+    return { ...KEYS, repaired: true }
+  }
+  if (body.action === 'default') {
+    KEYS.defaultKeyId = body.id
+    return { ...KEYS, defaultKeyId: body.id }
+  }
+  if (body.action === 'test') {
+    return body.id === 'k2'
+      ? { ...KEYS, test: { id: body.id, ok: false, status: 401, models: 0, error: 'ключ отклонён провайдером' } }
+      : { ...KEYS, test: { id: body.id, ok: true, status: 200, models: 12, error: null } }
+  }
+  return { ok: false, error: `неизвестное действие ${body.action}` }
+}
+
+const json = payload => ({ ok: true, status: 200, json: async () => payload })
+
 // Node 24 exposes a read-only `navigator` with no clipboard, so `copyText` takes
 // its textarea + execCommand branch here — which is the path worth exercising,
 // since it is the one a page without clipboard permission has to survive.
+const windowListeners = {}
 globalThis.window = {
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(type, fn) { (windowListeners[type] ??= []).push(fn) },
+  removeEventListener(type, fn) {
+    const held = windowListeners[type] ?? []
+    const at = held.indexOf(fn)
+    if (at >= 0) held.splice(at, 1)
+  },
+  // Real, because the settings page and the composer agree through this event: a
+  // stub that swallowed it would hide the only sync the two surfaces have.
+  dispatchEvent(event) {
+    for (const fn of [...(windowListeners[event.type] ?? [])]) fn(event)
+    return true
+  },
   __ModuleLoader__: { load: descriptor => { globalThis.__descriptor = descriptor } },
 }
 globalThis.fetch = async (url, init = {}) => {
@@ -105,6 +344,37 @@ globalThis.fetch = async (url, init = {}) => {
   const method = (init.method ?? 'GET').toUpperCase()
   requests.push({ path, method, body: init.body })
   if (path.includes('/models.yaml')) return { ok: true, status: 200, text: async () => YAML_TEXT }
+  if (/^\/dsh-rustvy\/(keys|session-key)/u.test(path) && KEYS_MODE === 'missing') {
+    return { ok: false, status: 404, json: async () => { throw new Error('no body') } }
+  }
+  if (path.startsWith('/dsh-rustvy/keys')) {
+    if (method === 'GET') return json(KEYS)
+    return json(mutateKeys(JSON.parse(init.body ?? '{}')))
+  }
+  if (path.startsWith('/dsh-rustvy/session-key')) {
+    if (method === 'GET') {
+      const sessionId = new URL(path, 'http://local').searchParams.get('sessionId')
+      return json({
+        ok: true, sessionId, keyId: SESSION_KEYS[sessionId] ?? null,
+        keys: KEYS.keys, hiddenGroups: KEYS.hiddenGroups,
+        enabled: KEYS.enabled, credentials: KEYS.credentials,
+      })
+    }
+    const body = JSON.parse(init.body ?? '{}')
+    SESSION_KEYS[body.sessionId] = body.keyId ?? null
+    return json({
+      ok: true, sessionId: body.sessionId, keyId: body.keyId ?? null,
+      keys: KEYS.keys, hiddenGroups: KEYS.hiddenGroups,
+    })
+  }
+  // `/config` really is the same store `/keys` reads `enabled` from: a fixture
+  // that accepted the write and then kept reporting the old value would let the
+  // switch appear to work while proving nothing.
+  if (path.endsWith('/config') && method === 'POST') {
+    const body = JSON.parse(init.body ?? '{}')
+    if (body.apiKeys !== undefined) KEYS.enabled = body.apiKeys !== false
+    return json(STATE)
+  }
   const payload = path.endsWith('/apply-models')
     ? { ok: true, applied: true, count: 12, plan: STATE.modelSync }
     : path.endsWith('/revert-models')
@@ -112,8 +382,9 @@ globalThis.fetch = async (url, init = {}) => {
       : path.endsWith('/catalog.json')
         ? { ok: true, enabled: true, config: STATE.config, records: [], count: 27, logos: 12 }
         : STATE
-  return { ok: true, status: 200, json: async () => payload }
+  return json(payload)
 }
+documentStub.execCommand = () => true
 
 /* --------------------- mini React, one hook store per component ---------- */
 // Keyed by component type plus its occurrence index within one render, not by a
@@ -164,18 +435,33 @@ check('the bundle registered itself', descriptor?.id === 'dsh-rustvy', String(de
 const loaded = descriptor.factory(name => (name === 'react' ? React : undefined))
 check('the factory returned a plugin', loaded?.name === 'dsh-rustvy' && typeof loaded.apply === 'function')
 
+// One registration per slot, because this half now fills two: the settings
+// section and the composer's key switch. Keyed by what the harness keys it by.
+const registrations = []
 let renderPage = null
-let sectionLabel = null
+let renderKeyControl = null
 const disposers = []
 loaded.apply({
   effect: fn => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose) },
   slots: {
     inject: (_name, fn) => { fn() },
-    register: (registered, render) => { renderPage = render; sectionLabel = registered.label(); return () => {} },
+    register: (registered, render) => {
+      registrations.push({ ...registered, render })
+      if (registered.name === 'settings.section') renderPage = render
+      if (registered.id === 'rustvy-key') renderKeyControl = render
+      return () => {}
+    },
   },
 })
+const sectionLabel = registrations.find(item => item.name === 'settings.section')?.label()
+const keySlot = registrations.find(item => item.id === 'rustvy-key')
 check('the settings page was registered', typeof renderPage === 'function')
 check('the settings section is named Rustvy', sectionLabel === 'Rustvy', String(sectionLabel))
+check('the composer key switch was registered', typeof renderKeyControl === 'function')
+check('the key switch sits in the composer tool row',
+  keySlot?.name === 'conversation.input.left' && keySlot?.order === 60,
+  `${String(keySlot?.name)}@${String(keySlot?.order)}`)
+check('the key switch has its own label', keySlot?.label?.() === 'API-ключ', String(keySlot?.label?.()))
 
 /* ------------------------------ tree walking ---------------------------- */
 function textOf(node, out = []) {
@@ -199,17 +485,38 @@ function collect(node, type) {
 function findButton(node, label) {
   return collect(node, 'button').find(item => allText(item).includes(label))
 }
-async function settle() { for (let i = 0; i < 8; i++) await new Promise(resolve => setTimeout(resolve, 0)) }
+/**
+ * One turn of the event loop, which is what drains the promise chains a fetch
+ * answer arrives on.
+ *
+ * `setImmediate` rather than `setTimeout(0)`: both yield a full turn, but a zero
+ * timer is clamped to the platform's clock granularity — about 15 ms on Windows —
+ * and eight of them per render pass made this suite spend 15 s waiting on the
+ * harness instead of exercising the code. Where there is no `setImmediate`, a
+ * timer is still correct, only slower.
+ *
+ * One consequence worth knowing: a pass no longer advances the 16 ms frame the
+ * decorator coalesces mutations into. Nothing here relies on that — the two
+ * helpers that drive the decorator wait on a real timer of their own.
+ */
+const yieldTurn = typeof setImmediate === 'function'
+  ? () => new Promise(resolve => setImmediate(resolve))
+  : () => new Promise(resolve => setTimeout(resolve, 0))
+
+async function settle() { for (let i = 0; i < 8; i++) await yieldTurn() }
 
 /**
- * One render pass. Effects are drained here, the way React runs them after the
- * paint: a field that follows the host's answer does so through an effect, so a
- * stub that never runs them reports the pre-effect value and hides exactly the
- * re-sync this page depends on.
+ * One render pass of one component. Effects are drained here, the way React runs
+ * them after the paint: a field that follows the host's answer does so through an
+ * effect, so a stub that never runs them reports the pre-effect value and hides
+ * exactly the re-sync this page depends on.
+ *
+ * @param component - the slot's render function.
+ * @param props - the standard props the slot hands it, if any.
  */
-function render() {
+function renderComponent(component, props) {
   occurrences = new Map()
-  const tree = renderPage()
+  const tree = component(props ?? {})
   for (const fn of effects.splice(0)) {
     try {
       const dispose = fn()
@@ -219,15 +526,19 @@ function render() {
   return tree
 }
 
+function render() { return renderComponent(renderPage) }
+
 /** Render until the effects of the previous pass have settled into the tree. */
-async function view() {
+async function viewComponent(component, props) {
   let tree
   for (let pass = 0; pass < 3; pass++) {
-    tree = render()
+    tree = renderComponent(component, props)
     await settle()
   }
   return tree
 }
+
+async function view() { return viewComponent(renderPage) }
 
 /* ------------------------------- rendering ------------------------------ */
 effects = []
@@ -267,7 +578,7 @@ check('the mark size is editable', numbers.length === 1 && numbers[0].props.valu
 check('both dropdowns render', selects.length === 2, String(selects.length))
 check('auto-apply defaults to explicit', selects[0]?.props.value === 'explicit', String(selects[0]?.props.value))
 check('the name source defaults to the provider label', selects[1]?.props.value === 'displayName', String(selects[1]?.props.value))
-check('six switches render', boxes.length === 6, String(boxes.length))
+check('seven switches render', boxes.length === 7, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -338,8 +649,497 @@ await settle()
 check('the revert was posted', requests.some(r => r.path.endsWith('/revert-models')))
 check('the revert notice carries the restored moment', allText(await view()).includes('откачен'))
 
+/* ------------------------------- API keys ------------------------------- */
+// The three surfaces share one state, so they are driven in the order a user
+// meets them: the settings page adds a key, the composer picks one for a chat,
+// and the picker offers the same choice where the effort levels are.
+const SECRET = 'sk-test-value-do-not-leak'
+
+/** One labelled field of a rendered tree, found the way a user finds it. */
+function fieldOf(node, label) {
+  return collect(node, 'input').find(item => item.props['aria-label'] === label)
+}
+
+/** Every button whose whole text is one label. */
+function buttonsNamed(node, label) {
+  return collect(node, 'button').filter(item => allText(item) === label)
+}
+
+/**
+ * The key labels on the page.
+ *
+ * Read from the fields rather than from the text: a label is rendered as an
+ * editable field's `value`, and `allText` only collects children — so a test that
+ * looked for it in the text would pass on a page that showed no labels at all.
+ */
+function labelsOf(node) {
+  return collect(node, 'input').filter(item => item.props.type === 'text').map(item => item.props.value)
+}
+
+tree = await view()
+text = allText(tree)
+check('the settings page names the keys section', text.includes('API-ключи'))
+check('the key list is read from the host route',
+  requests.some(item => item.path === '/dsh-rustvy/keys' && item.method === 'GET'),
+  JSON.stringify(requests.map(item => item.path).slice(-4)))
+check('both keys of the fixture are listed',
+  labelsOf(tree).includes('Основной') && labelsOf(tree).includes('Второй'),
+  labelsOf(tree).join('|'))
+check('a key is shown by mask, ref, route and chat count',
+  text.includes('sk-…f8') && text.includes('RUSTVY_API_KEY')
+  && text.includes('маршрут rustvy') && text.includes('чатов: 3'))
+check('the primary key explains why it cannot be deleted', text.includes('Основной ключ не удаляется'))
+check('only the keys that may go offer a delete button',
+  buttonsNamed(tree, 'Удалить').length === KEYS.keys.filter(key => key.primary !== true).length,
+  String(buttonsNamed(tree, 'Удалить').length))
+check('the key that is already default offers no "make default" button',
+  buttonsNamed(tree, 'По умолчанию').length === KEYS.keys.length - 1,
+  String(buttonsNamed(tree, 'По умолчанию').length))
+
+// --- the "+" form ----------------------------------------------------------
+check('no value field exists before "+" is pressed', fieldOf(tree, 'значение ключа') === undefined)
+findButton(tree, '+').props.onClick()
+await settle()
+tree = await view()
+check('"+" opens the inline add form', fieldOf(tree, 'значение ключа') !== undefined)
+check('the add form takes a label, a submit and a cancel',
+  fieldOf(tree, 'название ключа') !== undefined
+  && findButton(tree, 'Добавить') !== undefined
+  && findButton(tree, 'Отмена') !== undefined)
+check('the value is masked until it is asked for', fieldOf(tree, 'значение ключа').props.type === 'password')
+findButton(tree, 'показать').props.onClick()
+tree = render()
+check('the value can be shown and hidden again',
+  fieldOf(tree, 'значение ключа').props.type === 'text' && findButton(tree, 'скрыть') !== undefined)
+
+fieldOf(tree, 'название ключа').props.onChange({ target: { value: 'Рабочий' } })
+fieldOf(tree, 'значение ключа').props.onChange({ target: { value: SECRET } })
+tree = render()
+requests.length = 0
+findButton(tree, 'Добавить').props.onClick()
+await settle()
+const addRequest = requests.find(item => item.path === '/dsh-rustvy/keys' && item.method === 'POST')
+check('the add was posted to /keys', addRequest !== undefined, JSON.stringify(requests.map(item => item.path)))
+const addBody = JSON.parse(addRequest.body)
+check('the add body carries the action, the value and the label',
+  addBody.action === 'add' && addBody.key === SECRET && addBody.label === 'Рабочий',
+  JSON.stringify({ ...addBody, key: '…' }))
+check('no request carries the value in its URL', requests.every(item => !String(item.path).includes(SECRET)))
+tree = await view()
+check('the added key is listed', labelsOf(tree).includes('Рабочий'), labelsOf(tree).join('|'))
+check('the form closed and the typed value is gone from the page',
+  fieldOf(tree, 'значение ключа') === undefined && !allText(tree).includes(SECRET))
+check('the notice names the route the new key got', allText(tree).includes('маршрут rustvy-k3'))
+
+// --- rename on blur --------------------------------------------------------
+requests.length = 0
+const renameField = collect(tree, 'input').find(item => item.props.type === 'text' && item.props.value === 'Второй')
+check('every key label is editable', renameField !== undefined)
+renameField.props.onFocus()
+renameField.props.onChange({ target: { value: 'Запасной' } })
+tree = render()
+collect(tree, 'input').find(item => item.props.value === 'Запасной').props.onBlur()
+await settle()
+check('renaming on blur posts the rename action',
+  requests.some(item => item.method === 'POST' && JSON.parse(item.body ?? '{}').action === 'rename'
+    && JSON.parse(item.body).label === 'Запасной'),
+  JSON.stringify(requests.filter(item => item.method === 'POST').map(item => item.body)))
+
+// --- checking a key --------------------------------------------------------
+tree = await view()
+requests.length = 0
+check('every key can be checked', buttonsNamed(tree, 'Проверить').length === KEYS.keys.length,
+  String(buttonsNamed(tree, 'Проверить').length))
+buttonsNamed(tree, 'Проверить')[0].props.onClick()
+await settle()
+tree = await view()
+check('"Проверить" posts the test action',
+  requests.some(item => item.method === 'POST' && JSON.parse(item.body ?? '{}').action === 'test'))
+check('a key that answers reports its status and model count',
+  allText(tree).includes('HTTP 200') && allText(tree).includes('моделей 12'))
+buttonsNamed(tree, 'Проверить')[1].props.onClick()
+await settle()
+tree = await view()
+check('a key the provider rejects reports the rejection', allText(tree).includes('ключ отклонён провайдером'))
+
+// --- the default key -------------------------------------------------------
+tree = await view()
+requests.length = 0
+buttonsNamed(tree, 'По умолчанию')[0].props.onClick()
+await settle()
+check('"По умолчанию" posts the default action for that key',
+  requests.some(item => item.method === 'POST' && JSON.parse(item.body ?? '{}').action === 'default'
+    && JSON.parse(item.body).id === 'k2'),
+  JSON.stringify(requests.filter(item => item.method === 'POST').map(item => item.body)))
+tree = await view()
+check('the section says which key is now the default', allText(tree).includes('Ключ по умолчанию — «Запасной»'))
+
+// --- deleting a key --------------------------------------------------------
+tree = await view()
+requests.length = 0
+buttonsNamed(tree, 'Удалить')[0].props.onClick()
+tree = render()
+check('delete asks before it acts',
+  findButton(tree, 'Удалить навсегда') !== undefined && findButton(tree, 'Отмена') !== undefined)
+findButton(tree, 'Удалить навсегда').props.onClick()
+await settle()
+check('the confirmed delete posts the remove action',
+  requests.some(item => item.method === 'POST' && JSON.parse(item.body ?? '{}').action === 'remove'
+    && JSON.parse(item.body).id === 'k2'),
+  JSON.stringify(requests.filter(item => item.method === 'POST').map(item => item.body)))
+tree = await view()
+check('the deleted key is gone from the list', !allText(tree).includes('Запасной'))
+check('the delete notice says where its chats now point', allText(tree).includes('основным'))
+
+// --- a host that cannot take a key ----------------------------------------
+KEYS.credentials = false
+tree = await view()
+check('a host without credentials explains itself', allText(tree).includes('credentials'))
+check('the "+" button is disabled without credentials', findButton(tree, '+').props.disabled === true)
+KEYS.credentials = true
+tree = await view()
+check('the "+" button comes back with the capability', findButton(tree, '+').props.disabled === false)
+
+KEYS_MODE = 'missing'
+tree = await view()
+text = allText(tree)
+check('an older host half is named as the reason', text.includes('устарела') && text.includes('/keys'))
+check('no key is listed without the host route', !text.includes('sk-…f8'))
+check('the "+" button is disabled without the host route', findButton(tree, '+').props.disabled === true)
+
+KEYS_MODE = 'ok'
+KEYS = structuredClone(KEYS_FIXTURE)
+SESSION_KEYS['s-1'] = null
+tree = await view()
+check('the key list comes back with the host route',
+  labelsOf(tree).includes('Основной') && labelsOf(tree).includes('Второй'), labelsOf(tree).join('|'))
+
+// --- the fields the host half added on top of the contract ----------------
+text = allText(tree)
+check('the master switch for the ring is offered',
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 7
+  && text.includes('Ключи на несколько чатов'))
+check('the key count is shown against the limit', text.includes('2 из 12'))
+check('each key reports how many models its route serves', text.includes('моделей: 12'))
+check('the substitution counters are shown', text.includes('запросов через подмену') && text.includes('5 из 7'))
+check('the chats with a pick of their own are counted',
+  text.includes('чатов со своим ключом') && text.includes('1'))
+check('both key files are shown as copyable paths',
+  text.includes('C:\\profile\\.dsh-rustvy\\keys.json')
+  && text.includes('C:\\profile\\.dsh-rustvy\\session-keys.json'))
+check('no repair is offered while every route is written', findButton(tree, 'Починить маршруты') === undefined)
+
+requests.length = 0
+const ringSwitch = collect(tree, 'input').filter(item => item.props.type === 'checkbox')[6]
+check('the master switch reads the host answer', ringSwitch.props.checked === true)
+ringSwitch.props.onChange({ target: { checked: false } })
+await settle()
+check('the master switch posts the config field',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).apiKeys === false),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+tree = await view()
+check('the ring explains that it is off, and offers the switch back',
+  allText(tree).includes('Ключи выключены') && findButton(tree, '+').props.disabled === true)
+collect(tree, 'input').filter(item => item.props.type === 'checkbox')[6].props.onChange({ target: { checked: true } })
+await settle()
+tree = await view()
+check('the ring comes back on', findButton(tree, '+').props.disabled === false)
+
+// A route the profile lost: the key says so, and the section offers to rewrite it.
+KEYS = structuredClone(KEYS_FIXTURE)
+KEYS.keys[1].installed = false
+KEYS.routes = { missing: ['rustvy-k2'], stale: ['rustvy-k2'] }
+KEYS.fallback = {
+  at: '2026-10-19T18:00:00.000Z', sessionId: 's-9', keyId: 'k2', keyLabel: 'Второй',
+  route: 'rustvy-k2', provider: 'rustvy', model: 'claude-opus-5-5',
+  reason: 'в маршруте нет этой модели',
+}
+tree = await view()
+text = allText(tree)
+check('a key whose route is missing says so', text.includes('маршрут не записан'))
+check('the missing route is listed and can be repaired',
+  text.includes('rustvy-k2') && findButton(tree, 'Починить маршруты') !== undefined)
+check('a stale model list points at the button that writes it',
+  text.includes('список моделей устарел') && text.includes('Записать список моделей'))
+check('a request that missed its key is warned about',
+  text.includes('не смог уйти своим ключом') && text.includes('в маршруте нет этой модели')
+  && text.includes('«Второй»') && text.includes('s-9'), text.slice(0, 0))
+requests.length = 0
+findButton(tree, 'Починить маршруты').props.onClick()
+await settle()
+check('"Починить маршруты" posts the repair action',
+  requests.some(item => item.method === 'POST' && JSON.parse(item.body ?? '{}').action === 'repair'),
+  JSON.stringify(requests.filter(item => item.method === 'POST').map(item => item.body)))
+
+// The host holds twelve keys; the thirteenth is refused before it is typed.
+KEYS = structuredClone(KEYS_FIXTURE)
+KEYS.maxKeys = 2
+tree = await view()
+check('the "+" is disabled at the limit', findButton(tree, '+').props.disabled === true)
+check('the limit is explained', allText(tree).includes('Достигнут предел: 2 ключей'))
+KEYS = structuredClone(KEYS_FIXTURE)
+tree = await view()
+check('the "+" returns below the limit', findButton(tree, '+').props.disabled === false)
+
+/* -------------------------- the composer switch -------------------------- */
+check('the switch renders nothing without a session',
+  allText(await viewComponent(renderKeyControl, {})) === '')
+
+let keyTree = await viewComponent(renderKeyControl, { sessionId: 's-1' })
+check('the switch reads the session choice from the host',
+  requests.some(item => item.path.includes('/session-key?sessionId=s-1')),
+  JSON.stringify(requests.map(item => item.path).slice(-3)))
+check('the switch names the key this chat sends with',
+  allText(keyTree).includes('ключ по умолчанию'), allText(keyTree))
+
+const keyButton = collect(keyTree, 'button').find(item => /dmi-keybtn/u.test(String(item.props.className ?? '')))
+check('the switch is a compact control with a popup', keyButton?.props['aria-haspopup'] === 'true')
+keyButton.props.onClick()
+await settle()
+keyTree = await viewComponent(renderKeyControl, { sessionId: 's-1' })
+const popupRows = collect(keyTree, 'button').filter(item => /dmi-keypop-row/u.test(String(item.props.className ?? '')))
+check('the popup lists every key plus the default and the "+"',
+  popupRows.length === KEYS.keys.length + 2, String(popupRows.length))
+check('the popup offers to add a key', allText(keyTree).includes('+ Добавить ключ'))
+check('the active key carries the tick',
+  popupRows.filter(item => item.props['data-dmi-active'] === '1').length === 1,
+  String(popupRows.filter(item => item.props['data-dmi-active'] === '1').length))
+
+requests.length = 0
+popupRows[1].props.onClick()
+await settle()
+const choiceRequest = requests.find(item => item.path === '/dsh-rustvy/session-key' && item.method === 'POST')
+check('picking a key posts to /session-key', choiceRequest !== undefined, JSON.stringify(requests.map(item => item.path)))
+const choiceBody = JSON.parse(choiceRequest.body)
+check('the choice carries this session and that key',
+  choiceBody.sessionId === 's-1' && choiceBody.keyId === 'k2', JSON.stringify(choiceBody))
+keyTree = await viewComponent(renderKeyControl, { sessionId: 's-1' })
+check('the switch now names the chosen key', allText(keyTree).includes('Второй'), allText(keyTree))
+
+/* --------------------------- the picker section -------------------------- */
+/**
+ * A picker menu in the shape the host's own bundle renders it: a portal child
+ * `div[role="menu"]` whose classes match `_groups`, holding provider groups of
+ * `button[role="menuitemradio"]` rows with `_optionCopy > _modelName` and a
+ * trailing `_check`.
+ *
+ * Both group shapes are present on purpose, because the header cannot be matched
+ * by class — the primitives package that renders it is a frozen platform module —
+ * so the hiding has to work from structure alone: once as a header inside a group
+ * wrapper, once as a bare header followed by its rows as siblings.
+ */
+function buildPickerMenu() {
+  const menu = documentStub.createElement('div')
+  menu.setAttribute('role', 'menu')
+  menu.setAttribute('aria-label', 'Модели')
+  menu.setAttribute('class', 'ms_groups scrollable')
+
+  const modelRow = (model, parent) => {
+    const row = documentStub.createElement('button')
+    row.setAttribute('role', 'menuitemradio')
+    row.setAttribute('aria-checked', 'false')
+    row.setAttribute('class', 'ms_option ms_modelOption')
+    row.setAttribute('title', model)
+    const copy = documentStub.createElement('span')
+    copy.setAttribute('class', 'ms_optionCopy')
+    const name = documentStub.createElement('span')
+    name.setAttribute('class', 'ms_modelName')
+    name.textContent = model
+    copy.appendChild(name)
+    row.appendChild(copy)
+    const check = documentStub.createElement('span')
+    check.setAttribute('class', 'ms_check')
+    row.appendChild(check)
+    parent.appendChild(row)
+    return row
+  }
+
+  const wrappedGroup = (label, models) => {
+    const box = documentStub.createElement('div')
+    box.setAttribute('class', 'ms_group')
+    const head = documentStub.createElement('div')
+    head.setAttribute('class', 'ms_groupLabel')
+    head.textContent = label
+    box.appendChild(head)
+    for (const model of models) modelRow(model, box)
+    menu.appendChild(box)
+    return box
+  }
+
+  const flatGroup = (label, models) => {
+    const head = documentStub.createElement('div')
+    head.setAttribute('class', 'ms_stickyHeader')
+    head.textContent = label
+    menu.appendChild(head)
+    for (const model of models) modelRow(model, menu)
+    return head
+  }
+
+  wrappedGroup('rustvy', ['claude-opus-5-5', 'gpt-5'])
+  wrappedGroup('rustvy · ключ 3', ['gpt-5'])
+  flatGroup('rustvy · ключ 2', ['claude-opus-5-5'])
+  documentStub.body.appendChild(menu)
+  return menu
+}
+
+/** Fire a document event, then wait out the frame the pass is coalesced into. */
+async function pass() {
+  fireOn(documentStub, 'pointerdown')
+  await new Promise(resolve => setTimeout(resolve, 40))
+}
+
+/**
+ * Make the shared state follow the fixture again, then repaint.
+ *
+ * Swapping the fixture under a running plugin is not something a user can do, and
+ * since the read throttle landed it is no longer something an idle interaction does
+ * either — so the test forces a read the way a deliberate open would, and only
+ * then lets the decorator paint what it learned.
+ */
+async function refreshKeys() {
+  renderComponent(renderKeyControl, { sessionId: 's-1' })
+  await settle()
+  await pass()
+}
+
+const menu = buildPickerMenu()
+const keyBoxes = () => menu.querySelectorAll('[data-dmi-keys]')
+const keyRowsOf = () => menu.querySelectorAll('[data-dmi-key-row]')
+const hiddenOf = () => menu.querySelectorAll('.dmi-hidden-group')
+/** The host's own rows: a key row borrows their markup, so shape alone cannot tell them apart. */
+const hostRows = () => menu.querySelectorAll('[role="menuitemradio"]')
+  .filter(row => row.closest('[data-dmi-keys]') === null)
+const visibleModels = () => hostRows()
+  .filter(row => !row.classList.contains('dmi-hidden-group') && !row.closest('.dmi-hidden-group'))
+  .map(row => row.attributes.title)
+
+await pass()
+check('the picker menu grew a key section', keyBoxes().length === 1, String(keyBoxes().length))
+check('the section is headed «API-ключ»', keyBoxes()[0]?.textContent.includes('API-ключ') === true)
+check('the section has one row per key', keyRowsOf().length === KEYS.keys.length, String(keyRowsOf().length))
+check('the section is appended after the last group',
+  menu.children[menu.children.length - 1]?.hasAttribute('data-dmi-keys') === true)
+check('a key row mirrors the host row markup',
+  keyRowsOf().every(row => row.tagName === 'BUTTON'
+    && row.attributes.role === 'menuitemradio'
+    && row.querySelector('[class*="_optionCopy"]') !== null
+    && row.querySelector('.dmi-key-check') !== null))
+check('a key row borrows the host row classes, so it inherits the menu geometry',
+  keyRowsOf().every(row => /ms_modelOption/u.test(row.className) && row.attributes['data-dmi-borrowed'] === '1'),
+  keyRowsOf().map(row => row.className).join(' | '))
+check('the row of the chosen key is marked active',
+  keyRowsOf().filter(row => row.attributes['data-dmi-active'] === '1').length === 1
+  && keyRowsOf().find(row => row.attributes['data-dmi-active'] === '1')?.attributes['data-dmi-key-row'] === 'k2',
+  keyRowsOf().map(row => `${row.attributes['data-dmi-key-row']}=${row.attributes['data-dmi-active'] ?? '-'}`).join(' '))
+// Two of the three groups are per-key clones: one wrapped, one flat. The wrapped
+// one is hidden as a single group element, the flat one as a header plus its rows.
+check('both clone groups are hidden, in either shape', hiddenOf().length === 3, String(hiddenOf().length))
+check('the group the user picks from keeps every model',
+  visibleModels().join('|') === 'claude-opus-5-5|gpt-5', visibleModels().join('|'))
+
+await pass()
+check('a second pass leaves the section alone', keyBoxes().length === 1 && keyRowsOf().length === KEYS.keys.length)
+check('a second pass leaves the hidden groups alone', hiddenOf().length === 3)
+
+requests.length = 0
+keyRowsOf().find(row => row.attributes['data-dmi-key-row'] === 'k1').fire('click')
+await settle()
+const pickerChoice = requests.find(item => item.path === '/dsh-rustvy/session-key' && item.method === 'POST')
+check('a picker row posts the same choice', pickerChoice !== undefined, JSON.stringify(requests.map(item => item.path)))
+check('the picker row posts it for the composer session',
+  JSON.parse(pickerChoice.body).sessionId === 's-1' && JSON.parse(pickerChoice.body).keyId === 'k1',
+  String(pickerChoice?.body))
+await pass()
+check('the tick moved to the row that was clicked',
+  keyRowsOf().find(row => row.attributes['data-dmi-active'] === '1')?.attributes['data-dmi-key-row'] === 'k1',
+  keyRowsOf().map(row => `${row.attributes['data-dmi-key-row']}=${row.attributes['data-dmi-active'] ?? '-'}`).join(' '))
+check('the menu is still open, so the click did not bubble to the host',
+  menu.parentNode === documentStub.body && keyBoxes().length === 1)
+
+// One key is no choice, so the section goes away rather than showing a single row.
+KEYS = structuredClone(KEYS_FIXTURE)
+KEYS.keys = [KEYS_FIXTURE.keys[0]]
+KEYS.hiddenGroups = []
+await refreshKeys()
+check('one key draws no section at all', keyBoxes().length === 0, String(keyBoxes().length))
+check('hiding nothing restores every group', hiddenOf().length === 0)
+KEYS = structuredClone(KEYS_FIXTURE)
+await refreshKeys()
+check('the section returns when a second key exists', keyBoxes().length === 1 && keyRowsOf().length === 2)
+
+// The `/model` popup is a card rather than a menu, and a card is too common a
+// shape to trust on its own: it qualifies only when it holds model names.
+const popup = documentStub.createElement('div')
+popup.setAttribute('class', 'cmd_card')
+for (const model of ['claude-opus-5-5', 'gpt-5']) {
+  const row = documentStub.createElement('div')
+  row.setAttribute('class', 'cmd_row')
+  const name = documentStub.createElement('span')
+  name.setAttribute('class', 'cmd_labelText')
+  name.textContent = model
+  row.appendChild(name)
+  popup.appendChild(row)
+}
+documentStub.body.appendChild(popup)
+const plainCard = documentStub.createElement('div')
+plainCard.setAttribute('class', 'set_card')
+plainCard.appendChild(documentStub.createElement('span'))
+documentStub.body.appendChild(plainCard)
+await pass()
+check('the /model popup grows the same section',
+  popup.querySelectorAll('[data-dmi-key-row]').length === KEYS.keys.length,
+  String(popup.querySelectorAll('[data-dmi-key-row]').length))
+check('a card with no model names is left alone', plainCard.querySelectorAll('[data-dmi-keys]').length === 0)
+
+// --- the interaction throttle ---------------------------------------------
+// Every pointerdown and focusin in the whole application reaches this half, and
+// each read costs the host a credential resolve per key — so an interaction
+// re-reads only once the answer it already holds has gone stale, while a
+// deliberate open always reads.
+const sessionReads = () => requests
+  .filter(item => item.path.startsWith('/dsh-rustvy/session-key') && item.method === 'GET').length
+
+/** One full interaction with the page: the press, and the focus it moves. */
+async function interact() {
+  fireOn(documentStub, 'pointerdown')
+  fireOn(documentStub, 'focusin')
+  await new Promise(resolve => setTimeout(resolve, 40))
+}
+
+await new Promise(resolve => setTimeout(resolve, 2100))
+requests.length = 0
+await interact()
+await interact()
+check('two interactions in a row cost one key read', sessionReads() === 1, String(sessionReads()))
+
+requests.length = 0
+keyTree = renderComponent(renderKeyControl, { sessionId: 's-1' })
+await settle()
+check('a deliberate open still forces a read', sessionReads() === 1, String(sessionReads()))
+
+requests.length = 0
+await interact()
+await interact()
+check('and the interactions after it are throttled again', sessionReads() === 0, String(sessionReads()))
+
+// A mutation's answer is itself a fresh list, so it must not be followed by a read.
+requests.length = 0
+keyRowsOf().find(row => row.attributes['data-dmi-key-row'] === 'k2').fire('click')
+await settle()
+const afterChoice = requests.filter(item => item.path.startsWith('/dsh-rustvy/session-key'))
+check('a choice costs one POST and no follow-up read',
+  afterChoice.length === 1 && afterChoice[0].method === 'POST',
+  JSON.stringify(afterChoice.map(item => `${item.method} ${item.path}`)))
+await interact()
+check('the next interaction is throttled by the answer that POST brought home',
+  sessionReads() === 0, String(sessionReads()))
+
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)
+check('unload took the key section with it', menu.querySelectorAll('[data-dmi-keys]').length === 0)
+check('unload took the popup section with it', popup.querySelectorAll('[data-dmi-keys]').length === 0)
+check('unload took the marks with it', menu.querySelectorAll('.dmi-mark').length === 0)
+check('unload left no hidden group behind', menu.querySelectorAll('.dmi-hidden-group').length === 0)
 
 const failed = results.filter(ok => !ok).length
 console.log(`\n${results.length - failed}/${results.length} passed`)

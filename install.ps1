@@ -88,3 +88,6 @@ Write-Host '  2. Open the model menu: each row now carries its vendor mark, and 
 Write-Host '     the composer button of the model that is selected.'
 Write-Host '  3. Settings -> Rustvy shows what the mirror holds, what the provider serves,'
 Write-Host '     and the drift between the two; it writes the route''s model list on request.'
+Write-Host '  4. Settings -> Rustvy -> API keys adds another provider key with "+": the value'
+Write-Host '     goes to the harness credential store, the route is cloned for it, and the'
+Write-Host '     model picker then lets each chat pick the key it sends requests with.'

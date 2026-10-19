@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Rustvy",
-    "description": "Vendor marks in the model picker and a model list kept in step with the provider: mirrors the catalog and logos to loopback, and regenerates the pi-ai route's models from the provider's own endpoint, with the drift shown before anything is written"
+    "description": "Vendor marks in the model picker, a model list kept in step with the provider, and a ring of API keys: mirrors the catalog and logos to loopback, regenerates the pi-ai route's models from the provider's own endpoint with the drift shown before anything is written, and lets each chat send its requests with a key of its own — the value kept in the harness credential store, not in the plugin's files"
   }
 }

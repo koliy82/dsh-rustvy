@@ -153,7 +153,7 @@ const entry = manifest.main ?? 'lib/index.js'
 check('the main entry exists', existsSync(join(ROOT, entry)), String(entry))
 // The bootstrap re-imports these through a cache-busting query, so a renamed or
 // missing one is a plugin that loads and then silently stops reloading.
-for (const module of ['lib/host.js', 'lib/models.js', 'lib/net.js']) {
+for (const module of ['lib/host.js', 'lib/models.js', 'lib/keys.js', 'lib/net.js']) {
   check(`${module} exists`, existsSync(join(ROOT, module)))
 }
 check('the client bundle exists', existsSync(join(ROOT, 'client/client.js')))
@@ -161,7 +161,7 @@ check('no leftover duplicate entry ships', !existsSync(join(ROOT, 'lib/live.js')
   existsSync(join(ROOT, 'lib/live.js')) ? 'the loader row no longer names it' : '')
 
 // The pure mapping module can be imported without touching the network, which
-// makes it the one real smoke test available at publish time.
+// makes it a real smoke test available at publish time.
 try {
   const models = await import(`file://${join(ROOT, 'lib/models.js').replace(/\\/g, '/')}`)
   const expected = ['mirrorRecord', 'normalizeServedList', 'buildModelEntries', 'diffModels', 'servedFromCatalog', 'routePatchYaml', 'yamlScalar', 'yamlLines', 'reasoningEffortsOf']
@@ -177,6 +177,49 @@ try {
   check('the YAML emitter still produces a patch row', emitted.startsWith('- id: llm-pi-ai\n') && emitted.includes('off: null'), emitted.split('\n')[0])
 } catch (error) {
   check('lib/models.js imports', false, error.message)
+}
+
+// The ring's arithmetic is pure too, and it owns the one property the whole key
+// feature rests on: a second key's route is a *clone* of the profile's route, and
+// the route the profile declares is left alone. Both are cheap to assert here and
+// impossible to notice in a tarball that installs cleanly.
+try {
+  const keys = await import(`file://${join(ROOT, 'lib/keys.js').replace(/\\/g, '/')}`)
+  const expected = ['checkKeyValue', 'maskKey', 'keyFingerprint', 'normalizeLabel', 'refFor', 'routeFor',
+    'displayNameFor', 'emptyRing', 'readRing', 'writeRing', 'withPrimaryKey', 'newKeyEntry',
+    'keyProviderProfile', 'isRingRoute', 'syncRingRoutes', 'routesToSync', 'readPicks', 'writePicks',
+    'pickCounts', 'describeKey']
+  const missing = expected.filter(name => typeof keys[name] !== 'function')
+  check('lib/keys.js exports its whole surface', missing.length === 0, missing.join(', '))
+  check('lib/keys.js exports its key limit', Number.isFinite(keys.MAX_KEYS) && keys.MAX_KEYS > 1, String(keys.MAX_KEYS))
+
+  const base = {
+    displayName: 'rustvy', apiKeyEnv: 'RUSTVY_API_KEY', api: 'openai-completions',
+    baseURL: 'https://rustvy.xyz/v1', models: [{ id: 'x', name: 'X', maxTokens: 8 }],
+  }
+  const ring = keys.withPrimaryKey(keys.emptyRing(), base, 'rustvy')
+  check('the primary key is the route the profile declares',
+    ring.keys.length === 1 && ring.keys[0].primary === true && ring.keys[0].route === 'rustvy'
+    && ring.keys[0].ref === 'RUSTVY_API_KEY', JSON.stringify(ring.keys[0]))
+  const entry = keys.newKeyEntry(ring, { baseRef: base.apiKeyEnv, baseRoute: 'rustvy', label: 'Second' })
+  const synced = keys.syncRingRoutes({ rustvy: base }, { ...ring, keys: [...ring.keys, entry] }, 'rustvy')
+  const clone = synced.providers[entry.route]
+  check('a second key is named by its ordinal', entry.route === 'rustvy-k2' && entry.ref === 'RUSTVY_API_KEY_2',
+    `${entry.route} / ${entry.ref}`)
+  check('its clone keeps the endpoint, the protocol and the model list',
+    clone?.baseURL === base.baseURL && clone?.api === base.api
+    && JSON.stringify(clone?.models) === JSON.stringify(base.models))
+  check('the clone carries its own reference and the base route is untouched',
+    clone?.apiKeyEnv === entry.ref && synced.providers.rustvy.apiKeyEnv === base.apiKeyEnv
+    && synced.providers.rustvy.displayName === base.displayName)
+  check('a foreign provider is never claimed as a clone',
+    keys.isRingRoute('deepseek-account', { apiKeyEnv: 'DEEPSEEK_API_KEY' }, 'rustvy', new Set([entry.ref])) === false
+    && keys.isRingRoute(entry.route, clone, 'rustvy', new Set([entry.ref])) === true)
+  check('a masked key is not a usable key',
+    keys.maskKey('sk-live-secret-01') === 'sk-…01' && !keys.maskKey('sk-live-secret-01').includes('secret'),
+    keys.maskKey('sk-live-secret-01'))
+} catch (error) {
+  check('lib/keys.js imports', false, error.message)
 }
 
 /* --------------------------------- readme --------------------------------- */

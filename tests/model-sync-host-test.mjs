@@ -26,7 +26,7 @@ if (existsSync(seed)) {
 }
 process.env.DSH_PROFILE_DIR = PROFILE
 
-const { start } = await import('../lib/host.js')
+const { start, build } = await import('../lib/host.js')
 
 // The route exactly as the profile has it installed today.
 const installedModels = [
@@ -121,7 +121,7 @@ function check(label, ok, detail) {
 // --- state -----------------------------------------------------------------
 const state = await call('GET', '/dsh-rustvy/state')
 check('GET /state answers 200', state.status === 200, `status ${state.status}`)
-check('/state reports build rustvy-1', state.json?.build === 'rustvy-1', String(state.json?.build))
+check(`/state reports build ${build}`, state.json?.build === build, String(state.json?.build))
 check('/state carries a modelSync block', typeof state.json?.modelSync === 'object', JSON.stringify(Object.keys(state.json?.modelSync ?? {})))
 check('/state modelSync sees the route', state.json?.modelSync?.route === 'rustvy', String(state.json?.modelSync?.route))
 check('/state modelSync finds the entry', state.json?.modelSync?.entryId === 'llm-pi-ai', String(state.json?.modelSync?.entryId))

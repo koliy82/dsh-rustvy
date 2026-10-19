@@ -11,12 +11,15 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-blueviolet)](https://github.com/topics/dsh-plugin)
 
-Vendor marks in the DeepSeek Harness model picker, and a model list that stays as
-current as the provider's own — one plugin, one mirror, no restarts.
+Vendor marks in the DeepSeek Harness model picker, a model list that stays as
+current as the provider's own, and several provider keys in one profile — each
+chat sending its requests with the one its user picked. One plugin, one mirror, no
+restarts.
 
 ## What it does
 
-It has two jobs, and they share one mirror of the provider's public catalog.
+It has three jobs. The first two share one mirror of the provider's public catalog;
+the third needs no mirror at all, only the profile's route.
 
 **Marks.** One monochrome vendor mark before every model row in the picker, drawn
 the way the provider's own dashboard draws it: a CSS mask filled by
@@ -39,6 +42,18 @@ time. This plugin reads what the route's own endpoint serves, turns it into that
 adapter's exact entry shape, shows the difference against what is installed, and
 writes it back through `ctx.configEditor` when asked.
 
+**Keys.** Several provider keys in one profile, and a key of its own for any one
+chat — chosen where a reasoning level is chosen. A key is added inside the plugin,
+with a **«+»** button: no `.env`, no `cordis.patch.yml` and no trip to the Models
+page, and the choice survives a restart. The built-in DeepSeek account is
+untouched: the substitution only ever applies to this plugin's own routes.
+
+| Surface | What appears |
+|---|---|
+| **Settings → Rustvy** | an «API-ключи» section: the key list, a **«+»** button, and per key — replace the value, rename, test, make default, delete |
+| The composer, beside the model button | a compact switch for this chat's key, with a menu and a **«+ Добавить ключ»** row |
+| The model menu and the `/model` popup | an «API-ключ» section at the bottom of the menu: one row per key, ticked on the active one |
+
 ## Why you would want it
 
 Because the two failure modes of a hand-maintained provider route are both
@@ -57,6 +72,15 @@ And because the marks come from the same mirror, a brand-new model arrives with
 its vendor's own mark already cached — the mirror re-reads the catalog the moment
 the endpoint names a model it has never seen, which is exactly when a release
 lands.
+
+The third job answers a different kind of quiet. A provider key is its own limit
+and its own billing, and a profile is one, so "a key per chat" without the plugin
+means either a second profile or a second row in YAML that somebody has to maintain
+by hand. A hand-maintained clone of a route goes stale on exactly the same schedule
+as a hand-written model list — the day of a release. The ring writes its clones
+itself, in the same pass that writes the model list, so a key's route cannot lag
+behind the profile's route and a chat sending with another key sees the same choice
+of models as its neighbour.
 
 Nothing here is specific to one provider. The origin, the route and the profile
 row are all settings; `https://rustvy.xyz` and `rustvy` are defaults.
@@ -145,6 +169,12 @@ provider serves, and the exact drift between them. **Обновить катал
 refreshes both halves; **Записать список моделей** writes the generated list.
 Nothing is written without one of those, unless you ask for it in the settings.
 
+The **«API-ключи»** section on the same page holds the ring: the **«+»** button
+opens an inline "label + value" form, and each key's row offers a value
+replacement, a rename, making it the default, a test and a delete. None of that is
+required, though — the composer's switch and the picker's own section do the same
+thing for whichever chat is open, without leaving the conversation.
+
 ## Settings
 
 **Settings → Rustvy**
@@ -185,6 +215,20 @@ transcribing a summary.
 One field has no control because it belongs in a profile's YAML rather than a
 form: `modelZones` (default `["standard"]`), the catalog zones admitted when the
 endpoint is unreachable and the mirror decides membership instead.
+
+Keys:
+
+| Control | Default | Meaning |
+|---|---|---|
+| Ключи на несколько чатов | on | master switch for the ring; off applies no substitution at all, and every request goes out on the profile's route |
+
+Turning it off deletes nothing: the key routes stay in the profile's
+configuration, the values stay in the credential store and the chats' picks stay in
+their own file, so turning it back on resumes exactly where it left off. The switch
+lives in the «API-ключи» section rather than beside the mark and model-list
+switches, because it belongs to the ring — and that section is also where the page
+says why adding a key is unavailable, when the host offers no service to add one
+with.
 
 Stored in `<profile>\.dsh-rustvy\config.json`. Two environment variables
 override it, for a deployment that points the mirror elsewhere or wants the
@@ -268,7 +312,10 @@ pinned unsupported by the adapter, and a declared `off` with no wire value means
 An empty list is never written: the only way to get one is a failed read, and a
 route with no models serves nothing. An up-to-date list is not written either,
 because `configEditor.edit()` reconciles the whole loader and spending one on a
-no-op would reload a live profile for nothing. Every write keeps the previous
+no-op would reload a live profile for nothing. Up to date means more than the base
+route, though: a write is spent when the base is current but one of the key ring's
+clones has fallen behind, because otherwise a chat sending with another key would
+see fewer models than its neighbour. Every write keeps the previous
 document in `<profile>\.dsh-rustvy\models-backup.json`, and
 **Откатить к предыдущему** puts it back — the state a revert displaces becomes the
 next backup, so a revert is itself revertible.
@@ -296,6 +343,183 @@ of a blank box: a mask whose URL 404s would otherwise paint a solid square.
 Effort rows, provider headings, the menu's root cells, the search field and
 catalog-failure rows are matched by nothing and stay bare.
 
+## The API-key ring
+
+Several provider keys in one profile, and each chat sending its requests with the
+one its user picked. The choice lives beside the model and reasoning-level
+choices, applies to a single chat, and survives a restart. The built-in DeepSeek
+account is untouched by anything in this section.
+
+### Why one key is one route
+
+`@deepseek-ai/dsh-llm-pi-ai` takes its key from `profile.apiKeyEnv` — a *name*, not
+a value — and resolves it through the harness credential service on every request,
+caching nothing. Neither the call configuration (`LlmCallConfig`) nor the generate
+options (`GenerateOptions`) has a field for a key, and `baseURL` and the headers are
+baked into the profile snapshot. There is no way to hand the adapter a key "for this
+request", so the only honest way to give a chat another key is another route: a clone
+with the same `api`, the same `baseURL` and the same `models`, and its own
+`apiKeyEnv`.
+
+Everything else follows. Adding a key writes the value into the credential store
+under a new reference, clones the profile's route through `ctx.configEditor`, and
+records an entry in the ring. A chat's pick is applied on the `agent/request`
+waterfall by renaming the provider in the call configuration — the same device, on
+the same seam, that the harness uses to apply a per-chat model choice, so it works
+wherever the model choice already works and opens no second path to a request.
+
+| Key | Credential reference | Route | Route display name |
+|---|---|---|---|
+| first (primary) | `RUSTVY_API_KEY` — as the profile declares it | `rustvy` — as the profile declares it | `rustvy` |
+| second | `RUSTVY_API_KEY_2` | `rustvy-k2` | `rustvy · <the key's label>` |
+| n-th | `RUSTVY_API_KEY_<n>` | `rustvy-k<n>` | `rustvy · <the key's label>` |
+
+The names are built from the route in the settings rather than hard-coded: with
+`modelRoute: rustvy` the second key gets `rustvy-k2`, and with another route name it
+gets that route's suffixes. A clone copies the route profile whole and changes only
+`apiKeyEnv` and the display name, so a hand-written wire-compatibility switch — and
+everything else the profile author knows about their gateway — carries into every
+key instead of being lost the first time one is added.
+
+The limit is 12 keys: this is a ring, not a registry. A new key takes the first
+ordinal whose credential reference and route are both free, so a removed key's
+reference is never reused and a foreign row that happens to sit on such a name is
+never overwritten.
+
+### The primary key
+
+The ring's first key is not an entry somebody added but the route the profile
+already declares: it inherits that route's `apiKeyEnv` and its name, and it stays
+primary always. A profile that worked before this feature keeps working unchanged —
+a ring of one key renames nothing and writes nowhere. The primary key cannot be
+deleted: it belongs to the profile's route, and removing it would not remove a key,
+it would break the provider for every chat, including the ones that never used the
+ring. The refusal says exactly that and offers a value replacement instead, which
+every key has and which touches no configuration, because the reference name does
+not move.
+
+### Where things live
+
+| What | Where |
+|---|---|
+| Key values | `$DSH_HOME\.credentials.yaml`, `refs` — the same store the harness Models page writes and the same one the adapter reads |
+| The ring's metadata | `<profile>\.dsh-rustvy\keys.json` — `id`, label, credential reference, route, primary flag, ordinal, creation date, and `defaultKeyId` |
+| Per-chat picks | `<profile>\.dsh-rustvy\session-keys.json` — `sessionId → keyId` |
+
+No file of this plugin ever holds a key value: not `keys.json`, not
+`session-keys.json`, not the settings, not the profile backup a revert reads. The
+loopback routes answer with a mask — the first three and the last two characters —
+and an eight-character SHA-256 fingerprint, which is enough to recognise a key in a
+list and to notice two entries holding the same one, and not enough to use it. The
+value itself travels in the body of the single request that adds or replaces it, and
+never in a query string: a URL is logged, cached and kept in a browser's history,
+and a secret is none of those things' business.
+
+The picks live on disk rather than in the session log: this is a routing preference
+of the plugin's own, and a plugin that wrote its events into a durable log would
+leave them behind in every session it was ever mounted in. Only deviations from the
+default key are stored, so a chat created before the default changed follows the new
+one instead of holding on to the old.
+
+### What the interface shows
+
+Three surfaces, and two of them appear only when there is something to choose: with
+one key neither the menu section nor the composer button is drawn at all, because
+one key is not a choice.
+
+**Settings → Rustvy → «API-ключи».** The key list: label, mask, credential
+reference, route, how many models that route serves, and how many chats picked it.
+The **«+»** button in the section's header row opens an inline "label + value" form
+with a masked field and a show/hide toggle. Each row offers a value replacement, a
+rename (committed on blur), making it the default, a test and a two-step delete; the
+primary key has no delete button, and its row says why. Below is a «Маршруты
+ключей» block: the profile row and its package, the listing address, the
+"requests through the substitution" counter, the number of chats with a pick of
+their own, the missing and stale route lists, copyable paths to both files, and a
+**«Починить маршруты»** button that appears only when some key's route really has
+gone.
+
+**The composer.** A compact button beside the model button, in the
+`conversation.input.left` slot: the active key's label, or "ключ по умолчанию" when
+the chat has no pick of its own. Its menu holds one row per key with a tick on the
+active one, a "По умолчанию" row, and a **«+ Добавить ключ»** row with the same
+inline form; a key added from inside a conversation is chosen for that conversation
+straight away, because adding one from there is done in order to send with it. The
+button renders nothing until the slot has handed it a `sessionId`: the choice belongs
+to a chat, and a switch that saved it for the wrong one is worse than no switch.
+
+**The model menu and the `/model` popup.** A separator, an «API-ключ» header and one
+row per key at the bottom of the menu, ticked on the effective one and annotated
+"основной" or "по умолчанию". The rows are this half's own rather than the host's, so
+a repaint of the menu removes them and the observer puts them back — the same device
+the marks use. Provider groups named in `hiddenGroups` are hidden together with their
+rows, so one model list is not repeated once per key: a clone is a key, not a
+provider. A group header is hidden only when it can be identified with confidence (a
+container with `role="group"` and an `aria-label`, or a group-heading element); when
+none is found nothing is hidden, because a model row hidden by mistake is a choice
+taken away, while a duplicate group shown is only a repetition.
+
+### What adding a key does
+
+The order is deliberate. The value goes into the credential store first: a route
+whose reference resolves to nothing fails every request that names it. The
+configuration write comes second, and if it fails the value is taken back out, so a
+failed add leaves nothing behind. The ring document is written last, once both exist.
+
+That configuration write is a real and supported one: it goes through
+`ctx.configEditor`, which reconciles the profile, and it is exactly what the harness
+Models page does when a provider is added. `configEditor.edit()` reconciles the whole
+loader, so the ring's writes are queued: two keys added at once are two edits in
+turn, never two edits against a document the other had just replaced. And when the
+provider map already matches the ring, no write happens at all — spending a
+reconciliation on a no-op is the same thing this plugin refuses to do with the model
+list.
+
+A key can be tested without sending a request with it: the test does a
+`GET {baseURL}/models` with that key alone and reports the status, the number of
+models served, and the provider's own error text as it came.
+
+### How narrow the substitution is
+
+It changes exactly one field of the call configuration — the route name — and only
+when all of the following hold:
+
+1. the feature is on (`apiKeys`);
+2. the request carries a session id — with none there is no chat to choose for;
+3. the ring holds two keys or more;
+4. the key in force for that chat — its own pick, or the default when it has none —
+   is not the primary one;
+5. the request was already going to one of this ring's own routes (`rustvy`,
+   `rustvy-k*`);
+6. the target route is installed in the profile;
+7. the target route serves the requested model.
+
+Otherwise the configuration is returned as it came. `deepseek-account` and any other
+provider — a second gateway, a neighbouring row, somebody's hand-written route with a
+key — is never renamed: condition five asks whether the route belongs to the ring,
+not whether it looks like one.
+
+A clone that has gone or that does not serve the model does not fail the step: the
+request goes out on the profile's route and the reason is written down. It is in the
+`fallback` field of `GET /keys` — the settings page draws it as a warning above the
+key list — and in a log line that does not repeat while the reason stays the same.
+The reasoning is that a key route which is not ready is a configuration problem, and
+the right answer to it is a request that succeeded plus a visible reason, not a step
+that failed with nothing said about why. An exception inside the substitution itself
+is caught, and the request goes on as it was going.
+
+The model list is written in one pass over every route the ring owns — the base and
+each clone the ring can see in the profile — so a clone cannot lag behind the base,
+and the pasteable block (`/models.yaml`) carries the clones with their credential
+references, so whoever would rather put the row into `cordis.patch.yml` by hand is
+not reconstructing them from a description.
+
+Two counters on `GET /keys` answer the question that would otherwise present as
+"the keys do not work": `routing.seen` is how many requests the harness put through
+the `agent/request` waterfall at all, and `routing.applied` how many of them were
+renamed to a key's route. A zero under live traffic means the waterfall never
+reaches the plugin, and that is visible at once.
+
 ## Routes
 
 One prefix registration on the harness's own web server. Plugin routes are not
@@ -309,11 +533,13 @@ loopback only, a loopback `Host`, a same-origin `Sec-Fetch-Site` and a matching
 | `/dsh-rustvy/logo/<name>.svg` | GET, HEAD | one cached logo, fetched from the origin on first ask; `404` when the origin has no such mark, `400` for any name that is not `[A-Za-z0-9._-]+.svg` |
 | `/dsh-rustvy/models.json` | GET | the generated model list and its drift against the installed one; `?cached=1` reports the last computed plan instead of reading the endpoint again |
 | `/dsh-rustvy/models.yaml` | GET, HEAD | the same list as a paste-ready `cordis.patch.yml` row; `?cached=1` as above |
-| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path, last error, and the last computed drift. Never makes a request of its own |
+| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path, last error, the last computed drift, and a key-ring summary. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks |
 | `/dsh-rustvy/refresh` | POST | re-read the catalog, re-warm every logo it names, and report — or, when the write mode allows it, apply — the model list |
 | `/dsh-rustvy/apply-models` | POST | write the generated list into the route profile through `ctx.configEditor` |
 | `/dsh-rustvy/revert-models` | POST | put the backed-up route profile back |
 | `/dsh-rustvy/config` | POST | write settings; never touches the network |
+| `/dsh-rustvy/keys` | GET, POST | GET: the whole ring — keys with a mask and a fingerprint, the default key, the hidden provider groups, the missing and stale routes, the substitution counters, the last refusal, both file paths, and whether `credentials` and `configEditor` are available. POST: one action on the ring (`add`, `set`, `rename`, `default`, `remove`, `repair`, `test`); a success answers with a fresh GET plus the action's own field, so one POST repaints everything. A refusal is `409` with `{ ok: false, error }`, an unknown action `400`. A key value is accepted in the body only |
+| `/dsh-rustvy/session-key` | GET, POST | GET with `?sessionId=`: which key this chat sends its requests with (`keyId`), whether the choice is its own (`picked`), and the whole `GET /keys` answer besides; `400` without an id. POST `{ sessionId, keyId }` records the choice and answers with the same payload; `keyId: null` returns the chat to the default key |
 
 ## No restarts
 
@@ -321,8 +547,8 @@ The host half reloads itself, the same way `dsh-proxy-gui` does: the loader row
 names this package, whose entry imports the implementation through a
 cache-busting `?rev=` query, and a one-second poll of the `lib` directory disposes
 the previous revision and starts the next one once a changed fingerprint repeats.
-`lib/host.js`, `lib/models.js` and `lib/net.js` therefore reload live; only an
-edit to the entry bootstrap itself needs a restart. The browser half arrives in an
+`lib/host.js`, `lib/models.js`, `lib/keys.js` and `lib/net.js` therefore reload
+live; only an edit to the entry bootstrap itself needs a restart. The browser half arrives in an
 open page through the harness's own live plugin composition; a page refresh works
 too.
 
@@ -332,7 +558,7 @@ restart to show.
 
 ## Requirements and degradation
 
-Verified against dsh `0.2.0-rc.2`. The package declares no `engines.dsh` and no
+Verified against dsh `0.2.1-rc.2`. The package declares no `engines.dsh` and no
 peer dependency, because it imports no `@deepseek-ai/*` module at all — it has
 zero runtime dependencies, and a host requirement it has not tested would only
 produce false incompatibility warnings in the market.
@@ -345,25 +571,30 @@ Each capability degrades on its own:
 | a `dsh-llm-pi-ai` route | marks still work; the model-list half reports that no route was found |
 | the origin | the on-disk cache serves every mark and every model it holds |
 | the endpoint, catalog present | the island decides membership, and the page says so |
+| `credentials` | there is nowhere to put a key value: the ring stays at its one primary key, adding is unavailable, and the «API-ключи» section names the reason instead of showing a form that would fail |
+| `configEditor` — for the ring | an existing key's value can still be replaced, but a new key's route cannot be added: the add form is disabled and the section says why |
+| a key route lost to a hand edit of `cordis.patch.yml` or to a model-list revert | the key stays in the ring, its route is listed under `routes.missing`, that chat's requests go out on the profile's route with a visible reason, and **«Починить маршруты»** (`{ action: 'repair' }`) writes the ring's routes again |
 
 ## Layout
 
 | File | Role |
 |---|---|
 | `lib/index.js` | stable loader entry; owns the reload loop |
-| `lib/host.js` | routes, catalog mirror, logo cache, model sync, settings |
+| `lib/host.js` | routes, catalog mirror, logo cache, model sync, the key ring and its `agent/request` substitution, settings |
 | `lib/models.js` | pure mapping: what an origin publishes → one route-profile entry, the drift between two lists, and the YAML for a manual edit |
+| `lib/keys.js` | pure ring arithmetic: labels, credential-reference and route names, the ring and pick documents, and reconciling a provider map with the ring |
 | `lib/net.js` | one outbound GET on the process's route, then the environment's proxy |
-| `client/client.js` | hand-authored browser bundle: the decorator and the settings page |
+| `client/client.js` | hand-authored browser bundle: the decorator, the settings page, the composer's key switch and the picker's key section |
 | `locale/en.json`, `ru.json`, `zh.json` | the plugins-menu title and description |
 | `assets/icon.svg` | the plugins-menu icon |
 | `cordis.patch.yml` | the loader row the profile's bundle list pulls in |
 | `install.ps1` | install into a profile |
 | `scripts/prepublish-check.mjs` | the publish gate: everything that can install fine and still be wrong |
-| `tests/` | the mapping, the YAML emitter, and the host and browser halves |
+| `tests/` | the mapping, the YAML emitter, the key ring, and the host and browser halves |
 
-`lib/models.js` is deliberately pure — no network, no filesystem, no Cordis — so
-the mapping can be checked against a real origin's answer without mounting
+`lib/models.js` and `lib/keys.js` are deliberately pure — no network, no
+filesystem, no Cordis — so the mapping can be checked against a real origin's
+answer, and the ring arithmetic against an invented profile, without mounting
 anything. `lib/host.js` owns everything with a lifetime, and is what a reload
 replaces.
 
@@ -373,6 +604,7 @@ replaces.
 node tests\models-check.mjs              # pure mapping: live origin -> entries, drift, schema audit
 node tests\yaml-roundtrip-test.mjs       # emitter vs two real YAML parsers, against a real route row
 node tests\model-sync-host-test.mjs      # host: fake webServer + configEditor, real origin fetch
+node tests\api-keys-host-test.mjs        # the key ring: fake credentials, configEditor and event bus, no network
 node tests\model-sync-client-test.mjs    # browser: mini-React + stubbed DOM, fixture /state
 node scripts\prepublish-check.mjs        # the publish gate
 ```
@@ -409,6 +641,26 @@ backup lands on disk; a second apply is a no-op that does not touch the config;
 retired models and their `compat`; and `403` for a non-loopback peer, `405` for a
 wrong method.
 
+`api-keys-host-test.mjs` is 84 assertions over the same host half, with a fake
+credential store, a fake `configEditor` and a fake event bus, and no network at all:
+the route's endpoint points at a closed port, so both the model-listing read and a
+key test fail deterministically, and the mirrored island decides membership instead.
+It asserts the substitution: a picked key renames the route while the model, the
+reasoning effort and the output cap survive unchanged; a chat with no pick keeps the
+profile's route; `deepseek-account` and a neighbouring route with somebody else's key
+are never renamed; a request with no session is left alone; a model the clone does not
+serve keeps the request on the base route and lands in `fallback`; a chat with no pick
+follows the default key, and `keyId: null` returns it there. It asserts the refusals:
+an empty key, a key with a space, an unknown action (`400`), removal of the primary
+key (`409`). It asserts a removal: the clone route goes, the neighbour and the base
+route survive, the stored value is unset, the picks of that key are dropped, and the
+chat keeps using the base route afterwards. And it asserts the writes and the
+counters: one add spends exactly one configuration edit, replacing a value spends
+none, a model-list write covers the clone and keeps its own reference, the pasteable
+block carries the clone, `repair` puts a lost route back, `keys.json` holds no secret,
+a dispose releases both the route and the listener, and with the feature off nothing
+is renamed.
+
 The client test renders the settings page with a mini-React whose hook cells are
 keyed per component instance, and asserts: the section is named Rustvy; the three
 outbound addresses are real links that open outside the app; every file path is
@@ -419,14 +671,30 @@ the write button is enabled while drift exists, disabled once current, and disab
 when the host offers no editor; revert stays disabled until a backup exists; and
 each mutation posts to the right route and reports what actually moved.
 
+The same test draws the key ring: the «API-ключи» section with its list, masks,
+rename-on-blur, inline **«+»** form, test, make-default and two-step delete; an
+explanation for every refusal — no `credentials`, an out-of-date host half, the
+feature switched off — and the capability coming back once the reason is gone; the
+«Ключи на несколько чатов» switch, reading the host's answer and posting its own
+field to `/config`; the «Маршруты ключей» block with the substitution counters, the
+chats with a pick of their own, both file paths, the missing and stale routes and the
+**«Починить маршруты»** button; the limit of 12 keys; the composer's switch, which
+renders nothing without a `sessionId`, reads its chat's choice, posts it to
+`/session-key` and offers to add a key; and the «API-ключ» section in the model menu
+and in the `/model` popup — one row per key, ticked on the active one, the clone's
+group hidden, a click that does not bubble to the host (the menu stays open), no
+section at all with a single key, and an unload that takes both the section and the
+hidden groups with it. Separately, it asserts that a key value appears in no URL and
+is gone from the page once the add is done.
+
 The mark-drawing half is **not** covered by an automated suite in this repository,
 and that is worth knowing up front. It works on the DOM of an already-open page, so
 it is checked by eye: which rows get a mark and which icon each gets, that effort
 rows, provider headings and the search field stay bare, that a model whose logo
 could not be fetched gets a monogram chip instead of a blank box, that a row added
 later gets marked too, that a second pass duplicates nothing, and that an unload
-removes what was added. `model-sync-client-test.mjs` covers the settings page, not
-the decoration.
+removes what was added. `model-sync-client-test.mjs` covers the settings page and the
+menu's key section, not the drawing of marks.
 
 ## License
 
