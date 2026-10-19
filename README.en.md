@@ -6,6 +6,11 @@
 
 [Русский](README.md) | English
 
+[![npm](https://img.shields.io/npm/v/dsh-rustvy)](https://www.npmjs.com/package/dsh-rustvy)
+[![downloads](https://img.shields.io/npm/dm/dsh-rustvy)](https://www.npmjs.com/package/dsh-rustvy)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-blueviolet)](https://github.com/topics/dsh-plugin)
+
 Vendor marks in the DeepSeek Harness model picker, and a model list that stays as
 current as the provider's own — one plugin, one mirror, no restarts.
 
@@ -58,11 +63,23 @@ row are all settings; `https://rustvy.xyz` and `rustvy` are defaults.
 
 ## Install
 
-From npm, once published:
-
 ```sh
 dsh plugin --profile web add dsh-rustvy
 ```
+
+Or straight from GitHub, if you want the latest revision rather than the published
+version:
+
+```sh
+dsh plugin --profile web add github:koliy82/dsh-rustvy
+```
+
+A bare `koliy82/dsh-rustvy` without a scheme is not accepted: the install-spec
+parser knows a registry name, a git spec, a tarball and an absolute local path, and
+a git spec needs either a scheme or the `github:` shorthand.
+
+Neither route asks for build approval, because the package has no install script and
+no dependencies — there is nothing for pnpm to build.
 
 From a checkout of this repository:
 
@@ -410,12 +427,6 @@ could not be fetched gets a monogram chip instead of a blank box, that a row add
 later gets marked too, that a second pass duplicates nothing, and that an unload
 removes what was added. `model-sync-client-test.mjs` covers the settings page, not
 the decoration.
-
-## Publishing
-
-See [PUBLISHING.md](PUBLISHING.md) for the step-by-step: repository, npm, a
-GitHub Release tarball, and the one-file pull request that gets it listed in the
-community catalog and therefore in the in-app plugin market.
 
 ## License
 

@@ -137,10 +137,15 @@ for (const required of ['lib', 'client', 'locale', 'assets', 'cordis.patch.yml',
 // Repository-only material: a reader of the source needs it, an installer does not,
 // and shipping the gate that judges the package is exactly the kind of noise that
 // makes a tarball hard to review.
-for (const local of ['tests', 'docs', 'scripts', 'PUBLISHING.md', '.gitignore']) {
+//
+// `PUBLISHING.md` is deliberately not in this list. It is a private maintainer
+// guide, ignored by git and never pushed, so requiring it on disk would fail on
+// every fresh clone. It is checked below only when it happens to be present.
+for (const local of ['tests', 'docs', 'scripts', '.gitignore']) {
   check(`${local} exists on disk`, existsSync(join(ROOT, local)))
   check(`files does not ship ${local}`, !shipped.has(local), [...shipped].join(', '))
 }
+check('files does not ship PUBLISHING.md', !shipped.has('PUBLISHING.md'), [...shipped].join(', '))
 
 /* --------------------------------- sources -------------------------------- */
 
@@ -196,8 +201,21 @@ for (const file of ['README.md', 'README.en.md']) {
     /(?:README\.md|README\.en\.md)\)/u.test(readme), 'a reader who picked the wrong one needs a way back')
 }
 
+// The publishing guide is a private note that git ignores, so it never reaches
+// GitHub. That decision is fine, but it has to be consistent: a file that is not
+// pushed must not be linked from something that is, or the repository's front page
+// carries a dead link — precisely what a catalog reviewer notices first.
+check('the publishing guide stays out of git',
+  read('.gitignore').split('\n').some(line => line.trim() === 'PUBLISHING.md'),
+  'either ignore it or publish it; an untracked file nobody mentions is fine, a half-decision is not')
+for (const file of ['README.md', 'README.en.md']) {
+  if (!existsSync(join(ROOT, file))) continue
+  check(`${file} does not link the untracked publishing guide`,
+    !/\]\(\.?\/?PUBLISHING\.md\)/u.test(read(file)),
+    'the link would be dead on GitHub')
+}
 if (existsSync(join(ROOT, 'PUBLISHING.md'))) {
-  check('PUBLISHING.md names the catalog repository',
+  check('the publishing guide names the catalog repository',
     read('PUBLISHING.md').includes('awesome-dsh-plugin'),
     'the market reads that list, so the guide has to name it')
 }

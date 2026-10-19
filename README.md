@@ -6,6 +6,11 @@
 
 Русский | [English](README.en.md)
 
+[![npm](https://img.shields.io/npm/v/dsh-rustvy)](https://www.npmjs.com/package/dsh-rustvy)
+[![загрузки](https://img.shields.io/npm/dm/dsh-rustvy)](https://www.npmjs.com/package/dsh-rustvy)
+[![лицензия](https://img.shields.io/badge/лицензия-MIT-blue)](LICENSE)
+[![dsh-plugin](https://img.shields.io/badge/тема-dsh--plugin-blueviolet)](https://github.com/topics/dsh-plugin)
+
 Значки производителей в списке моделей DeepSeek Harness и список моделей, который
 остаётся настолько же актуальным, насколько актуален сам провайдер. Один плагин,
 одно зеркало, без перезапусков.
@@ -63,13 +68,24 @@ CSS-маска, заливаемая `currentColor`, поэтому один ф�
 
 ## Установка
 
-Из npm после публикации:
-
 ```sh
 dsh plugin --profile web add dsh-rustvy
 ```
 
-Из копии этого репозитория:
+Либо прямо с GitHub, если нужна самая свежая ревизия, а не опубликованная версия:
+
+```sh
+dsh plugin --profile web add github:koliy82/dsh-rustvy
+```
+
+Голый `koliy82/dsh-rustvy` без схемы не принимается: разбор источника установки
+знает имя в реестре, git-спецификацию, tarball и абсолютный локальный путь, а
+git-спецификации нужна схема либо сокращение `github:`.
+
+Подтверждение сборки не запрашивается ни в том ни в другом случае: у пакета нет ни
+install-скрипта, ни зависимостей, поэтому pnpm нечего собирать.
+
+Из локальной копии этого репозитория:
 
 ```powershell
 pwsh -File .\install.ps1
@@ -417,12 +433,6 @@ node scripts\prepublish-check.mjs        # гейт публикации
 позже строка тоже получает значок, что повторный проход ничего не удваивает и что
 выгрузка убирает добавленное. `model-sync-client-test.mjs` покрывает страницу
 настроек, а не декорирование.
-
-## Публикация
-
-Пошагово — в [PUBLISHING.md](PUBLISHING.md): репозиторий, npm, tarball в GitHub
-Release и pull request из одного файла, который попадает в общественный каталог, а
-значит и во встроенный маркет плагинов.
 
 ## Лицензия
 

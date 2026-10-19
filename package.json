@@ -25,11 +25,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Koliy82/dsh-rustvy.git"
+    "url": "git+https://github.com/koliy82/dsh-rustvy.git"
   },
-  "homepage": "https://github.com/Koliy82/dsh-rustvy#readme",
+  "homepage": "https://github.com/koliy82/dsh-rustvy#readme",
   "bugs": {
-    "url": "https://github.com/Koliy82/dsh-rustvy/issues"
+    "url": "https://github.com/koliy82/dsh-rustvy/issues"
   },
   "engines": {
     "node": ">=20"
