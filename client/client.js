@@ -20,21 +20,21 @@
  * the mirror could not fetch, fall back to a small monogram chip, so a row is
  * never left with a blank box where a mark should be.
  *
- * The same three surfaces also carry the *API key* this chat sends with, which
- * is the only honest way to change a key per chat: the provider adapter bakes
- * `apiKeyEnv` into a route snapshot, so one key means one route, and the host
- * half writes a route per key (`docs/api-keys.md`). This half draws the choice
- * in three places — a «API-ключ» section at the bottom of the model picker, a
- * compact switch in the composer's tool row, and a management section on the
- * settings page — and never sees a key value except in the body of the one
- * request that adds or replaces it. The DeepSeek account is untouched: the host
- * only substitutes routes of this plugin.
+ * This half also carries the *API key* a chat sends with, which is the only
+ * honest way to change a key per chat: the provider adapter bakes `apiKeyEnv`
+ * into a route snapshot, so one key means one route, and the host half writes a
+ * route per key (`docs/api-keys.md`). The choice is offered in exactly one place
+ * in a conversation — a compact selector in the composer's tool row, right after
+ * the permission/mode dropdown — and managed on the settings page. It never sees
+ * a key value except in the body of the one request that adds or replaces it, and
+ * the DeepSeek account is untouched: the host only substitutes routes of this
+ * plugin.
  *
  * This is a hand-authored bundle in the loader's factory-CJS protocol
  * (`window.__ModuleLoader__.load`), which is what the client module system
  * serves for a package declaring `dsh.client`. `react` comes from the frozen
  * platform module table and is used by the settings page and the composer
- * control; the picker decoration itself is plain DOM.
+ * selector; the mark decoration itself is plain DOM.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-rustvy',
@@ -54,22 +54,36 @@ window.__ModuleLoader__.load({
     /** Body attribute that turns on "one mark per row" for competing skins. */
     const HIDE_FLAG = 'data-dmi-hide-other'
 
-    /** Attribute on a key row this half appended to a picker menu. */
-    const KEY_ROW_FLAG = 'data-dmi-key-row'
-
-    /** Attribute on the container that holds the picker's whole key section. */
-    const KEYS_FLAG = 'data-dmi-keys'
+    /**
+     * The containers this half treats as a model menu.
+     *
+     * One list, two consumers: `rowOf` uses it to decide where a mark may be drawn
+     * and the clone-group hiding uses it to decide where a duplicate provider group
+     * may be hidden. Sharing it is the point — a surface one pass decorates and the
+     * other ignores is a menu where the marks are right and the list is still
+     * doubled, which reads as a bug rather than as two features.
+     */
+    const MENU_SURFACE_SELECTOR = '[role="menu"], [role="listbox"], [class*="_menu"], [class*="_card"], [class*="_groups"], .dsh-claude-model-popover'
 
     /**
-     * Class of a provider-group header this half hid, and of the rows hidden
-     * with it.
+     * Class this half puts on a provider group it hid, and on the rows hidden with
+     * it.
      *
-     * A class rather than a style edit, so `clearMarks` restores a group by
-     * dropping the class instead of remembering what `display` used to be: the
-     * host may have changed it while this half was mounted, and restoring a
-     * remembered value would then overwrite the host's own state.
+     * A class rather than a style edit, so restoring a group means dropping the
+     * class instead of remembering what `display` used to be: the host may have
+     * changed it while this half was mounted, and writing a remembered value back
+     * would then overwrite the host's own state.
      */
     const HIDDEN_GROUP = 'dmi-hidden-group'
+
+    /**
+     * Anything the host treats as a choice, and therefore never as a group header.
+     *
+     * The picker's rows are `button[role="menuitemradio"]` carrying `_option` and
+     * `_modelOption`; both fragments are listed because a header must not be
+     * confused with the copy inside a row either.
+     */
+    const INTERACTIVE_SELECTOR = 'button, [role="menuitemradio"], [role="option"], [class*="_option"], [class*="_row"]'
 
     /** The event both halves of this page use to agree on a changed setting. */
     const CHANGED = 'dsh-rustvy:changed'
@@ -107,12 +121,11 @@ window.__ModuleLoader__.load({
      * to load would otherwise leave a solid square, so a row whose logo is
      * missing gets a letter in a box instead of a block of ink.
      *
-     * The key rows and the composer's key switch are styled here rather than
-     * inline for two reasons: a hover state cannot be written inline at all, and
-     * the picker's rows are plain DOM this half owns, so their styling has to
-     * travel with the stylesheet the loader already inventories. Every colour is
-     * a theme token or a `color-mix` over `currentColor`, which is what keeps one
-     * rule correct in both palettes.
+     * The composer's key switch is styled here rather than inline because a hover
+     * state cannot be written inline at all, and because its popup needs a stacking
+     * context and a scroll box that a row of style objects would only spell worse.
+     * Every colour is a theme token or a `color-mix` over `currentColor`, which is
+     * what keeps one rule correct in both palettes.
      */
     const CSS = `
 .${MARK}{--dmi-size:16px;flex:none;width:var(--dmi-size);height:var(--dmi-size);min-width:var(--dmi-size);display:inline-block;background-color:currentColor;opacity:.9;-webkit-mask:var(--dmi-src) center / contain no-repeat;mask:var(--dmi-src) center / contain no-repeat;pointer-events:none;vertical-align:middle}
@@ -122,23 +135,16 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 .${HIDDEN_GROUP}{display:none!important}
 .dmi-glyph{display:inline-flex;flex:none;align-items:center;justify-content:center}
 .dmi-glyph svg{display:block;width:100%;height:100%}
-.dmi-keys{display:flex;flex-direction:column;gap:1px;padding:2px 0 4px;margin-top:2px}
 .dmi-key-sep{height:1px;flex:none;margin:4px 8px;background:${C.border}}
-.dmi-key-head{padding:4px 10px 2px;font:400 10.5px/1.4 ${SANS};letter-spacing:.04em;text-transform:uppercase;color:${C.labelSecondary}}
-.dmi-key-row{cursor:pointer}
-.dmi-key-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dmi-key-note{flex:none;font:400 10.5px/1.4 ${SANS};opacity:.75}
+.dmi-key-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dmi-key-note{flex:none;font:400 10.5px/1.4 ${SANS};color:${C.labelSecondary}}
 .dmi-key-check{width:12px;height:12px;color:${C.brand}}
-.dmi-key-row:not([data-dmi-borrowed="1"]){display:flex;align-items:center;gap:8px;width:100%;padding:5px 10px;font:400 12.5px/1.4 ${SANS};text-align:left;color:${C.label};background:transparent;border:0;border-radius:6px;box-sizing:border-box}
-.dmi-key-row:not([data-dmi-borrowed="1"]):hover{background:color-mix(in srgb, currentColor 8%, transparent)}
-.dmi-key-row:not([data-dmi-borrowed="1"])[data-dmi-active="1"]{color:${C.brand}}
-.dmi-key-row:not([data-dmi-borrowed="1"]) .dmi-key-copy{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0}
+.dmi-keywrap{position:relative;display:inline-flex}
 .dmi-keybtn{display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 9px;font:500 12px/1 ${SANS};color:${C.label};background:transparent;border:1px solid ${C.borderStrong};border-radius:7px;cursor:pointer;box-sizing:border-box}
 .dmi-keybtn:hover{background:color-mix(in srgb, currentColor 8%, transparent)}
 .dmi-keybtn[data-dmi-open="1"]{border-color:${C.brand};color:${C.brand}}
 .dmi-keybtn .dmi-glyph{width:13px;height:13px}
 .dmi-keybtn-label{max-width:14ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dmi-keywrap{position:relative;display:inline-flex}
 .dmi-keypop{position:absolute;bottom:calc(100% + 6px);left:0;z-index:60;display:flex;flex-direction:column;gap:1px;min-width:230px;max-width:320px;max-height:60vh;overflow:auto;padding:5px;font:400 12.5px/1.45 ${SANS};color:${C.label};background:${C.surface};border:1px solid ${C.borderStrong};border-radius:10px;box-shadow:0 8px 24px color-mix(in srgb, #000 22%, transparent)}
 .dmi-keypop-row{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;font:inherit;color:inherit;text-align:left;background:transparent;border:0;border-radius:7px;cursor:pointer;box-sizing:border-box}
 .dmi-keypop-row:hover{background:color-mix(in srgb, currentColor 8%, transparent)}
@@ -187,18 +193,27 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       fetchedAt: null,
       error: null,
       /**
-       * API keys, shared by all three surfaces.
+       * API keys, shared by both surfaces that draw them.
        *
-       * One copy rather than one per surface, because the picker's plain-DOM
-       * section, the composer's React control and the settings page must agree on
-       * which key is active the moment any of them changes it. `keyId` is the
-       * choice for `sessionId`; `null` means "the default", which is what the
-       * host answers with for a chat that never picked one.
+       * One copy rather than one per surface, because the composer's selector and
+       * the settings page must agree on which key is active the moment either of
+       * them changes it. `keyId` is the choice for `sessionId`; `null` means "the
+       * default", which is what the host answers with for a chat that never picked
+       * one.
        */
       keys: [],
       keyId: null,
       defaultKeyId: null,
       sessionId: null,
+      /**
+       * The display names of the routes that are plumbing rather than choices.
+       *
+       * The host computes them as `<base> · <label>`, one per extra key. It cannot
+       * leave them out of the profile — a clone has to keep its models so the call
+       * still resolves once the swap has renamed the route — so the picker would
+       * otherwise list every model once per key, and `hideProviderGroups` hides
+       * exactly these groups to keep the list clean.
+       */
       hiddenGroups: [],
       keysLoadedAt: null,
       /** How many keys the host will hold; the «+» form stops there. */
@@ -223,7 +238,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       keysError: null,
       /** The last `/keys` answer, for the settings section to repaint from. */
       keysPayload: undefined,
-      /** Bumped on every key-list load so a menu can drop a stale section. */
+      /** Bumped on every key-list load, so a caller can tell a read from a cache hit. */
       keysRevision: 0,
     }
 
@@ -458,14 +473,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       }
       const row = node.closest('[role="menuitemradio"], [role="option"], [class*="_row"], .dsh-claude-model-option')
       if (row === null) return undefined
-      // This half's own key section borrows the host's row and name classes so it
-      // inherits the menu's geometry — which also makes a key label look exactly
-      // like a model name. One called "claude-work" would otherwise resolve to a
-      // vendor and get its mark stamped into the key row.
-      if (row.closest?.(`[${KEYS_FLAG}]`) !== null) return undefined
-      const surface = row.closest(
-        '[role="menu"], [role="listbox"], [class*="_menu"], [class*="_card"], [class*="_groups"], .dsh-claude-model-popover',
-      )
+      const surface = row.closest(MENU_SURFACE_SELECTOR)
       if (surface === null) return undefined
       return { row, surface: 'row' }
     }
@@ -618,10 +626,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       try {
         for (const mark of document.querySelectorAll(`.${MARK}`)) mark.remove()
         for (const row of document.querySelectorAll(`[${ROW_FLAG}]`)) row.removeAttribute(ROW_FLAG)
-        // The key section and the groups this half hid are its DOM too: an unload
-        // that left them behind would leave clickable rows in a menu this half no
-        // longer services, and a provider group nobody can bring back.
-        for (const box of document.querySelectorAll(`[${KEYS_FLAG}]`)) box.remove()
+        // The provider groups this half hid are its doing too: an unload that left
+        // the class behind would leave a whole provider's models invisible with
+        // nothing on the page able to bring them back.
         for (const element of document.querySelectorAll(`.${HIDDEN_GROUP}`)) {
           element.classList.remove(HIDDEN_GROUP)
         }
@@ -632,23 +639,165 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * True for a node this half put in the document.
+     * Every descendant of one node, in document order.
      *
-     * The observer must not read this half's own writes as a reason to run again.
-     * `suppress` covers the synchronous ones; this covers the nodes a host
-     * re-render detaches, which are ours and whose removal needs no mark pass.
-     *
-     * @param element - one added or removed node.
-     * @returns true when this half owns it.
+     * @param node - the subtree root.
+     * @param out - the accumulator.
+     * @returns the descendants, parents before children.
      */
-    function isOwnNode(element) {
-      if (element.classList?.contains(MARK) === true) return true
-      if (element.classList?.contains('dmi-glyph') === true) return true
-      if (element.hasAttribute?.(KEYS_FLAG) === true) return true
-      if (element.hasAttribute?.(KEY_ROW_FLAG) === true) return true
-      // A missing `querySelector` reads as "own", which is what the mark pass has
-      // always done: a node this half cannot inspect is not a reason to repaint.
-      return element.querySelector?.(`.${MARK}, [${KEYS_FLAG}]`) !== null
+    function walkDown(node, out = []) {
+      for (const child of Array.from(node.children ?? [])) {
+        out.push(child)
+        walkDown(child, out)
+      }
+      return out
+    }
+
+    /**
+     * The model menus on the page, innermost first of any nested pair.
+     *
+     * The same containers `rowOf` accepts, so hiding and marking agree on what a
+     * menu is. A `/model` portal can match twice — a wrapper around the model list
+     * — and only the inner one is kept: the outer walk would cross pane boundaries,
+     * and a clone header in the model pane must not sweep the effort pane that
+     * happens to sit after it.
+     *
+     * @returns the menu elements, in document order.
+     */
+    function menuSurfaces() {
+      if (typeof document?.querySelectorAll !== 'function') return []
+      const found = Array.from(document.querySelectorAll(MENU_SURFACE_SELECTOR) ?? [])
+      return found.filter(surface => !found.some(other => other !== surface && surface.contains?.(other) === true))
+    }
+
+    /**
+     * The elements of one menu that carry a wanted provider-group header.
+     *
+     * Matched structurally rather than by class, and that is deliberate: the group
+     * header comes from a primitives package that is a frozen platform module, so
+     * its class names are neither readable here nor stable across versions. What is
+     * stable is the shape — inside the model list, a header is the one
+     * non-interactive element whose whole trimmed text is the provider's display
+     * name, and the host hands this half exactly those names in `hiddenGroups`.
+     *
+     * Best effort, and biased towards doing nothing at all. A candidate has to match
+     * a wanted name exactly, sit outside any row or button, and hold at most one
+     * element child; the outermost such element wins, so a label nested in a header
+     * is not counted twice. A duplicate group left in the list is cosmetic. Hiding
+     * a model row removes a choice the user opened this menu to make, so anything
+     * doubtful stays visible.
+     *
+     * @param surface - the model list to walk.
+     * @param wanted - the normalized `hiddenGroups` names.
+     * @returns the header elements, in document order.
+     */
+    function groupHeaderElements(surface, wanted) {
+      const headers = []
+      for (const element of walkDown(surface)) {
+        if (element.closest?.(INTERACTIVE_SELECTOR) !== null) continue
+        if (Array.from(element.children ?? []).length > 1) continue
+        const text = normalize(element.textContent ?? '')
+        if (text === '' || !wanted.has(text)) continue
+        if (headers.some(known => known.contains?.(element) === true)) continue
+        headers.push(element)
+      }
+      return headers
+    }
+
+    /**
+     * True for an element that could be a group header, wanted or not.
+     *
+     * Used only to bound a walk: the rows that follow a hidden header belong to it
+     * up to the next header, and the next header is usually a provider this half was
+     * not asked to hide. The same structural test as above, without the name match —
+     * so an unexpected element (a "nothing found" line, a divider with text in it)
+     * stops the walk early, which hides less rather than more.
+     *
+     * @param element - the sibling to test.
+     * @returns true when the walk should stop here.
+     */
+    function looksLikeHeader(element) {
+      if (element === null || element === undefined || element.nodeType !== 1) return false
+      if (element.closest?.(INTERACTIVE_SELECTOR) !== null) return false
+      if (Array.from(element.children ?? []).length > 1) return false
+      return normalize(element.textContent ?? '') !== ''
+    }
+
+    /**
+     * Hide the per-key clone groups of one menu.
+     *
+     * Every extra key adds a route, and a route the profile lists shows up in the
+     * picker as another copy of the same models. The host cannot drop them — a
+     * clone has to keep its models so the call still resolves once the swap has
+     * renamed the route — so the list is kept clean here, by hiding and never by
+     * adding.
+     *
+     * Two shapes are covered. When the header sits in a group element of its own,
+     * that element is the smallest thing that can be hidden and the whole group
+     * goes. Otherwise the header is hidden with its following siblings up to the
+     * next header, which is the same set of nodes in a flat list.
+     *
+     * Idempotent by class: a second pass over an already hidden group changes
+     * nothing, so the observer does not feed on it and a host re-render that drops
+     * the class is simply answered by the next pass.
+     *
+     * @param surface - the model list to walk.
+     * @returns how many elements this pass hid or restored.
+     */
+    function hideProviderGroups(surface) {
+      const wanted = new Set(
+        (state.hiddenGroups ?? []).map(group => normalize(group)).filter(text => text !== ''),
+      )
+      const hide = new Set()
+      for (const header of groupHeaderElements(surface, wanted)) {
+        // The smallest enclosing group: a parent that is not the surface itself,
+        // holds at least one row, and says more than the header alone.
+        const parent = header.parentNode
+        const enclosed = parent !== null && parent !== undefined && parent !== surface
+          && parent.nodeType === 1
+          && parent.querySelector?.(INTERACTIVE_SELECTOR) !== null
+          && normalize(parent.textContent ?? '') !== normalize(header.textContent ?? '')
+        if (enclosed) {
+          hide.add(parent)
+          continue
+        }
+        hide.add(header)
+        for (let next = header.nextElementSibling; next !== null && next !== undefined; next = next.nextElementSibling) {
+          if (looksLikeHeader(next)) break
+          hide.add(next)
+        }
+      }
+
+      let touched = 0
+      for (const element of walkDown(surface)) {
+        const should = hide.has(element)
+        const has = element.classList?.contains(HIDDEN_GROUP) === true
+        if (has === should) continue
+        if (should) element.classList?.add(HIDDEN_GROUP)
+        else element.classList?.remove(HIDDEN_GROUP)
+        touched += 1
+      }
+      return touched
+    }
+
+    /**
+     * Hide the clone provider groups of every menu on the page.
+     *
+     * Needs no session and no read of its own: it is a pure function of the menu
+     * DOM and the `hiddenGroups` the last `/keys` answer carried, so it belongs in
+     * the decorate pass and runs whenever the marks do.
+     *
+     * @returns how many elements changed.
+     */
+    function hideCloneGroups() {
+      let touched = 0
+      suppress = true
+      try {
+        for (const surface of menuSurfaces()) touched += hideProviderGroups(surface)
+      } finally {
+        suppress = false
+      }
+      return touched
     }
 
     /** Coalesce a burst of mutations into one pass on the next frame. */
@@ -659,9 +808,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         scheduled = false
         if (suppress) return
         decorate(document)
-        // The key section lives in the same surfaces and is torn down by the same
-        // host re-render, so one scheduled pass restores both.
-        updatePicker()
+        // Same surfaces, same pass: the marks are drawn into the rows that are
+        // left visible, and a clone group the host re-rendered is hidden again.
+        hideCloneGroups()
       }
       if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run)
       else setTimeout(run, 16)
@@ -728,18 +877,18 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     async function reload() {
       try {
         // Both reads at once: the catalog is what the marks need and the key list
-        // is what the picker's own section needs, and neither waits on the other.
-        // `loadKeys` never rejects, so a dead key route cannot fail the marks.
+        // is what the composer's selector and the clone-group hiding need, and
+        // neither waits on the other. `loadKeys` never rejects, so a dead key route
+        // cannot fail the marks.
         const [summary] = await Promise.all([loadCatalog(), loadKeys(state.sessionId)])
         clearMarks()
         decorate(document)
-        updatePicker()
+        hideCloneGroups()
         return summary
       } catch (error) {
         state.ready = false
         state.error = error instanceof Error ? error.message : String(error)
         clearMarks()
-        updatePicker()
         return undefined
       }
     }
@@ -752,49 +901,14 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      * keyId` map; this half only draws the choice and posts it. It never receives a
      * key value — `GET /keys` answers with a mask and a fingerprint — and the only
      * value it ever sends is the one just typed, in the body of one POST.
-     */
-
-    /**
-     * The surfaces a key section may be appended to.
      *
-     * The same list the mark pass accepts, because the key section belongs where
-     * the models are: the composer's model menu, the `/model` command popup, and a
-     * skin that redraws the picker itself.
+     * Two surfaces draw it: the composer's switch, which is where a chat picks the
+     * key it sends with, and the settings page, which is where keys are added,
+     * named, checked and removed. Both are React, so neither leaves a node in the
+     * host's own menus. What this half does write into the picker is a mark per
+     * model row, and a hidden class on the clone groups the extra routes would
+     * otherwise add to the list — hiding, never adding.
      */
-    const KEY_MENU_SELECTOR = '[role="menu"], [role="listbox"], [class*="_menu"], [class*="_card"], [class*="_groups"], .dsh-claude-model-popover'
-
-    /**
-     * The two entries of that list that are containers rather than menus.
-     *
-     * A mark in a row is inert, so the mark pass can afford to accept any card;
-     * an appended section of clickable rows cannot. A settings page is full of
-     * cards, so for these two the surface must also hold a model name before this
-     * half treats it as the `/model` popup — which is the difference between
-     * drawing the key choice where the user picks a model and drawing it somewhere
-     * they did not ask for it.
-     */
-    const KEY_MENU_LOOSE = '[class*="_card"], [class*="_groups"]'
-
-    /** A model name, as the host and the skins spell it. */
-    const MODEL_NAME_SELECTOR = '[class*="_modelName"], [class*="_labelText"], .dsh-claude-model-copy'
-
-    /** A row that offers a choice, as opposed to a row that merely heads a group. */
-    const ROW_SELECTOR = '[role="menuitemradio"], [role="option"], [class*="_row"]'
-
-    /**
-     * Every descendant of one node, in document order.
-     *
-     * @param node - the subtree root.
-     * @param out - the accumulator.
-     * @returns the descendants, parents before children.
-     */
-    function walkDown(node, out = []) {
-      for (const child of Array.from(node.children ?? [])) {
-        out.push(child)
-        walkDown(child, out)
-      }
-      return out
-    }
 
     /**
      * Tell every surface this half draws that the shared state moved.
@@ -803,7 +917,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      * because a mutation already carried the fresh list home in its answer — a
      * listener that reloaded would make every key click cost two round trips.
      *
-     * @param keys - true when only keys changed, so the picker's own listener can
+     * @param keys - true when only keys changed, so the decorator's listener can
      *   skip the catalog read a full `reload()` makes.
      */
     function announce(keys = false) {
@@ -822,11 +936,13 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * Publish the session a surface rendered for.
+     * Publish the session the composer control rendered for.
      *
-     * The composer control is the only place that learns a `sessionId`, and the
-     * picker's section is plain DOM with no props — so the id travels through the
-     * module state, which is also why the section draws nothing until it is set.
+     * The switch is the only surface that is handed a `sessionId`, and the choice
+     * it posts is per chat, so the id lives in the module state: `chooseKey` reads
+     * it back as the default, and a background refresh knows which chat to ask
+     * about. Nothing is published until a control has one, which is why an
+     * interaction on a page with no conversation costs no read at all.
      *
      * @param sessionId - the session id; anything else is ignored.
      * @returns true when the published session changed.
@@ -1048,348 +1164,6 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     function keyFormError(value) {
       if (String(value ?? '').trim() === '') return 'Введите значение ключа.'
       return undefined
-    }
-
-    /**
-     * Drop one surface's key section, if this half appended one.
-     *
-     * The host rewrites a menu on every state change, which detaches this half's
-     * nodes without telling it; removing the ones still attached is what keeps
-     * `clearMarks` honest on unload.
-     *
-     * @param surface - the menu to clean.
-     */
-    function clearKeySection(surface) {
-      for (const box of Array.from(surface?.querySelectorAll?.(`[${KEYS_FLAG}]`) ?? [])) box.remove()
-    }
-
-    /** The tick an active key row carries, shared by the DOM rows and the React ones. */
-    const CHECK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" '
-      + 'stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.5 12 13 4.5"/></svg>'
-
-    /** The composer switch's own glyph: a key, in `currentColor` like the marks. */
-    const KEY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" '
-      + 'stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="8" r="2.6"/>'
-      + '<path d="M7.6 8H14M11.6 8v2.4M13.6 8v1.7"/></svg>'
-
-    /**
-     * Anything the host treats as a choice, and therefore never as a group header.
-     *
-     * The picker's rows are `button[role="menuitemradio"]` carrying `_option` and
-     * `_modelOption`; both fragments are listed because a header must not be
-     * confused with the copy inside a row either.
-     */
-    const INTERACTIVE_SELECTOR = 'button, [role="menuitemradio"], [role="option"], [class*="_option"], [class*="_row"]'
-
-    /**
-     * The class names one host row carries, so this half's rows can borrow them.
-     *
-     * The menu's geometry, hover and selected states come from a CSS module whose
-     * hashed class names are neither readable from here nor stable across versions,
-     * so they are read off a row that is already in the surface rather than
-     * guessed. Borrowing them is what makes a key row line up with the model rows
-     * above it and light up the same way; this half's own `dmi-*` names go on top,
-     * which keeps the row identifiable and its click ours.
-     *
-     * Sampled before the section is appended, so the only rows in the surface are
-     * the host's own.
-     *
-     * @param surface - the menu to sample.
-     * @returns class strings keyed by the part of the row they belong to.
-     */
-    function borrowedClasses(surface) {
-      /** The class of the first element matching one selector, if there is one. */
-      const of = selector => {
-        const found = surface?.querySelector?.(selector)
-        if (found === null || found === undefined) return undefined
-        const name = String(found.className ?? '').trim()
-        return name === '' ? undefined : name
-      }
-      const row = of(`${ROW_SELECTOR}[class*="_modelOption"]`)
-        ?? of(`${ROW_SELECTOR}[class*="_option"]`)
-        ?? of(ROW_SELECTOR)
-      return {
-        row,
-        copy: of('[class*="_optionCopy"]'),
-        name: of('[class*="_modelName"]'),
-        check: of('[class*="_check"]'),
-      }
-    }
-
-    /**
-     * Build the picker's key section: a separator, a small header, one row per key.
-     *
-     * Plain DOM, not React: the menu it lands in is the host's, opened and closed
-     * on its own schedule, and a portal into it would have to be mounted and
-     * unmounted with the menu's lifetime — which this half cannot observe.
-     *
-     * Each row mirrors the shape of the picker's own rows — a
-     * `button[role="menuitemradio"]` holding a copy span, a name span and a
-     * trailing check — so it inherits the menu's row geometry and its selected
-     * state, and so the host's keyboard navigation still has something to move
-     * through. The key id lives in a dataset attribute rather than in a closure, so
-     * a handler on a detached node still knows what it was.
-     *
-     * @param surface - the menu the section is being built for.
-     * @returns the container element.
-     */
-    function buildKeySection(surface) {
-      const active = activeKey()
-      const host = borrowedClasses(surface)
-      const box = document.createElement('div')
-      box.className = 'dmi-keys'
-      box.setAttribute(KEYS_FLAG, String(state.keysRevision))
-
-      const separator = document.createElement('div')
-      separator.className = 'dmi-key-sep'
-      separator.setAttribute('role', 'separator')
-      box.appendChild(separator)
-
-      const head = document.createElement('div')
-      head.className = 'dmi-key-head'
-      head.textContent = 'API-ключ'
-      box.appendChild(head)
-
-      for (const key of state.keys) {
-        const isActive = active !== null && key.id === active.id
-        const row = document.createElement('button')
-        row.type = 'button'
-        // The host moves focus by index into an array it built from its own React
-        // list, so an injected row can never join that walk — arrow keys will skip
-        // these. They are still reachable by Tab, and stating that explicitly is
-        // what keeps a roving-tabindex menu from leaving them unfocusable.
-        row.tabIndex = 0
-        row.setAttribute('role', 'menuitemradio')
-        row.setAttribute('aria-checked', isActive ? 'true' : 'false')
-        row.className = `${host.row ?? ''} dmi-key-row`.trim()
-        if (host.row !== undefined) row.dataset.dmiBorrowed = '1'
-        row.dataset.dmiKeyRow = String(key.id)
-        if (isActive) row.dataset.dmiActive = '1'
-        row.title = `${keyName(key)} · ${key.route ?? key.ref ?? ''}`.trim()
-
-        const copy = document.createElement('span')
-        copy.className = `${host.copy ?? ''} dmi-key-copy`.trim()
-        const name = document.createElement('span')
-        name.className = `${host.name ?? ''} dmi-key-name`.trim()
-        name.textContent = keyName(key)
-        copy.appendChild(name)
-        if (key.primary === true || key.id === state.defaultKeyId) {
-          const note = document.createElement('span')
-          note.className = 'dmi-key-note'
-          note.textContent = key.primary === true ? 'основной' : 'по умолчанию'
-          copy.appendChild(note)
-        }
-        row.appendChild(copy)
-
-        // The check goes last, where the host's own rows put it, so the column of
-        // ticks lines up with the models above instead of sitting on the other side.
-        const check = document.createElement('span')
-        check.className = `${host.check ?? ''} dmi-glyph dmi-key-check`.trim()
-        check.setAttribute('aria-hidden', 'true')
-        if (isActive) check.innerHTML = CHECK_SVG
-        row.appendChild(check)
-
-        // Capture phase, and no re-dispatch: a key is not a model, so a click here
-        // must not reach the host's menu handler, which would either close the menu
-        // or read it as a model selection it knows nothing about.
-        row.addEventListener('click', event => {
-          event.preventDefault()
-          event.stopPropagation()
-          if (row.dataset.dmiBusy === '1') return
-          row.dataset.dmiBusy = '1'
-          void chooseKey(key.id).then(() => {
-            row.dataset.dmiBusy = '0'
-            updatePicker()
-          })
-        }, true)
-        box.appendChild(row)
-      }
-      return box
-    }
-
-    /**
-     * The elements of one surface that carry a wanted provider-group header.
-     *
-     * Matched structurally rather than by class, and that is deliberate: the group
-     * header comes from a primitives package that is a frozen platform module, so
-     * its class names are neither readable here nor stable across versions. What is
-     * stable is the shape — inside the model list, a header is the one
-     * non-interactive element whose whole trimmed text is the provider's display
-     * name, and the host hands this half exactly those names in `hiddenGroups`.
-     *
-     * Best effort, and biased towards doing nothing at all. A candidate has to match
-     * a wanted name exactly, sit outside any row or button, and hold at most one
-     * element child; the outermost such element wins, so a label nested in a header
-     * is not counted twice. A duplicate group left in the list is cosmetic. Hiding
-     * a model row removes a choice the user opened this menu to make, so anything
-     * doubtful stays visible.
-     *
-     * @param surface - the model list to walk.
-     * @param wanted - the normalized `hiddenGroups` names.
-     * @returns the header elements, in document order.
-     */
-    function groupHeaderElements(surface, wanted) {
-      const headers = []
-      for (const element of walkDown(surface)) {
-        if (element.closest?.(`[${KEYS_FLAG}]`) !== null) continue
-        if (element.closest?.(INTERACTIVE_SELECTOR) !== null) continue
-        if (Array.from(element.children ?? []).length > 1) continue
-        const text = normalize(element.textContent ?? '')
-        if (text === '' || !wanted.has(text)) continue
-        if (headers.some(known => known.contains?.(element) === true)) continue
-        headers.push(element)
-      }
-      return headers
-    }
-
-    /**
-     * True for an element that could be a group header, wanted or not.
-     *
-     * Used only to bound a walk: the rows that follow a hidden header belong to it
-     * up to the next header, and the next header is usually a provider this half was
-     * not asked to hide. The same structural test as above, without the name match —
-     * so an unexpected element (a "nothing found" line, a divider with text in it)
-     * stops the walk early, which hides less rather than more.
-     *
-     * @param element - the sibling to test.
-     * @returns true when the walk should stop here.
-     */
-    function looksLikeHeader(element) {
-      if (element === null || element === undefined || element.nodeType !== 1) return false
-      if (element.closest?.(`[${KEYS_FLAG}]`) !== null) return false
-      if (element.closest?.(INTERACTIVE_SELECTOR) !== null) return false
-      if (Array.from(element.children ?? []).length > 1) return false
-      return normalize(element.textContent ?? '') !== ''
-    }
-
-    /**
-     * Hide the provider groups the host asks to hide.
-     *
-     * Every extra key adds a route, and a route the profile lists shows up in the
-     * picker as another copy of the same models — so `hiddenGroups` names the
-     * display names that are plumbing rather than choices.
-     *
-     * Two shapes are covered. When the header sits in a group element of its own,
-     * that element is the smallest thing that can be hidden and the whole group
-     * goes. Otherwise the header is hidden with its following siblings up to the
-     * next header, which is the same set of nodes in a flat list.
-     *
-     * Idempotent by class: a second pass over an already hidden group changes
-     * nothing, which is what keeps the observer from feeding on it. A class rather
-     * than an inline `display`, so restoring a group does not overwrite a style the
-     * host may have set on it while this half was mounted.
-     *
-     * @param surface - the model list to walk.
-     * @returns how many elements this pass hid or restored.
-     */
-    function hideProviderGroups(surface) {
-      const wanted = new Set(
-        (state.hiddenGroups ?? []).map(group => normalize(group)).filter(text => text !== ''),
-      )
-      const hide = new Set()
-      if (wanted.size > 0) {
-        for (const header of groupHeaderElements(surface, wanted)) {
-          // The smallest enclosing group: a parent that is not the surface itself,
-          // holds at least one row, and says more than the header alone.
-          const parent = header.parentNode
-          const enclosed = parent !== null && parent !== undefined && parent !== surface
-            && parent.nodeType === 1
-            && parent.closest?.(`[${KEYS_FLAG}]`) === null
-            && parent.querySelector?.(ROW_SELECTOR) !== null
-            && normalize(parent.textContent ?? '') !== normalize(header.textContent ?? '')
-          if (enclosed) {
-            hide.add(parent)
-            continue
-          }
-          hide.add(header)
-          for (let next = header.nextElementSibling; next !== null && next !== undefined; next = next.nextElementSibling) {
-            if (looksLikeHeader(next)) break
-            hide.add(next)
-          }
-        }
-      }
-
-      let touched = 0
-      for (const element of walkDown(surface)) {
-        if (element.closest?.(`[${KEYS_FLAG}]`) !== null) continue
-        const should = hide.has(element)
-        const has = element.classList?.contains(HIDDEN_GROUP) === true
-        if (has === should) continue
-        if (should) element.classList?.add(HIDDEN_GROUP)
-        else element.classList?.remove(HIDDEN_GROUP)
-        touched += 1
-      }
-      return touched
-    }
-
-    /**
-     * The menu surfaces this half may write into.
-     *
-     * Three filters. Everything this half renders carries `data-dmi-keyui`, which
-     * keeps the composer's own popup — a `[role="menu"]` too — from growing a second
-     * copy of the list it already shows. A container-shaped surface qualifies only
-     * when it holds a model name. And of a nested pair only the inner one is kept:
-     * the `/model` portal has a wrapper that matches `_menu` around a model list
-     * that matches `_groups`, and appending to both would draw the section twice.
-     * The inner one is also where the host's own rows live.
-     *
-     * @returns the surfaces, in document order.
-     */
-    function keySurfaces() {
-      if (typeof document?.querySelectorAll !== 'function') return []
-      const candidates = Array.from(document.querySelectorAll(KEY_MENU_SELECTOR) ?? []).filter(surface => {
-        if (surface.matches?.('[data-dmi-keyui]') === true) return false
-        if (surface.closest?.('[data-dmi-keyui]') !== null) return false
-        if (surface.matches?.(KEY_MENU_LOOSE) !== true) return true
-        if (surface.matches?.('[role="menu"], [role="listbox"], [class*="_menu"]') === true) return true
-        const named = surface.querySelector?.(MODEL_NAME_SELECTOR)
-        return named !== null && named !== undefined
-      })
-      return candidates.filter(surface => !candidates.some(other => other !== surface && surface.contains?.(other) === true))
-    }
-
-    /**
-     * Repaint the key section of every surface that should have one.
-     *
-     * Rebuilt rather than patched: the section is at most a dozen nodes, it is
-     * only touched when the key list or the choice actually moved, and a rebuild
-     * cannot leave a stale row behind the way an in-place patch can.
-     */
-    function paintKeys() {
-      const wanted = state.keysAvailable === true
-        && state.keysEnabled !== false
-        && state.sessionId !== null
-        && state.keys.length >= 2
-      for (const surface of keySurfaces()) {
-        const box = surface.querySelector?.(`[${KEYS_FLAG}]`) ?? null
-        if (!wanted) {
-          if (box !== null) box.remove()
-          continue
-        }
-        if (box !== null && box.getAttribute(KEYS_FLAG) === String(state.keysRevision)) continue
-        clearKeySection(surface)
-        // Appended last, which puts it after the final provider group: the key
-        // choice reads as the tail of the list, not as a group of its own.
-        surface.appendChild(buildKeySection(surface))
-      }
-    }
-
-    /**
-     * One key pass over the document: repaint the picker's sections and hide the
-     * groups the host named.
-     *
-     * Independent of `decorate`, because the marks follow the icon setting and the
-     * keys follow their own feature switch — a user who turns icons off still
-     * picks a key.
-     */
-    function updatePicker() {
-      suppress = true
-      try {
-        paintKeys()
-        for (const surface of keySurfaces()) hideProviderGroups(surface)
-      } finally {
-        suppress = false
-      }
     }
 
     /** One labelled status line on the settings page. */
@@ -2285,12 +2059,21 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                       'Дописывает в конфигурацию маршруты ключей, которых в ней нет.'))))
     }
 
+    /** The tick that marks the key a chat sends with. */
+    const CHECK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" '
+      + 'stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.5 12 13 4.5"/></svg>'
+
+    /** The switch's own glyph: a key, drawn in `currentColor` like the marks. */
+    const KEY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" '
+      + 'stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="8" r="2.6"/>'
+      + '<path d="M7.6 8H14M11.6 8v2.4M13.6 8v1.7"/></svg>'
+
     /**
      * Re-render when the shared state moves.
      *
-     * The composer control has no props to follow: what it shows lives in the
-     * state it shares with the picker's plain-DOM section, so the only thing React
-     * can hold for it is a counter that the change event increments.
+     * The switch has no props to follow: what it shows lives in the state it shares
+     * with the settings page, so the only thing React can hold for it is a counter
+     * that the change event increments.
      *
      * @returns a function that forces the same re-render, for a caller that has
      *   just refreshed the state itself and cannot wait for an event.
@@ -2308,9 +2091,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     /**
      * One inline SVG glyph, painted in `currentColor`.
      *
-     * Markup rather than a React tree, because the same two glyphs also have to be
-     * built as plain DOM for the picker's rows, and two spellings of one shape is
-     * how an icon ends up looking different in two menus.
+     * Markup rather than a React tree, because a two-node icon written as elements
+     * is four lines of `h()` that say less than the path does, and `currentColor`
+     * is what keeps it correct in both palettes and in every row state.
      */
     function Glyph(props) {
       return h('span', {
@@ -2321,7 +2104,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       })
     }
 
-    /** The tick that marks the key this chat sends with. */
+    /** The tick on the row this chat sends with. */
     function Check(props) {
       return h(Glyph, {
         className: 'dmi-key-check',
@@ -2332,7 +2115,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       })
     }
 
-    /** One row of the composer's popup: a tick, a label, an optional note. */
+    /** One row of the switch's popup: a tick, a label, an optional note. */
     function KeyPopupRow(props) {
       return h('button', {
         type: 'button',
@@ -2349,16 +2132,16 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * The composer's key switch.
+     * The composer's key selector — the one place a conversation offers the choice.
      *
-     * Sits in the tool row beside the model button and answers the same question
-     * the picker's own section does — which key this chat sends with — for whoever
-     * would rather not open the model menu to change it.
+     * It sits in the tool row right after the permission/mode dropdown and answers
+     * a question that belongs to the chat rather than to the model: which key this
+     * conversation sends with. The model picker stays about models.
      *
-     * It renders nothing until it holds a `sessionId`: the choice is per chat, and
-     * a switch that posted for the wrong session is worse than no switch. The id it
-     * was given is published to the decorator's state, which is how the picker's
-     * section — plain DOM, no props — learns which chat to post for.
+     * It renders nothing until it holds a `sessionId`: the choice is per chat, and a
+     * switch that posted for the wrong session is worse than no switch. The id it
+     * was given is published to the shared state, which is what a background refresh
+     * and `chooseKey`'s default both read.
      */
     function KeyControl(props) {
       const [open, setOpen] = React.useState(false)
@@ -2371,14 +2154,14 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 
       React.useEffect(() => {
         if (sessionId === null) return undefined
-        if (publishSession(sessionId)) updatePicker()
+        publishSession(sessionId)
         // Forced: mounting is deliberate, and this chat's own pick is the one thing
         // the shared state may still be holding for another conversation.
         void loadKeys(sessionId, { force: true }).then(answer => setReady(answer !== null))
         return undefined
       }, [sessionId])
 
-      // The menu is re-read on open, which is what makes a key added in another
+      // The list is re-read on open, which is what makes a key added in another
       // window — or removed by the host — show up without a reload of the page.
       // Forced for the same reason, and it announces nothing, so it repaints this
       // control itself.
@@ -2431,8 +2214,8 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       /**
        * The popup's «+»: the same POST the settings page makes, and then the new
        * key is chosen for this chat — adding a key from inside a conversation is
-       * done in order to send with it, and the popup closes on success, so
-       * leaving the choice for later would hide what just happened.
+       * done in order to send with it, and the popup closes on success, so leaving
+       * the choice for later would hide what just happened.
        */
       const addKey = async (value, keyLabel) => {
         const answer = await postKeys({ action: 'add', key: value, label: keyLabel })
@@ -2458,10 +2241,10 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         open
           ? h('span', { className: 'dmi-keypop', role: 'menu', 'data-dmi-keyui': '' },
               // Exactly one tick in this popup: a key row is ticked when this chat
-              // explicitly picked it, and «По умолчанию» is ticked when it did
-              // not. Ticking the default key's row *and* the «По умолчанию» row
-              // would be two marks for one state, and the default key already
-              // carries its own «по умолчанию» note.
+              // explicitly picked it, and «По умолчанию» is ticked when it did not.
+              // Ticking the default key's row *and* the «По умолчанию» row would be
+              // two marks for one state, and the default key already carries its own
+              // «по умолчанию» note.
               ...state.keys.map(key => h(KeyPopupRow, {
                 key: key.id,
                 active: chosen !== null && key.id === chosen.id,
@@ -2791,32 +2574,34 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         /**
          * React to a change made anywhere in this page.
          *
-         * A keys-only change repaints from the state the mutation already carried
-         * home; anything else is a settings change and re-reads the catalog, which
-         * is a dozen requests this half must not make on every key click.
+         * A keys-only change needs nothing here: the surfaces that draw keys are
+         * React components listening for the same event. Anything else is a
+         * settings change, so the catalog is re-read and the marks repainted.
          */
         const onChanged = event => {
-          if (disposed) return
-          if (event?.detail?.keys === true) {
-            updatePicker()
-            return
-          }
+          if (disposed || event?.detail?.keys === true) return
           void reload()
         }
         window.addEventListener(CHANGED, onChanged)
 
         /**
-         * One interaction with the page: schedule a repaint, and re-read the key
-         * list when a menu may just have opened.
+         * One interaction with the page: repaint the marks, and refresh the key
+         * list for the chat the composer published.
          *
-         * The read is coalesced inside `loadKeys`, and a menu that is not open
-         * costs one request that also warms the picker's section — the same trade
-         * the mark pass already makes by running on every `pointerdown`.
+         * Both are cheap by construction. The repaint is coalesced into one frame,
+         * and the read is throttled inside `loadKeys`, so a burst of clicks costs at
+         * most one request per couple of seconds — which matters because the host
+         * resolves every key's credential to answer it. A read that did reach the
+         * host moved the revision, and only then does the switch need repainting.
          */
         const onInteract = () => {
           if (disposed) return
           scheduleDecorate()
-          if (state.sessionId !== null) void loadKeys(state.sessionId).then(() => updatePicker())
+          if (state.sessionId === null) return
+          const before = state.keysRevision
+          void loadKeys(state.sessionId).then(() => {
+            if (state.keysRevision !== before) announce(true)
+          })
         }
 
         observer = new MutationObserver(records => {
@@ -2828,7 +2613,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             if (record.type === 'characterData') return true
             for (const node of [...record.addedNodes, ...record.removedNodes]) {
               if (node.nodeType !== 1) continue
-              if (isOwnNode(/** @type {Element} */ (node))) continue
+              const element = /** @type {Element} */ (node)
+              if (element.classList?.contains(MARK)) continue
+              if (element.querySelector?.(`.${MARK}`) !== null) continue
               return true
             }
             return false
@@ -2880,12 +2667,17 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       }, () => h(IconsPage)))
 
       /**
-       * The composer's key switch, in the tool row beside the model button.
+       * The key selector, in the composer's tool row immediately after the
+       * permission/mode dropdown.
+       *
+       * This is the one place a conversation offers the choice: the model picker
+       * stays about models, and a second copy of the same list in a menu the user
+       * opens for another reason is clutter rather than convenience.
        *
        * The slot is session-scoped, so Cordis disposes the registration when the
-       * conversation it was injected for goes away: this half keeps no per-session
-       * resource of its own, and `KeyControl` renders nothing at all until the slot
-       * hands it a `sessionId` and the host answers with two keys or more.
+       * conversation it was injected for goes away, and this half keeps no
+       * per-session resource of its own. `KeyControl` renders nothing at all until
+       * the slot hands it a `sessionId` and the host answers with two keys or more.
        */
       ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
         name: 'conversation.input.left',

@@ -112,6 +112,18 @@ function stubElement(tag) {
       return this.children.map(child => (child.nodeType === 3 ? child.text : child.textContent)).join('') + (this._text ?? '')
     },
     set textContent(value) { this.children = []; this._text = String(value) },
+    /**
+     * Text set through `textContent` lives in `_text`, so `childNodes` has to hand
+     * it back as a text node. The decorator reads a row's name through
+     * `childNodes`, and without this every name in the stub is the empty string —
+     * which silently draws no marks at all and lets an assertion about removing
+     * them pass without any ever having been drawn.
+     */
+    get childNodes() {
+      const nodes = [...this.children]
+      if (this._text !== undefined && this._text !== '') nodes.push(textNode(this._text))
+      return nodes
+    },
     setAttribute(name, value) { this.attributes[name] = String(value) },
     getAttribute(name) { return this.attributes[name] ?? null },
     removeAttribute(name) { delete this.attributes[name] },
@@ -435,8 +447,8 @@ check('the bundle registered itself', descriptor?.id === 'dsh-rustvy', String(de
 const loaded = descriptor.factory(name => (name === 'react' ? React : undefined))
 check('the factory returned a plugin', loaded?.name === 'dsh-rustvy' && typeof loaded.apply === 'function')
 
-// One registration per slot, because this half now fills two: the settings
-// section and the composer's key switch. Keyed by what the harness keys it by.
+// One registration per slot, because this half fills two: the settings section
+// and the composer's key selector. Keyed by what the harness keys it by.
 const registrations = []
 let renderPage = null
 let renderKeyControl = null
@@ -457,11 +469,17 @@ const sectionLabel = registrations.find(item => item.name === 'settings.section'
 const keySlot = registrations.find(item => item.id === 'rustvy-key')
 check('the settings page was registered', typeof renderPage === 'function')
 check('the settings section is named Rustvy', sectionLabel === 'Rustvy', String(sectionLabel))
-check('the composer key switch was registered', typeof renderKeyControl === 'function')
-check('the key switch sits in the composer tool row',
+// The key choice lives in exactly one place in a conversation: the composer's tool
+// row, right after the permission/mode dropdown. The model picker stays about
+// models, and the settings page is where keys are managed rather than chosen.
+check('the composer key selector was registered', typeof renderKeyControl === 'function',
+  registrations.map(item => item.id).join(', '))
+check('the key selector sits in the composer tool row',
   keySlot?.name === 'conversation.input.left' && keySlot?.order === 60,
   `${String(keySlot?.name)}@${String(keySlot?.order)}`)
-check('the key switch has its own label', keySlot?.label?.() === 'API-ключ', String(keySlot?.label?.()))
+check('the key selector has its own label', keySlot?.label?.() === 'API-ключ', String(keySlot?.label?.()))
+check('it is the only slot besides the settings section',
+  registrations.length === 2, registrations.map(item => item.id).join(', '))
 
 /* ------------------------------ tree walking ---------------------------- */
 function textOf(node, out = []) {
@@ -881,27 +899,31 @@ KEYS = structuredClone(KEYS_FIXTURE)
 tree = await view()
 check('the "+" returns below the limit', findButton(tree, '+').props.disabled === false)
 
-/* -------------------------- the composer switch -------------------------- */
-check('the switch renders nothing without a session',
+/* -------------------------- the composer selector ------------------------- */
+// The key choice lives in exactly one place in a conversation: the composer's tool
+// row, right after the permission/mode dropdown. The model picker stays about
+// models, so the block after this one asserts it grows nothing.
+check('the selector renders nothing without a session',
   allText(await viewComponent(renderKeyControl, {})) === '')
 
 let keyTree = await viewComponent(renderKeyControl, { sessionId: 's-1' })
-check('the switch reads the session choice from the host',
+check('the selector reads this chat choice from the host',
   requests.some(item => item.path.includes('/session-key?sessionId=s-1')),
   JSON.stringify(requests.map(item => item.path).slice(-3)))
-check('the switch names the key this chat sends with',
+check('the selector names the key this chat sends with',
   allText(keyTree).includes('ключ по умолчанию'), allText(keyTree))
 
 const keyButton = collect(keyTree, 'button').find(item => /dmi-keybtn/u.test(String(item.props.className ?? '')))
-check('the switch is a compact control with a popup', keyButton?.props['aria-haspopup'] === 'true')
+check('the selector is a compact control with a popup', keyButton?.props['aria-haspopup'] === 'true')
 keyButton.props.onClick()
 await settle()
 keyTree = await viewComponent(renderKeyControl, { sessionId: 's-1' })
-const popupRows = collect(keyTree, 'button').filter(item => /dmi-keypop-row/u.test(String(item.props.className ?? '')))
+const popupRows = collect(keyTree, 'button')
+  .filter(item => /dmi-keypop-row/u.test(String(item.props.className ?? '')))
 check('the popup lists every key plus the default and the "+"',
   popupRows.length === KEYS.keys.length + 2, String(popupRows.length))
 check('the popup offers to add a key', allText(keyTree).includes('+ Добавить ключ'))
-check('the active key carries the tick',
+check('exactly one row of the popup carries the tick',
   popupRows.filter(item => item.props['data-dmi-active'] === '1').length === 1,
   String(popupRows.filter(item => item.props['data-dmi-active'] === '1').length))
 
@@ -909,75 +931,79 @@ requests.length = 0
 popupRows[1].props.onClick()
 await settle()
 const choiceRequest = requests.find(item => item.path === '/dsh-rustvy/session-key' && item.method === 'POST')
-check('picking a key posts to /session-key', choiceRequest !== undefined, JSON.stringify(requests.map(item => item.path)))
+check('picking a key posts to /session-key', choiceRequest !== undefined,
+  JSON.stringify(requests.map(item => item.path)))
 const choiceBody = JSON.parse(choiceRequest.body)
 check('the choice carries this session and that key',
   choiceBody.sessionId === 's-1' && choiceBody.keyId === 'k2', JSON.stringify(choiceBody))
 keyTree = await viewComponent(renderKeyControl, { sessionId: 's-1' })
-check('the switch now names the chosen key', allText(keyTree).includes('Второй'), allText(keyTree))
+check('the selector now names the chosen key', allText(keyTree).includes('Второй'), allText(keyTree))
 
-/* --------------------------- the picker section -------------------------- */
+// One key is no choice, so the selector goes away rather than showing a single row.
+KEYS = structuredClone(KEYS_FIXTURE)
+KEYS.keys = [KEYS_FIXTURE.keys[0]]
+check('one key draws no selector at all',
+  allText(await viewComponent(renderKeyControl, { sessionId: 's-1' })) === '')
+KEYS = structuredClone(KEYS_FIXTURE)
+check('the selector returns when a second key exists',
+  allText(await viewComponent(renderKeyControl, { sessionId: 's-1' })) !== '')
+
+/* ------------------ the picker: marks and clone-group hiding ---------------- */
+/** One model row, in the shape the host's own bundle renders it. */
+function pickerRow(model, parent) {
+  const row = documentStub.createElement('button')
+  row.setAttribute('role', 'menuitemradio')
+  row.setAttribute('aria-checked', 'false')
+  row.setAttribute('class', 'ms_option ms_modelOption')
+  row.setAttribute('title', model)
+  const copy = documentStub.createElement('span')
+  copy.setAttribute('class', 'ms_optionCopy')
+  const name = documentStub.createElement('span')
+  name.setAttribute('class', 'ms_modelName')
+  name.textContent = model
+  copy.appendChild(name)
+  row.appendChild(copy)
+  const tick = documentStub.createElement('span')
+  tick.setAttribute('class', 'ms_check')
+  row.appendChild(tick)
+  parent.appendChild(row)
+  return row
+}
+
 /**
  * A picker menu in the shape the host's own bundle renders it: a portal child
  * `div[role="menu"]` whose classes match `_groups`, holding provider groups of
  * `button[role="menuitemradio"]` rows with `_optionCopy > _modelName` and a
  * trailing `_check`.
  *
- * Both group shapes are present on purpose, because the header cannot be matched
- * by class — the primitives package that renders it is a frozen platform module —
- * so the hiding has to work from structure alone: once as a header inside a group
- * wrapper, once as a bare header followed by its rows as siblings.
+ * A group is wrapped or flat, and both shapes are exercised on purpose: a header
+ * cannot be matched by class — the primitives package that renders it is a frozen
+ * platform module — so the hiding has to work from structure alone, and the two
+ * shapes are the two ways a structure can carry "these rows belong to that name".
+ *
+ * @param groups - `[{ label, models, flat }]`.
+ * @returns the menu, already in the document.
  */
-function buildPickerMenu() {
+function buildPickerMenu(groups) {
   const menu = documentStub.createElement('div')
   menu.setAttribute('role', 'menu')
   menu.setAttribute('aria-label', 'Модели')
   menu.setAttribute('class', 'ms_groups scrollable')
-
-  const modelRow = (model, parent) => {
-    const row = documentStub.createElement('button')
-    row.setAttribute('role', 'menuitemradio')
-    row.setAttribute('aria-checked', 'false')
-    row.setAttribute('class', 'ms_option ms_modelOption')
-    row.setAttribute('title', model)
-    const copy = documentStub.createElement('span')
-    copy.setAttribute('class', 'ms_optionCopy')
-    const name = documentStub.createElement('span')
-    name.setAttribute('class', 'ms_modelName')
-    name.textContent = model
-    copy.appendChild(name)
-    row.appendChild(copy)
-    const check = documentStub.createElement('span')
-    check.setAttribute('class', 'ms_check')
-    row.appendChild(check)
-    parent.appendChild(row)
-    return row
-  }
-
-  const wrappedGroup = (label, models) => {
+  for (const group of groups) {
+    const head = documentStub.createElement('div')
+    head.setAttribute('class', group.flat === true ? 'ms_stickyHeader' : 'ms_groupLabel')
+    head.textContent = group.label
+    if (group.flat === true) {
+      menu.appendChild(head)
+      for (const model of group.models) pickerRow(model, menu)
+      continue
+    }
     const box = documentStub.createElement('div')
     box.setAttribute('class', 'ms_group')
-    const head = documentStub.createElement('div')
-    head.setAttribute('class', 'ms_groupLabel')
-    head.textContent = label
     box.appendChild(head)
-    for (const model of models) modelRow(model, box)
+    for (const model of group.models) pickerRow(model, box)
     menu.appendChild(box)
-    return box
   }
-
-  const flatGroup = (label, models) => {
-    const head = documentStub.createElement('div')
-    head.setAttribute('class', 'ms_stickyHeader')
-    head.textContent = label
-    menu.appendChild(head)
-    for (const model of models) modelRow(model, menu)
-    return head
-  }
-
-  wrappedGroup('rustvy', ['claude-opus-5-5', 'gpt-5'])
-  wrappedGroup('rustvy · ключ 3', ['gpt-5'])
-  flatGroup('rustvy · ключ 2', ['claude-opus-5-5'])
   documentStub.body.appendChild(menu)
   return menu
 }
@@ -988,89 +1014,21 @@ async function pass() {
   await new Promise(resolve => setTimeout(resolve, 40))
 }
 
-/**
- * Make the shared state follow the fixture again, then repaint.
- *
- * Swapping the fixture under a running plugin is not something a user can do, and
- * since the read throttle landed it is no longer something an idle interaction does
- * either — so the test forces a read the way a deliberate open would, and only
- * then lets the decorator paint what it learned.
- */
-async function refreshKeys() {
-  renderComponent(renderKeyControl, { sessionId: 's-1' })
-  await settle()
-  await pass()
-}
+// One group the user picks from, and two per-key clones the host cannot drop: a
+// clone has to keep its models so the call still resolves once the swap has
+// renamed the route. `KEYS_FIXTURE.hiddenGroups` names exactly the two clones.
+const menu = buildPickerMenu([
+  { label: 'rustvy', models: ['claude-opus-5-5', 'gpt-5'] },
+  { label: 'rustvy · ключ 3', models: ['gpt-5'] },
+  { label: 'rustvy · ключ 2', models: ['claude-opus-5-5'], flat: true },
+])
+// A menu none of whose headers is a clone, which must be left completely alone.
+const plainMenu = buildPickerMenu([{ label: 'another provider', models: ['gpt-5'] }])
 
-const menu = buildPickerMenu()
-const keyBoxes = () => menu.querySelectorAll('[data-dmi-keys]')
-const keyRowsOf = () => menu.querySelectorAll('[data-dmi-key-row]')
-const hiddenOf = () => menu.querySelectorAll('.dmi-hidden-group')
-/** The host's own rows: a key row borrows their markup, so shape alone cannot tell them apart. */
-const hostRows = () => menu.querySelectorAll('[role="menuitemradio"]')
-  .filter(row => row.closest('[data-dmi-keys]') === null)
-const visibleModels = () => hostRows()
-  .filter(row => !row.classList.contains('dmi-hidden-group') && !row.closest('.dmi-hidden-group'))
-  .map(row => row.attributes.title)
-
-await pass()
-check('the picker menu grew a key section', keyBoxes().length === 1, String(keyBoxes().length))
-check('the section is headed «API-ключ»', keyBoxes()[0]?.textContent.includes('API-ключ') === true)
-check('the section has one row per key', keyRowsOf().length === KEYS.keys.length, String(keyRowsOf().length))
-check('the section is appended after the last group',
-  menu.children[menu.children.length - 1]?.hasAttribute('data-dmi-keys') === true)
-check('a key row mirrors the host row markup',
-  keyRowsOf().every(row => row.tagName === 'BUTTON'
-    && row.attributes.role === 'menuitemradio'
-    && row.querySelector('[class*="_optionCopy"]') !== null
-    && row.querySelector('.dmi-key-check') !== null))
-check('a key row borrows the host row classes, so it inherits the menu geometry',
-  keyRowsOf().every(row => /ms_modelOption/u.test(row.className) && row.attributes['data-dmi-borrowed'] === '1'),
-  keyRowsOf().map(row => row.className).join(' | '))
-check('the row of the chosen key is marked active',
-  keyRowsOf().filter(row => row.attributes['data-dmi-active'] === '1').length === 1
-  && keyRowsOf().find(row => row.attributes['data-dmi-active'] === '1')?.attributes['data-dmi-key-row'] === 'k2',
-  keyRowsOf().map(row => `${row.attributes['data-dmi-key-row']}=${row.attributes['data-dmi-active'] ?? '-'}`).join(' '))
-// Two of the three groups are per-key clones: one wrapped, one flat. The wrapped
-// one is hidden as a single group element, the flat one as a header plus its rows.
-check('both clone groups are hidden, in either shape', hiddenOf().length === 3, String(hiddenOf().length))
-check('the group the user picks from keeps every model',
-  visibleModels().join('|') === 'claude-opus-5-5|gpt-5', visibleModels().join('|'))
-
-await pass()
-check('a second pass leaves the section alone', keyBoxes().length === 1 && keyRowsOf().length === KEYS.keys.length)
-check('a second pass leaves the hidden groups alone', hiddenOf().length === 3)
-
-requests.length = 0
-keyRowsOf().find(row => row.attributes['data-dmi-key-row'] === 'k1').fire('click')
-await settle()
-const pickerChoice = requests.find(item => item.path === '/dsh-rustvy/session-key' && item.method === 'POST')
-check('a picker row posts the same choice', pickerChoice !== undefined, JSON.stringify(requests.map(item => item.path)))
-check('the picker row posts it for the composer session',
-  JSON.parse(pickerChoice.body).sessionId === 's-1' && JSON.parse(pickerChoice.body).keyId === 'k1',
-  String(pickerChoice?.body))
-await pass()
-check('the tick moved to the row that was clicked',
-  keyRowsOf().find(row => row.attributes['data-dmi-active'] === '1')?.attributes['data-dmi-key-row'] === 'k1',
-  keyRowsOf().map(row => `${row.attributes['data-dmi-key-row']}=${row.attributes['data-dmi-active'] ?? '-'}`).join(' '))
-check('the menu is still open, so the click did not bubble to the host',
-  menu.parentNode === documentStub.body && keyBoxes().length === 1)
-
-// One key is no choice, so the section goes away rather than showing a single row.
-KEYS = structuredClone(KEYS_FIXTURE)
-KEYS.keys = [KEYS_FIXTURE.keys[0]]
-KEYS.hiddenGroups = []
-await refreshKeys()
-check('one key draws no section at all', keyBoxes().length === 0, String(keyBoxes().length))
-check('hiding nothing restores every group', hiddenOf().length === 0)
-KEYS = structuredClone(KEYS_FIXTURE)
-await refreshKeys()
-check('the section returns when a second key exists', keyBoxes().length === 1 && keyRowsOf().length === 2)
-
-// The `/model` popup is a card rather than a menu, and a card is too common a
-// shape to trust on its own: it qualifies only when it holds model names.
-const popup = documentStub.createElement('div')
-popup.setAttribute('class', 'cmd_card')
+// The `/model` popup is a card rather than a menu, and it is the other surface a
+// key section used to be appended to.
+const modelPopup = documentStub.createElement('div')
+modelPopup.setAttribute('class', 'cmd_card')
 for (const model of ['claude-opus-5-5', 'gpt-5']) {
   const row = documentStub.createElement('div')
   row.setAttribute('class', 'cmd_row')
@@ -1078,18 +1036,37 @@ for (const model of ['claude-opus-5-5', 'gpt-5']) {
   name.setAttribute('class', 'cmd_labelText')
   name.textContent = model
   row.appendChild(name)
-  popup.appendChild(row)
+  modelPopup.appendChild(row)
 }
-documentStub.body.appendChild(popup)
-const plainCard = documentStub.createElement('div')
-plainCard.setAttribute('class', 'set_card')
-plainCard.appendChild(documentStub.createElement('span'))
-documentStub.body.appendChild(plainCard)
+documentStub.body.appendChild(modelPopup)
+
+const hiddenOf = node => node.querySelectorAll('.dmi-hidden-group')
+/** The model rows a user can still reach: neither hidden nor inside a hidden group. */
+const visibleModels = () => menu.querySelectorAll('[role="menuitemradio"]')
+  .filter(row => !row.classList.contains('dmi-hidden-group') && row.closest('.dmi-hidden-group') === null)
+  .map(row => row.attributes.title)
+
 await pass()
-check('the /model popup grows the same section',
-  popup.querySelectorAll('[data-dmi-key-row]').length === KEYS.keys.length,
-  String(popup.querySelectorAll('[data-dmi-key-row]').length))
-check('a card with no model names is left alone', plainCard.querySelectorAll('[data-dmi-keys]').length === 0)
+await pass()
+// The positive control. Without it every "nothing was drawn here" assertion below
+// would also pass on a stub the decorator never matched at all.
+check('the marks still reach the picker menu', menu.querySelectorAll('.dmi-mark').length > 0,
+  String(menu.querySelectorAll('.dmi-mark').length))
+check('the picker menu grows no key section', menu.querySelectorAll('[data-dmi-keys]').length === 0)
+check('the picker menu grows no key rows', menu.querySelectorAll('[data-dmi-key-row]').length === 0)
+check('the /model popup grows no key section', modelPopup.querySelectorAll('[data-dmi-keys]').length === 0)
+
+// The wrapped clone is hidden as one group element, the flat one as a header plus
+// its rows — three elements for two groups.
+check('both clone groups are hidden, in either shape', hiddenOf(menu).length === 3, String(hiddenOf(menu).length))
+check('the provider the user picks from keeps every model',
+  visibleModels().join('|') === 'claude-opus-5-5|gpt-5', visibleModels().join('|'))
+check('a menu with no clone header hides nothing', hiddenOf(plainMenu).length === 0,
+  String(hiddenOf(plainMenu).length))
+
+await pass()
+check('a second pass leaves the hidden groups alone', hiddenOf(menu).length === 3, String(hiddenOf(menu).length))
+check('and still hides nothing it should not', hiddenOf(plainMenu).length === 0)
 
 // --- the interaction throttle ---------------------------------------------
 // Every pointerdown and focusin in the whole application reaches this half, and
@@ -1106,16 +1083,23 @@ async function interact() {
   await new Promise(resolve => setTimeout(resolve, 40))
 }
 
+/** The selector's own button, from a freshly rendered tree. */
+function switchButton(node) {
+  return collect(node, 'button').find(item => /dmi-keybtn/u.test(String(item.props.className ?? '')))
+}
+
 await new Promise(resolve => setTimeout(resolve, 2100))
 requests.length = 0
 await interact()
 await interact()
 check('two interactions in a row cost one key read', sessionReads() === 1, String(sessionReads()))
 
+// Opening the selector is a deliberate act, so it reads inside the window too.
 requests.length = 0
 keyTree = renderComponent(renderKeyControl, { sessionId: 's-1' })
+switchButton(keyTree).props.onClick()
 await settle()
-check('a deliberate open still forces a read', sessionReads() === 1, String(sessionReads()))
+check('opening the selector forces a read of its own', sessionReads() === 1, String(sessionReads()))
 
 requests.length = 0
 await interact()
@@ -1123,8 +1107,13 @@ await interact()
 check('and the interactions after it are throttled again', sessionReads() === 0, String(sessionReads()))
 
 // A mutation's answer is itself a fresh list, so it must not be followed by a read.
+keyTree = renderComponent(renderKeyControl, { sessionId: 's-1' })
+switchButton(keyTree).props.onClick()
+await settle()
+keyTree = renderComponent(renderKeyControl, { sessionId: 's-1' })
 requests.length = 0
-keyRowsOf().find(row => row.attributes['data-dmi-key-row'] === 'k2').fire('click')
+collect(keyTree, 'button')
+  .filter(item => /dmi-keypop-row/u.test(String(item.props.className ?? '')))[1].props.onClick()
 await settle()
 const afterChoice = requests.filter(item => item.path.startsWith('/dsh-rustvy/session-key'))
 check('a choice costs one POST and no follow-up read',
@@ -1136,10 +1125,16 @@ check('the next interaction is throttled by the answer that POST brought home',
 
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)
-check('unload took the key section with it', menu.querySelectorAll('[data-dmi-keys]').length === 0)
-check('unload took the popup section with it', popup.querySelectorAll('[data-dmi-keys]').length === 0)
 check('unload took the marks with it', menu.querySelectorAll('.dmi-mark').length === 0)
-check('unload left no hidden group behind', menu.querySelectorAll('.dmi-hidden-group').length === 0)
+// The groups this half hid are its doing, so an unload has to give them back:
+// leaving the class behind would hide a whole provider with nothing able to
+// restore it, since the stylesheet that reads the class goes too.
+check('unload unhid every provider group',
+  hiddenOf(menu).length === 0 && hiddenOf(plainMenu).length === 0,
+  String(hiddenOf(menu).length))
+check('unload left no key section or key row anywhere',
+  menu.querySelectorAll('[data-dmi-keys], [data-dmi-key-row]').length === 0
+  && modelPopup.querySelectorAll('[data-dmi-keys], [data-dmi-key-row]').length === 0)
 
 const failed = results.filter(ok => !ok).length
 console.log(`\n${results.length - failed}/${results.length} passed`)

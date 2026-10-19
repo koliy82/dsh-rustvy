@@ -43,16 +43,21 @@ adapter's exact entry shape, shows the difference against what is installed, and
 writes it back through `ctx.configEditor` when asked.
 
 **Keys.** Several provider keys in one profile, and a key of its own for any one
-chat — chosen where a reasoning level is chosen. A key is added inside the plugin,
-with a **«+»** button: no `.env`, no `cordis.patch.yml` and no trip to the Models
-page, and the choice survives a restart. The built-in DeepSeek account is
-untouched: the substitution only ever applies to this plugin's own routes.
+chat — chosen in the composer's tool row, right after the access-mode dropdown. A
+key is added inside the plugin, with a **«+»** button: no `.env`, no
+`cordis.patch.yml` and no trip to the Models page, and the choice survives a
+restart. The built-in DeepSeek account is untouched: the substitution only ever
+applies to this plugin's own routes.
 
 | Surface | What appears |
 |---|---|
 | **Settings → Rustvy** | an «API-ключи» section: the key list, a **«+»** button, and per key — replace the value, rename, test, make default, delete |
-| The composer, beside the model button | a compact switch for this chat's key, with a menu and a **«+ Добавить ключ»** row |
-| The model menu and the `/model` popup | an «API-ключ» section at the bottom of the menu: one row per key, ticked on the active one |
+| The composer, right after the access-mode dropdown | a compact switch for this chat's key, with a menu and a **«+ Добавить ключ»** row |
+
+There is no key section in the model menu or in the `/model` popup: the choice lives
+in one place. What the model menu gets instead is the removal of the provider groups
+that turn out to be this ring's route clones — otherwise the same model list would be
+repeated once per key.
 
 ## Why you would want it
 
@@ -172,8 +177,8 @@ Nothing is written without one of those, unless you ask for it in the settings.
 The **«API-ключи»** section on the same page holds the ring: the **«+»** button
 opens an inline "label + value" form, and each key's row offers a value
 replacement, a rename, making it the default, a test and a delete. None of that is
-required, though — the composer's switch and the picker's own section do the same
-thing for whichever chat is open, without leaving the conversation.
+required, though — the switch in the composer's tool row does the same thing for
+whichever chat is open, without leaving the conversation.
 
 ## Settings
 
@@ -346,9 +351,10 @@ catalog-failure rows are matched by nothing and stay bare.
 ## The API-key ring
 
 Several provider keys in one profile, and each chat sending its requests with the
-one its user picked. The choice lives beside the model and reasoning-level
-choices, applies to a single chat, and survives a restart. The built-in DeepSeek
-account is untouched by anything in this section.
+one its user picked. The choice lives in the composer's tool row — beside the
+access-mode dropdown rather than in the model menu — applies to a single chat, and
+survives a restart. The built-in DeepSeek account is untouched by anything in this
+section.
 
 ### Why one key is one route
 
@@ -423,9 +429,9 @@ one instead of holding on to the old.
 
 ### What the interface shows
 
-Three surfaces, and two of them appear only when there is something to choose: with
-one key neither the menu section nor the composer button is drawn at all, because
-one key is not a choice.
+Two surfaces: one manages the ring, the other picks a key for its own chat. The
+switch appears only when there is something to choose — with one key it is not drawn
+at all, because one key is not a choice.
 
 **Settings → Rustvy → «API-ключи».** The key list: label, mask, credential
 reference, route, how many models that route serves, and how many chats picked it.
@@ -439,25 +445,30 @@ their own, the missing and stale route lists, copyable paths to both files, and 
 **«Починить маршруты»** button that appears only when some key's route really has
 gone.
 
-**The composer.** A compact button beside the model button, in the
-`conversation.input.left` slot: the active key's label, or "ключ по умолчанию" when
-the chat has no pick of its own. Its menu holds one row per key with a tick on the
-active one, a "По умолчанию" row, and a **«+ Добавить ключ»** row with the same
-inline form; a key added from inside a conversation is chosen for that conversation
-straight away, because adding one from there is done in order to send with it. The
-button renders nothing until the slot has handed it a `sessionId`: the choice belongs
-to a chat, and a switch that saved it for the wrong one is worse than no switch.
+**The composer.** A compact button in the tool row, right after the access-mode
+dropdown — a registration in the `conversation.input.left` slot: the active key's
+label, or "ключ по умолчанию" when the chat has no pick of its own. Its menu holds one
+row per key with a tick on the active one, a "По умолчанию" row, and a **«+ Добавить
+ключ»** row with the same inline form; a key added from inside a conversation is
+chosen for that conversation straight away, because adding one from there is done in
+order to send with it. The button renders nothing until the slot has handed it a
+`sessionId`: the choice belongs to a chat, and a switch that saved it for the wrong
+one is worse than no switch.
 
-**The model menu and the `/model` popup.** A separator, an «API-ключ» header and one
-row per key at the bottom of the menu, ticked on the effective one and annotated
-"основной" or "по умолчанию". The rows are this half's own rather than the host's, so
-a repaint of the menu removes them and the observer puts them back — the same device
-the marks use. Provider groups named in `hiddenGroups` are hidden together with their
-rows, so one model list is not repeated once per key: a clone is a key, not a
-provider. A group header is hidden only when it can be identified with confidence (a
-container with `role="group"` and an `aria-label`, or a group-heading element); when
-none is found nothing is hidden, because a model row hidden by mistake is a choice
-taken away, while a duplicate group shown is only a repetition.
+**The model menu and the `/model` popup.** No key section here — no rows and no
+header: the choice lives in the composer, and a second copy of the same list in the
+menu would only double the places to get it wrong. What the decorator does here is
+the opposite: it hides the provider groups the host names in `hiddenGroups`, which
+are this ring's route clones, so one model list is not repeated once per key. The
+host cannot simply not declare them — a clone needs its own model list, or a request
+whose route was just renamed would find no model in it. The hiding is structural and
+deliberately cautious: a group header is recognised by its shape rather than by a
+class name, because the host's primitives classes are neither readable here nor
+stable across versions, and what gets hidden is either the smallest element that
+encloses the group or the header together with the siblings after it up to the next
+header. When nothing can be identified with confidence, nothing is hidden: a model
+row hidden by mistake is a choice taken away, while a duplicate group left in the
+list is only a repetition.
 
 ### What adding a key does
 
@@ -584,7 +595,7 @@ Each capability degrades on its own:
 | `lib/models.js` | pure mapping: what an origin publishes → one route-profile entry, the drift between two lists, and the YAML for a manual edit |
 | `lib/keys.js` | pure ring arithmetic: labels, credential-reference and route names, the ring and pick documents, and reconciling a provider map with the ring |
 | `lib/net.js` | one outbound GET on the process's route, then the environment's proxy |
-| `client/client.js` | hand-authored browser bundle: the decorator, the settings page, the composer's key switch and the picker's key section |
+| `client/client.js` | hand-authored browser bundle: the decorator, the settings page, the composer's key switch, and the hiding of clone groups in the model menu |
 | `locale/en.json`, `ru.json`, `zh.json` | the plugins-menu title and description |
 | `assets/icon.svg` | the plugins-menu icon |
 | `cordis.patch.yml` | the loader row the profile's bundle list pulls in |
@@ -679,13 +690,13 @@ feature switched off — and the capability coming back once the reason is gone;
 field to `/config`; the «Маршруты ключей» block with the substitution counters, the
 chats with a pick of their own, both file paths, the missing and stale routes and the
 **«Починить маршруты»** button; the limit of 12 keys; the composer's switch, which
-renders nothing without a `sessionId`, reads its chat's choice, posts it to
-`/session-key` and offers to add a key; and the «API-ключ» section in the model menu
-and in the `/model` popup — one row per key, ticked on the active one, the clone's
-group hidden, a click that does not bubble to the host (the menu stays open), no
-section at all with a single key, and an unload that takes both the section and the
-hidden groups with it. Separately, it asserts that a key value appears in no URL and
-is gone from the page once the add is done.
+renders nothing without a `sessionId` and nothing at all with a single key, reads its
+chat's choice, posts it to `/session-key` and offers to add a key; a model menu and a
+`/model` popup that grow no key section and no key rows; what the reads cost — two
+interactions in a row spend one key read, opening the switch always reads, and a
+choice spends one POST with no follow-up read; and an unload that leaves nothing of
+its own in the picker or the popup. Separately, it asserts that a key value appears
+in no URL and is gone from the page once the add is done.
 
 The mark-drawing half is **not** covered by an automated suite in this repository,
 and that is worth knowing up front. It works on the DOM of an already-open page, so
@@ -694,7 +705,9 @@ rows, provider headings and the search field stay bare, that a model whose logo
 could not be fetched gets a monogram chip instead of a blank box, that a row added
 later gets marked too, that a second pass duplicates nothing, and that an unload
 removes what was added. `model-sync-client-test.mjs` covers the settings page and the
-menu's key section, not the drawing of marks.
+composer's key switch, not the drawing of marks; hiding the clone groups is the same
+kind of work on an already-open page, and all the suite asserts there is that the
+menu grows no key section and no key rows.
 
 ## License
 
