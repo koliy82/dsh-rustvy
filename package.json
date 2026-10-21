@@ -1,6 +1,6 @@
 {
   "name": "dsh-rustvy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Rustvy for DeepSeek Harness: vendor marks in the model picker, a model list kept in step with what the provider actually serves, and a ring of API keys that lets each chat send its requests with a key of its own — the host half mirrors the catalog and logos to loopback, regenerates the pi-ai route's models from the route's own endpoint with the drift shown before anything is written, and clones that route once per key, so a key value stays in the harness credential store and never in the plugin's files.",
   "type": "module",
   "license": "MIT",
