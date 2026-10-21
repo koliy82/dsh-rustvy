@@ -153,7 +153,7 @@ const entry = manifest.main ?? 'lib/index.js'
 check('the main entry exists', existsSync(join(ROOT, entry)), String(entry))
 // The bootstrap re-imports these through a cache-busting query, so a renamed or
 // missing one is a plugin that loads and then silently stops reloading.
-for (const module of ['lib/host.js', 'lib/models.js', 'lib/keys.js', 'lib/net.js']) {
+for (const module of ['lib/host.js', 'lib/models.js', 'lib/keys.js', 'lib/net.js', 'lib/errors.js']) {
   check(`${module} exists`, existsSync(join(ROOT, module)))
 }
 check('the client bundle exists', existsSync(join(ROOT, 'client/client.js')))
@@ -220,6 +220,83 @@ try {
     keys.maskKey('sk-live-secret-01'))
 } catch (error) {
   check('lib/keys.js imports', false, error.message)
+}
+
+// The report module is pure as well, and it owns the two decisions the whole
+// monitor rests on: an infrastructure fault is reported and the user's own account
+// trouble is not, and the report that goes out carries the fields the collector's
+// API actually reads. All of it is cheap to assert here, and a classifier or a
+// mapping that got it wrong is invisible in a tarball that installs cleanly — it
+// simply reports nothing, reports somebody's unpaid balance as an outage, or
+// reports to a field the collector ignores.
+try {
+  const errors = await import(`file://${join(ROOT, 'lib/errors.js').replace(/\\/g, '/')}`)
+  const expected = ['classifyFailure', 'scrubErrorText', 'readInstallIdentity', 'eventRecord', 'reportPayload', 'createReporter']
+  const missing = expected.filter(name => typeof errors[name] !== 'function')
+  check('lib/errors.js exports its whole surface', missing.length === 0, missing.join(', '))
+  check('lib/errors.js exports its report version',
+    Number.isInteger(errors.REPORT_VERSION) && errors.REPORT_VERSION >= 1, String(errors.REPORT_VERSION))
+  check('lib/errors.js exports its non-infra codes',
+    errors.NON_INFRA_CODES instanceof Set && errors.NON_INFRA_CODES.size > 1, String(errors.NON_INFRA_CODES?.size))
+  check('lib/errors.js exports its folding limits',
+    Number.isFinite(errors.FOLD_LIMITS?.FAILURE_WINDOW_MS) && Number.isFinite(errors.FOLD_LIMITS?.MAX_BATCH)
+    && Number.isFinite(errors.FOLD_LIMITS?.MAX_PER_MINUTE),
+    Object.keys(errors.FOLD_LIMITS ?? {}).join(', '))
+
+  const outage = errors.classifyFailure({ message: 'upstream_502', code: 'PI_AI_ERROR' })
+  check('an upstream gateway fault counts as infrastructure',
+    outage.infra === true && outage.kind === 'upstream_502' && outage.status === 502, JSON.stringify(outage))
+  const quota = errors.classifyFailure({ message: 'You exceeded your current quota', code: 'QUOTA' })
+  check('an exhausted quota does not', quota.infra === false, JSON.stringify(quota))
+
+  // The wire mapping: `code` carries our kind, the harness verdict moves to
+  // `meta.harnessCode`, `status` is absent rather than 0, and `message` is never
+  // empty — a report with no text is worthless to whoever reads it.
+  const record = errors.eventRecord({
+    at: 1792435355423, model: 'gpt-6.1-sol', ok: false, status: 0, ms: 10683, err: '',
+    route: 'rustvy', code: 'TIMEOUT', kind: 'connect_timeout', count: 1,
+  }, { id: 'install-uuid' })
+  const payload = errors.reportPayload(record)
+  check('a report names its kind as the code and keeps the harness verdict in meta',
+    payload.code === 'connect_timeout' && payload.meta?.harnessCode === 'TIMEOUT'
+    && payload.plugin === 'dsh-rustvy' && payload.provider === 'rustvy'
+    && payload.meta?.id === 'install-uuid' && payload.ts === 1792435355423, JSON.stringify(payload))
+  check('a report omits an absent status and never sends an empty message',
+    !('status' in payload) && typeof payload.message === 'string' && payload.message !== '', JSON.stringify(payload.message))
+  check('a report sends exactly one alias per concept',
+    !('error' in payload) && !('detail' in payload) && !('type' in payload) && !('kind' in payload)
+    && !('timestamp' in payload) && !('source' in payload) && !('events' in payload), Object.keys(payload).join(', '))
+
+  // The per-minute ceiling is the property that keeps one install from spending a
+  // whole NAT's share of the collector's 60 reports/min/IP, and it is cheap to
+  // reach only from here: a burst must pause, must not lose a single report, and
+  // must publish the pause where a reader can see it. A regression that turned
+  // this into a drop — or into a burst — would be invisible in a package that
+  // installs cleanly and would only show up as everybody's 429s.
+  const gateSent = []
+  const gateClock = 1_000_000
+  const gate = errors.createReporter({
+    // The real collector's address, so this fixture cannot be mistaken for a
+    // private one; `send` is injected, so nothing here reaches the network.
+    endpoint: 'http://185.94.29.228:3789/api/report',
+    identity: { id: 'publish-gate' },
+    send: async report => { gateSent.push(report); return { status: 200 } },
+    now: () => gateClock,
+    limits: { MAX_PER_MINUTE: 1, MAX_BATCH: 5 },
+  })
+  gate.noteFailure({ model: 'a', kind: 'dns', err: 'ENOTFOUND', at: gateClock })
+  gate.noteFailure({ model: 'b', kind: 'dns', err: 'ENOTFOUND', at: gateClock + 10 })
+  gate.start()
+  await gate.flush({ settle: true })
+  const throttled = gate.summary()
+  check('the per-minute ceiling pauses delivery instead of dropping it',
+    gateSent.length === 1 && throttled.queued === 1 && throttled.dropped === 0 && throttled.failed === 0,
+    `sent ${gateSent.length}, queued ${throttled.queued}, dropped ${throttled.dropped}, failed ${throttled.failed}`)
+  check('and says so through nextFlushAt rather than only through the log',
+    throttled.nextFlushAt === gateClock + errors.FOLD_LIMITS.MINUTE_MS, String(throttled.nextFlushAt))
+  gate.dispose()
+} catch (error) {
+  check('lib/errors.js imports', false, error.message)
 }
 
 /* --------------------------------- readme --------------------------------- */

@@ -219,6 +219,8 @@ const STATE = {
     config: 'C:\\profile\\.dsh-rustvy\\config.json',
     backup: 'C:\\profile\\.dsh-rustvy\\models-backup.json',
     patch: 'C:\\profile\\cordis.patch.yml',
+    install: 'C:\\profile\\.dsh-rustvy\\install.json',
+    errorsQueue: 'C:\\profile\\.dsh-rustvy\\errors-queue.json',
   },
   node: 'v22',
   absentLogos: [],
@@ -243,6 +245,31 @@ const STATE = {
     kept: [],
     entries: [{ id: 'ahmia-v7-pro', name: 'Ahmia 7 Pro' }],
     backup: null,
+  },
+  // The error collector's summary, in the shape `docs/error-report.md` specifies.
+  // `config.collectErrors` is deliberately absent from the fixture above: the
+  // default is on, and a page that needed the field present to draw the switch as
+  // on would draw it off for every host half older than the feature. The endpoint is
+  // the public collector the host really defaults to, and `200` is the answer it
+  // gives for an accepted report — the fixture uses the shipped contract, not an
+  // invented one.
+  errorReport: {
+    enabled: true,
+    endpoint: 'http://185.94.29.228:3789/api/report',
+    installId: 'a3f0c81b7d4e4f2a9c6b5d8e1f0a2b3c',
+    queued: 2,
+    sent: 5,
+    failed: 1,
+    dropped: 0,
+    folded: 3,
+    attempts: 9,
+    failures: 2,
+    successes: 5,
+    lastSentAt: 1792472700000,
+    lastStatus: 200,
+    lastError: null,
+    byKind: { upstream_502: 4, connect_timeout: 2, dns: 1 },
+    nextFlushAt: 1792473000000,
   },
 }
 globalThis.document = documentStub
@@ -282,6 +309,16 @@ let KEYS = structuredClone(KEYS_FIXTURE)
 const SESSION_KEYS = { 's-1': null }
 /** `'ok'`, or `'missing'` to answer 404 with an empty body like an older host half. */
 let KEYS_MODE = 'ok'
+/** `'ok'`, `'down'` for a transport failure, or `'refused'` for the collector's `400`. */
+let ERRORS_MODE = 'ok'
+/**
+ * `'bare'` for the envelope `POST /dsh-rustvy/errors` really answers with — the
+ * summary spread at the top level — or `'wrapped'` for the nested `errorReport`
+ * block that only `GET /state` uses. The bare one is the default because it is the
+ * branch production takes; the wrapped one exists so `noticeFor`'s tolerance for it
+ * is asserted rather than merely written.
+ */
+let ERRORS_ENVELOPE = 'bare'
 
 /** One host-side key mutation, answered with a fresh list plus the result field. */
 function mutateKeys(body) {
@@ -385,7 +422,43 @@ globalThis.fetch = async (url, init = {}) => {
   if (path.endsWith('/config') && method === 'POST') {
     const body = JSON.parse(init.body ?? '{}')
     if (body.apiKeys !== undefined) KEYS.enabled = body.apiKeys !== false
+    if (body.collectErrors !== undefined) STATE.config.collectErrors = body.collectErrors !== false
     return json(STATE)
+  }
+  // `/errors` answers with the fresh summary in the shape the host really sends —
+  // `{ ok: true, ...summary }`, bare at the top level, where only `GET /state` nests
+  // that same block as `errorReport`. `ERRORS_MODE` picks how the collector answers:
+  // `'down'` is a transport failure with the reports still on disk, `'refused'` is a
+  // `400` — a report the collector will not take and the host therefore drops rather
+  // than retries. `ERRORS_ENVELOPE = 'wrapped'` answers the nested shape instead and
+  // moves nothing at all, so one and the same summary can be read through both.
+  if (path.endsWith('/errors')) {
+    const body = JSON.parse(init.body ?? '{}')
+    const report = STATE.errorReport
+    if (method === 'POST' && ERRORS_ENVELOPE !== 'wrapped') {
+      report.attempts += 1
+      if (ERRORS_MODE === 'down') {
+        report.failures += 1
+        report.lastStatus = 0
+        report.lastError = 'connect ECONNREFUSED 185.94.29.228:3789'
+      } else if (ERRORS_MODE === 'refused') {
+        report.failed += 1
+        report.dropped += body.action === 'test' ? 1 : report.queued
+        report.queued = body.action === 'test' ? report.queued : 0
+        report.lastStatus = 400
+        report.lastError = 'the collector answered 400'
+      } else {
+        report.successes += 1
+        report.sent += body.action === 'test' ? 1 : report.queued
+        report.queued = 0
+        report.lastStatus = 200
+        report.lastSentAt = 1792473300000
+        report.lastError = null
+      }
+    }
+    return json(ERRORS_ENVELOPE === 'wrapped'
+      ? { ok: true, errorReport: report }
+      : { ok: true, ...report })
   }
   const payload = path.endsWith('/apply-models')
     ? { ok: true, applied: true, count: 12, plan: STATE.modelSync }
@@ -596,7 +669,7 @@ check('the mark size is editable', numbers.length === 1 && numbers[0].props.valu
 check('both dropdowns render', selects.length === 2, String(selects.length))
 check('auto-apply defaults to explicit', selects[0]?.props.value === 'explicit', String(selects[0]?.props.value))
 check('the name source defaults to the provider label', selects[1]?.props.value === 'displayName', String(selects[1]?.props.value))
-check('seven switches render', boxes.length === 7, String(boxes.length))
+check('eight switches render', boxes.length === 8, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -834,8 +907,11 @@ check('the key list comes back with the host route',
 
 // --- the fields the host half added on top of the contract ----------------
 text = allText(tree)
+// Eight, not seven: the page's own switches plus the ring's master switch, and the
+// error-collection switch below. The ring switch is the seventh of them, which is
+// the index the block after this one drives.
 check('the master switch for the ring is offered',
-  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 7
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 8
   && text.includes('Ключи на несколько чатов'))
 check('the key count is shown against the limit', text.includes('2 из 12'))
 check('each key reports how many models its route serves', text.includes('моделей: 12'))
@@ -898,6 +974,184 @@ check('the limit is explained', allText(tree).includes('Достигнут пр�
 KEYS = structuredClone(KEYS_FIXTURE)
 tree = await view()
 check('the "+" returns below the limit', findButton(tree, '+').props.disabled === false)
+
+/* ------------------------ error collection and uptime ---------------------- */
+// The one setting on this page that sends anything off the machine, so it is
+// asserted the way a user meets it: the switch and its exact label, the promise
+// written underneath it, the counters the reports move, and what the two buttons
+// post. The prose is checked by substring on purpose — a page that quietly dropped
+// "never sends your prompts" would otherwise still pass every structural check.
+
+/** The checkbox of the `label` whose whole text is one caption. */
+function switchNamed(node, caption) {
+  return collect(node, 'label')
+    .filter(item => allText(item).trim() === caption)
+    .map(item => collect(item, 'input').find(input => input.props.type === 'checkbox'))
+    .find(item => item !== undefined)
+}
+
+/** One status row's value: the second span of the row whose first span is its name. */
+function rowValue(node, name) {
+  const row = collect(node, 'div').find(item => {
+    const kids = item.children ?? []
+    return kids.length >= 2 && kids[0]?.type === 'span' && kids[1]?.type === 'span'
+      && allText(kids[0]).trim() === name
+  })
+  return row === undefined ? undefined : allText(row.children[1]).trim()
+}
+
+const COLLECT_LABEL = 'Собирать ошибки rustvy'
+tree = await view()
+text = allText(tree)
+const collectSwitch = switchNamed(tree, COLLECT_LABEL)
+check('the page names the collection block', text.includes('Сбор ошибок Rustvy'))
+check('the collection switch carries its exact label', collectSwitch !== undefined)
+// The fixture config omits `collectErrors`, which is the shape an older host half
+// answers with: the default is on, and the switch has to say so rather than read a
+// missing field as a refusal.
+check('an absent collectErrors renders as on', collectSwitch?.props.checked === true,
+  String(collectSwitch?.props.checked))
+check('the description asks the user to leave it on',
+  text.includes('Пожалуйста, оставьте сбор включённым'))
+check('the description names what never leaves the machine',
+  text.includes('содержание сообщений и чатов') && text.includes('содержимое и пути файлов')
+  && text.includes('идентификатор сессии'))
+check('the description says only failures are sent, and that nobody probes',
+  text.includes('удачный запрос не отправляется никогда') && text.includes('отсутствие ошибок в окне')
+  && text.includes('которые сжигали бы ваши токены'))
+check('the description limits collection to the provider own faults',
+  text.includes('upstream_502') && text.includes('закончившейся подписке')
+  && text.includes('ограничении частоты'))
+check('the description says an undelivered report is queued',
+  text.includes('остаётся очередью на диске'))
+check('the endpoint is shown read-only, with no field to edit it',
+  rowValue(tree, 'адрес сборщика') === 'http://185.94.29.228:3789/api/report'
+  && !collect(tree, 'input').some(item => item.props.value === 'http://185.94.29.228:3789/api/report'),
+  String(rowValue(tree, 'адрес сборщика')))
+check('the anonymous id is shown truncated',
+  rowValue(tree, 'анонимный id') === 'a3f0c81b7d4e4f2a9c6b5d8e…', String(rowValue(tree, 'анонимный id')))
+check('the sent, queued and dropped counters are shown',
+  rowValue(tree, 'отправлено') === '5' && rowValue(tree, 'в очереди') === '2' && rowValue(tree, 'отброшено') === '0',
+  JSON.stringify([rowValue(tree, 'отправлено'), rowValue(tree, 'в очереди'), rowValue(tree, 'отброшено')]))
+check('the last answer carries the status and a local time',
+  rowValue(tree, 'последний ответ') === `HTTP 200, ${new Date(1792472700000).toLocaleString()}`,
+  String(rowValue(tree, 'последний ответ')))
+check('a delivery that went through reports no send error', rowValue(tree, 'ошибка отправки') === undefined)
+check('the failures are broken down by kind',
+  rowValue(tree, 'сбои по видам') === 'upstream_502: 4; connect_timeout: 2; dns: 1',
+  String(rowValue(tree, 'сбои по видам')))
+check('both collector files are shown as copyable paths',
+  text.includes('C:\\profile\\.dsh-rustvy\\install.json')
+  && text.includes('C:\\profile\\.dsh-rustvy\\errors-queue.json'))
+check('both send buttons are offered while collection is on',
+  findButton(tree, 'Отправить тестовое событие')?.props.disabled === false
+  && findButton(tree, 'Отправить очередь сейчас')?.props.disabled === false)
+
+requests.length = 0
+collectSwitch.props.onChange({ target: { checked: false } })
+await settle()
+check('the switch posts its own config field',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).collectErrors === false),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+tree = await view()
+check('the switch reads the host answer back', switchNamed(tree, COLLECT_LABEL).props.checked === false)
+check('both send buttons are disabled while collection is off',
+  findButton(tree, 'Отправить тестовое событие').props.disabled === true
+  && findButton(tree, 'Отправить очередь сейчас').props.disabled === true)
+
+requests.length = 0
+switchNamed(tree, COLLECT_LABEL).props.onChange({ target: { checked: true } })
+await settle()
+check('turning collection back on posts the same field',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).collectErrors === true),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+tree = await view()
+check('the buttons come back with the switch',
+  findButton(tree, 'Отправить тестовое событие').props.disabled === false
+  && findButton(tree, 'Отправить очередь сейчас').props.disabled === false)
+
+// A flush into an outage first, because it is the case the queue exists for: the
+// events must be seen not to have moved, and the warning must not read as a success.
+ERRORS_MODE = 'down'
+requests.length = 0
+findButton(tree, 'Отправить очередь сейчас').props.onClick()
+await settle()
+check('the flush button posts the flush action',
+  requests.some(item => item.path === '/dsh-rustvy/errors' && item.method === 'POST'
+    && JSON.parse(item.body ?? '{}').action === 'flush'),
+  JSON.stringify(requests.map(item => item.body)))
+tree = await view()
+text = allText(tree)
+check('a collector that is down is reported as a warning, not a success',
+  text.includes('Сборщик не принял очередь') && text.includes('ECONNREFUSED')
+  && !text.includes('Очередь отправлена сборщику'))
+check('the failed delivery is shown in the status block',
+  rowValue(tree, 'ошибка отправки') === 'connect ECONNREFUSED 185.94.29.228:3789',
+  String(rowValue(tree, 'ошибка отправки')))
+check('the events stay queued when the site does not answer', rowValue(tree, 'в очереди') === '2',
+  String(rowValue(tree, 'в очереди')))
+
+ERRORS_MODE = 'ok'
+requests.length = 0
+findButton(tree, 'Отправить тестовое событие').props.onClick()
+await settle()
+const errorRequest = requests.find(item => item.path === '/dsh-rustvy/errors' && item.method === 'POST')
+check('the test button posts to /errors', errorRequest !== undefined,
+  JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
+check('it asks for one synthetic event', JSON.parse(errorRequest.body).action === 'test', String(errorRequest?.body))
+// One literal, asserted through both envelopes: the host spreads the summary into its
+// answer, and `noticeFor` also accepts it nested, so the same summary has to produce
+// the same sentence whichever way it arrived.
+const TEST_NOTICE = 'Тестовое событие отправлено: ответ HTTP 200 (всего 6, в очереди 0).'
+tree = await view()
+text = allText(tree)
+check('the notice reports what the collector took', text.includes(TEST_NOTICE),
+  String(text.includes('Тестовое событие')))
+check('a delivery that went through drops the send-error row', rowValue(tree, 'ошибка отправки') === undefined)
+
+// The same summary nested under `errorReport` — the shape only `GET /state` uses, and
+// answered here without moving a single counter — has to render the identical notice.
+// `noticeFor` claims to read either envelope; a claim nothing exercises is not a
+// tolerance, it is a guess.
+ERRORS_ENVELOPE = 'wrapped'
+findButton(tree, 'Отправить тестовое событие').props.onClick()
+await settle()
+tree = await view()
+check('a summary nested under errorReport renders the same notice', allText(tree).includes(TEST_NOTICE))
+ERRORS_ENVELOPE = 'bare'
+
+// A `400` is the collector refusing the report itself — neither `message` nor `code`
+// in it — and the host drops that one rather than retrying it. The notice has to say
+// so: "still queued, it will go when the site answers" would promise something nothing
+// keeps. A `429` or a `5xx` means busy and stays queued, which is the case above.
+ERRORS_MODE = 'refused'
+findButton(tree, 'Отправить тестовое событие').props.onClick()
+await settle()
+tree = await view()
+text = allText(tree)
+check('a report refused as unusable is said to be dropped rather than kept',
+  text.includes('Сборщик отклонил отчёт как непригодный') && text.includes('the collector answered 400')
+  && text.includes('Он отброшен, а не оставлен в очереди'))
+check('the dropped report is counted', rowValue(tree, 'отброшено') === '1',
+  String(rowValue(tree, 'отброшено')))
+ERRORS_MODE = 'ok'
+
+// A host half older than the collector answers `/state` without the block. The page
+// still has to draw — switch, prose and buttons — and draw no status rows at all,
+// rather than throwing on a field that is not there.
+const REPORT = STATE.errorReport
+delete STATE.errorReport
+tree = await view()
+text = allText(tree)
+check('an older host half still gets the switch and its description',
+  switchNamed(tree, COLLECT_LABEL)?.props.checked === true && text.includes('Пожалуйста, оставьте сбор включённым'))
+check('and no status rows it has nothing to fill them with',
+  rowValue(tree, 'адрес сборщика') === undefined && rowValue(tree, 'сбои по видам') === undefined
+  && !text.includes('Состояние сборщика'))
+STATE.errorReport = REPORT
+tree = await view()
+check('the status block comes back with the summary',
+  rowValue(tree, 'адрес сборщика') === 'http://185.94.29.228:3789/api/report')
 
 /* -------------------------- the composer selector ------------------------- */
 // The key choice lives in exactly one place in a conversation: the composer's tool

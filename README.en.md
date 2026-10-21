@@ -235,10 +235,37 @@ switches, because it belongs to the ring — and that section is also where the 
 says why adding a key is unavailable, when the host offers no service to add one
 with.
 
-Stored in `<profile>\.dsh-rustvy\config.json`. Two environment variables
-override it, for a deployment that points the mirror elsewhere or wants the
-plugin mounted but inert: `DSH_RUSTVY_ORIGIN` and
-`DSH_RUSTVY_DISABLED=1`.
+Error collection:
+
+| Control | Default | Meaning |
+|---|---|---|
+| Собирать ошибки rustvy | on | master switch for the collector: one line per infrastructure fault of the provider goes to the uptime collector. Off sends nothing, and the queue already on disk stays on disk |
+
+The switch has a block of its own, «Сбор ошибок Rustvy», because it is the only setting
+on the page that sends anything off the machine — one line per failure of the provider
+goes to the monitor's collector. What leaves,
+what never does and when it fires is written right underneath it. The same block shows
+the state of the collection: the collector's address, the anonymous identifier, the sent,
+queued and dropped counters, the last answer and the last send error, and the failures
+broken down by kind. The address — `uptimeEndpoint`, `http://185.94.29.228:3789/api/report`
+by default — is shown rather than
+offered: there is no field for it, and it is repointed without a release by the
+`DSH_RUSTVY_UPTIME_ENDPOINT` environment variable or by hand in
+`<profile>\.dsh-rustvy\config.json`. The two buttons do exactly what they say:
+**Отправить тестовое событие** queues one synthetic event and flushes it immediately,
+**Отправить очередь сейчас** sends what has accumulated; both are disabled while
+collection is off.
+
+Stored in `<profile>\.dsh-rustvy\config.json`. Four environment variables
+override it, for a deployment that points the mirror and the collector elsewhere or
+wants the plugin mounted but inert, or mounted but silent: `DSH_RUSTVY_ORIGIN` and
+`DSH_RUSTVY_DISABLED=1`, `DSH_RUSTVY_UPTIME_ENDPOINT` and `DSH_RUSTVY_NO_ERRORS=1`.
+The first repoints the provider's site, the second disables the plugin whole. The third
+repoints the uptime collector and overrides both the default and `config.json`: only an
+address that parses as `http`/`https` is accepted, trailing slashes are stripped, and an
+unusable value is ignored, leaving the setting in force. The fourth, set to `1` or
+`true`, forces collection off regardless of the setting — the same device by which
+`DSH_RUSTVY_DISABLED` silences the marks.
 
 ## Where the pictures come from
 
@@ -411,9 +438,12 @@ not move.
 | Key values | `$DSH_HOME\.credentials.yaml`, `refs` — the same store the harness Models page writes and the same one the adapter reads |
 | The ring's metadata | `<profile>\.dsh-rustvy\keys.json` — `id`, label, credential reference, route, primary flag, ordinal, creation date, and `defaultKeyId` |
 | Per-chat picks | `<profile>\.dsh-rustvy\session-keys.json` — `sessionId → keyId` |
+| The install's anonymous identifier | `<profile>\.dsh-rustvy\install.json` — a random UUID and a creation date; it belongs to error collection rather than to the ring, and lives beside the plugin's other files |
+| Undelivered error reports | `<profile>\.dsh-rustvy\errors-queue.json` — the queue of reports the uptime collector has not accepted yet |
 
 No file of this plugin ever holds a key value: not `keys.json`, not
-`session-keys.json`, not the settings, not the profile backup a revert reads. The
+`session-keys.json`, not the settings, not the profile backup a revert reads, not the
+queue of error reports. The
 loopback routes answer with a mask — the first three and the last two characters —
 and an eight-character SHA-256 fingerprint, which is enough to recognise a key in a
 list and to notice two entries holding the same one, and not enough to use it. The
@@ -531,6 +561,161 @@ the `agent/request` waterfall at all, and `routing.applied` how many of them wer
 renamed to a key's route. A zero under live traffic means the waterfall never
 reaches the plugin, and that is visible at once.
 
+## Error collection and uptime
+
+The monitor exists because "the provider's site is down" is knowledge that today
+belongs only to the people who just ran into it, and to each of them separately. A
+failed request looks like a local problem: the user retries the step, switches model or
+walks away, and nobody — the provider included — learns that four hundred other
+installs were catching `upstream_502` at the same moment.
+
+Collecting it by polling is not an option. A probe request is a real request to a model,
+it costs the tokens of whoever's key it goes out on, and one "alive" mark per model per
+minute burns exactly what the user is paying for. So uptime here is derived from passive
+error reports: a request that happened anyway either succeeded or failed, the host half
+knows which either way, but only a failure ever leaves the machine. There are no
+additional requests at all, and the monitor judges a model's health by the absence of
+errors in a window — while knowing the one thing a probe can never show: how many
+*people* a fault reached.
+
+### What one report carries
+
+One report is one request: a flat JSON object, with no envelope and no array of events.
+The collector takes it on `POST /api/report`; `meta` is the only object in it, and
+everything else sits at the top level, because a great many of these are stored and read
+back grouped by model and hour.
+
+The default address is `http://185.94.29.228:3789/api/report`: the monitor's public
+collector, on bare HTTP over a bare IP deliberately for now. It is
+repointed without a release, through the `uptimeEndpoint` field in
+`<profile>\.dsh-rustvy\config.json` or the `DSH_RUSTVY_UPTIME_ENDPOINT` environment
+variable.
+
+| Request field | What it carries |
+|---|---|
+| `plugin` | `dsh-rustvy` |
+| `version` | the package version |
+| `provider` | the name of the route the request went out on |
+| `model` | the model's id |
+| `code` | the kind of fault, from this plugin's own vocabulary: `upstream_502`, `connect_timeout`, `dns`, … |
+| `status` | the HTTP status, and only when there is one: with no connection the field is absent rather than holding a `0` |
+| `message` | the provider's own error text, scrubbed and cut to 2000 characters |
+| `ts` | the moment of the failure in milliseconds; the collector stamps its own `serverTs` regardless |
+| `meta` | an object of at most 8 KB: `id` — the install's anonymous identifier, `ms` — how long the attempt took, `n` — how many events are folded (only when more than one), `harnessCode` — the harness's own verdict as it named it, and `t` |
+
+Each concept gets exactly one of the aliases the collector accepts: `code` rather than
+`type` or `kind`; `message` rather than `error` or `detail`; `ts` rather than
+`timestamp`. The anonymous identifier lives in `meta.id`, because the API has no
+top-level field for it — and without it the monitor could not answer "how many people".
+
+Never sent: prompts, message and chat content, file contents and paths, API keys, the
+session id, and anything at all that names the user or their machine. That is the
+construction rather than a promise: the report has no field such a thing could be put in,
+and the one free-form field — `message` — goes through a scrubber that erases `sk-…`
+keys, `Bearer` tokens, credential headers, named secrets, Windows paths (whole, spaces
+included) and POSIX paths — both replaced by `<path>` — and long opaque runs.
+
+### Which failures count as an outage
+
+One rule: what broke at the provider is reported, and what happened to the user never
+is. The verdict is read from the harness code, the status and the message text, and the
+user's own situation is checked first — a quota message does not become an outage just
+because a number resembling a status appears in it.
+
+| Counts as an outage | Does not |
+|---|---|
+| `upstream_502`, `upstream_503`, `upstream_400`, `upstream_404` — any `upstream_*` except 401, 402, 403 and 429 | an ended subscription, a blocked account, an exhausted quota or balance |
+| `http_5xx`, `http_404`, `http_408` | a rate limit, `429` included |
+| `dns`, `refused`, `unreachable`, `tls` | an invalid, missing or revoked key |
+| `connect_timeout`, `timeout`, `reset`, `server`, `transport` | a context window exceeded, an unknown model, a malformed request |
+| | the user pressing stop |
+
+`upstream_400` and `upstream_404` are reported while a bare `400` and a bare `404` are
+not: the prefix means the provider's gateway named what its own origin answered, so what
+broke is over there, and not in the request you composed.
+
+### Successes go nowhere
+
+The collector receives failures only: a report about a request that succeeded is never
+sent. Successes are still observed locally, for exactly two reasons — the counters on the
+settings page, and settling a model's still-folding failure the moment a request goes
+through again, so that report reaches the collector at the instant of recovery rather
+than at the end of a folding window; the gap between the two timestamps is the length of
+the outage.
+
+The consequence is worth stating plainly: uptime on the monitor is the absence of errors
+in a window, not a ratio of two kinds of report. A model nobody asked about looks the
+same there as a model that is up.
+
+### The anonymous identifier and the two files
+
+The identifier is a random UUID and nothing else: no hardware id, no account name, no
+path. It exists so the monitor can count people rather than requests — a thousand
+reports from one install is one person retrying, a thousand reports from three hundred
+installs is an outage. In a report it lives in `meta.id`. Resetting it is deleting
+`<profile>\.dsh-rustvy\install.json`: the next send creates a new one, and this install
+becomes somebody else as far as the monitor is concerned.
+
+| What | Where |
+|---|---|
+| The anonymous identifier | `<profile>\.dsh-rustvy\install.json` |
+| Undelivered reports | `<profile>\.dsh-rustvy\errors-queue.json` |
+
+The queue on disk is part of the meaning rather than a cache: a report that could not be
+delivered stays in the file with its real timestamp and leaves when the site answers, so
+an outage reaches the monitor with the times it happened at rather than with the moment
+connectivity came back. It is written at most once every 5 seconds and once more on
+unload, so a restart during an outage loses nothing.
+
+### Folding and ceilings
+
+Without them, an install in a retry loop would send the collector thousands of reports
+about one and the same outage:
+
+| What | Value |
+|---|---|
+| Failure folding window | 60 seconds per model-and-kind pair: `ts` stays at the first failure, `meta.ms` is taken from the last, and the number of events grows in `meta.n` |
+| Queue delivery | every 15 seconds, up to 10 reports per flush — each in a request of its own, because that is what the collector asks for |
+| Per-minute ceiling | 20 reports per install — the direct counterpart of the collector's own 60 reports a minute per IP |
+| Per-install allowance | 240 reports an hour; beyond it they are dropped rather than accumulated |
+| Queue ceiling | 500 reports; on overflow the oldest are dropped |
+| Retry after a refusal | 15 seconds, doubling up to 10 minutes |
+| One send's timeout | 10 seconds |
+| Writing the queue to disk | at most once every 5 seconds, and once more on unload |
+
+The collector's answers are read by meaning rather than by one rule over every `4xx`.
+`200 { ok: true }` means the report was accepted. `400` means it carried neither a
+`message` nor a `code`: such a report is dropped as unusable, because a collector that
+refused it once will refuse it again. `429` and any `5xx` — including the `503` of a
+storage backend that is unavailable — keep the report queued and postpone the next
+attempt, and a `Retry-After` header on a `429` is honoured as the floor of that backoff.
+A transport failure keeps the report queued in exactly the same way, which is how an
+outage reaches the collector after the site has answered, and reaches it with its
+original timestamps.
+
+`429` is kept apart from `400` deliberately: it means "busy", not "bad report", and a
+report dropped on somebody else's rate limit would be a real failure lost. That limit is
+60 reports a minute per IP, and this plugin's own stream stays below it by construction
+rather than by agreement: identical failures of one model fold into a single report per 60
+seconds, one flush carries at most 10 reports, the per-minute ceiling is 20 against their
+60, the hourly allowance is 240, and the queue does not grow past 500. This plugin is not
+why anybody gets a `429`.
+
+Every install shares one collector address, which is what the per-minute ceiling is
+really protecting: an outage on one machine does not consume the whole share of the
+collector's 60 reports a minute that a shared NAT has between everyone behind it.
+
+### Turning it off
+
+With the **Собирать ошибки rustvy** switch in **Settings → Rustvy**, with
+`collectErrors: false` in `<profile>\.dsh-rustvy\config.json`, or with the
+`DSH_RUSTVY_NO_ERRORS=1` environment variable, which forces silence regardless of the
+setting: that one is for a deployment that wants the plugin mounted but silent and would
+rather not edit a profile file. Collection that is off sends nothing and queues nothing
+new; it has no effect on the requests to the provider themselves, in any state. The
+report shape, the kind vocabulary and the collector's contract are described in
+[`docs/error-report.md`](docs/error-report.md).
+
 ## Routes
 
 One prefix registration on the harness's own web server. Plugin routes are not
@@ -544,11 +729,12 @@ loopback only, a loopback `Host`, a same-origin `Sec-Fetch-Site` and a matching
 | `/dsh-rustvy/logo/<name>.svg` | GET, HEAD | one cached logo, fetched from the origin on first ask; `404` when the origin has no such mark, `400` for any name that is not `[A-Za-z0-9._-]+.svg` |
 | `/dsh-rustvy/models.json` | GET | the generated model list and its drift against the installed one; `?cached=1` reports the last computed plan instead of reading the endpoint again |
 | `/dsh-rustvy/models.yaml` | GET, HEAD | the same list as a paste-ready `cordis.patch.yml` row; `?cached=1` as above |
-| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path, last error, the last computed drift, and a key-ring summary. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks |
+| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path — `install` and `errorsQueue` among them — last error, the last computed drift, a key-ring summary, and an `errorReport` block: whether collection is on, the collector's address, the anonymous identifier, the sent, queued and dropped counters, the last answer, the last send error and the failures by kind. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks. A host half older than error collection sends neither the `errorReport` block nor the two new paths, and the settings page draws dashes instead |
 | `/dsh-rustvy/refresh` | POST | re-read the catalog, re-warm every logo it names, and report — or, when the write mode allows it, apply — the model list |
 | `/dsh-rustvy/apply-models` | POST | write the generated list into the route profile through `ctx.configEditor` |
 | `/dsh-rustvy/revert-models` | POST | put the backed-up route profile back |
 | `/dsh-rustvy/config` | POST | write settings; never touches the network |
+| `/dsh-rustvy/errors` | GET, POST | GET: the collection summary — the same `errorReport` block `/state` carries. POST `{ action: 'test' }` queues one synthetic event and flushes it immediately, `{ action: 'flush' }` sends what has accumulated; both answer with the fresh summary, so one POST is enough to repaint. A refusal is HTTP 200 with `{ ok: false, error }`, the way a disabled feature answers on `/apply-models` |
 | `/dsh-rustvy/keys` | GET, POST | GET: the whole ring — keys with a mask and a fingerprint, the default key, the hidden provider groups, the missing and stale routes, the substitution counters, the last refusal, both file paths, and whether `credentials` and `configEditor` are available. POST: one action on the ring (`add`, `set`, `rename`, `default`, `remove`, `repair`, `test`); a success answers with a fresh GET plus the action's own field, so one POST repaints everything. A refusal is `409` with `{ ok: false, error }`, an unknown action `400`. A key value is accepted in the body only |
 | `/dsh-rustvy/session-key` | GET, POST | GET with `?sessionId=`: which key this chat sends its requests with (`keyId`), whether the choice is its own (`picked`), and the whole `GET /keys` answer besides; `400` without an id. POST `{ sessionId, keyId }` records the choice and answers with the same payload; `keyId: null` returns the chat to the default key |
 
@@ -558,7 +744,8 @@ The host half reloads itself, the same way `dsh-proxy-gui` does: the loader row
 names this package, whose entry imports the implementation through a
 cache-busting `?rev=` query, and a one-second poll of the `lib` directory disposes
 the previous revision and starts the next one once a changed fingerprint repeats.
-`lib/host.js`, `lib/models.js`, `lib/keys.js` and `lib/net.js` therefore reload
+`lib/host.js`, `lib/models.js`, `lib/keys.js`, `lib/errors.js` and `lib/net.js`
+therefore reload
 live; only an edit to the entry bootstrap itself needs a restart. The browser half arrives in an
 open page through the harness's own live plugin composition; a page refresh works
 too.
@@ -585,6 +772,8 @@ Each capability degrades on its own:
 | `credentials` | there is nowhere to put a key value: the ring stays at its one primary key, adding is unavailable, and the «API-ключи» section names the reason instead of showing a form that would fail |
 | `configEditor` — for the ring | an existing key's value can still be replaced, but a new key's route cannot be added: the add form is disabled and the section says why |
 | a key route lost to a hand edit of `cordis.patch.yml` or to a model-list revert | the key stays in the ring, its route is listed under `routes.missing`, that chat's requests go out on the profile's route with a visible reason, and **«Починить маршруты»** (`{ action: 'repair' }`) writes the ring's routes again |
+| the uptime collector | reports stay queued on disk and leave when the site answers, so an outage still reaches the monitor with its real timestamps; requests to the provider are unaffected either way, and the settings page shows the backlog and the last send error |
+| a host half older than error collection | `/state` arrives without the `errorReport` block and without the two new paths: the page draws dashes where the status rows would be and offers neither send button |
 
 ## Layout
 
@@ -594,6 +783,7 @@ Each capability degrades on its own:
 | `lib/host.js` | routes, catalog mirror, logo cache, model sync, the key ring and its `agent/request` substitution, settings |
 | `lib/models.js` | pure mapping: what an origin publishes → one route-profile entry, the drift between two lists, and the YAML for a manual edit |
 | `lib/keys.js` | pure ring arithmetic: labels, credential-reference and route names, the ring and pick documents, and reconciling a provider map with the ring |
+| `lib/errors.js` | classifying a failure as infrastructure or as the user's own, scrubbing secrets and paths out of its text, the install's anonymous identifier, and the folding report queue with its file on disk |
 | `lib/net.js` | one outbound GET on the process's route, then the environment's proxy |
 | `client/client.js` | hand-authored browser bundle: the decorator, the settings page, the composer's key switch, and the hiding of clone groups in the model menu |
 | `locale/en.json`, `ru.json`, `zh.json` | the plugins-menu title and description |
@@ -606,7 +796,11 @@ Each capability degrades on its own:
 `lib/models.js` and `lib/keys.js` are deliberately pure — no network, no
 filesystem, no Cordis — so the mapping can be checked against a real origin's
 answer, and the ring arithmetic against an invented profile, without mounting
-anything. `lib/host.js` owns everything with a lifetime, and is what a reload
+anything. `lib/errors.js` touches no network either: its sender is injected, precisely
+because a queue whose transport is imported cannot be reasoned about at the moment the
+site it reports on is the thing that is down. That module does read and write its own two
+files — an install identity that could only be created inside a mounted host would be
+nothing to build on. `lib/host.js` owns everything with a lifetime, and is what a reload
 replaces.
 
 ## Tests
@@ -616,6 +810,7 @@ node tests\models-check.mjs              # pure mapping: live origin -> entries,
 node tests\yaml-roundtrip-test.mjs       # emitter vs two real YAML parsers, against a real route row
 node tests\model-sync-host-test.mjs      # host: fake webServer + configEditor, real origin fetch
 node tests\api-keys-host-test.mjs        # the key ring: fake credentials, configEditor and event bus, no network
+node tests\error-report-host-test.mjs    # error collection: classification, folding and delivery to a local collector
 node tests\model-sync-client-test.mjs    # browser: mini-React + stubbed DOM, fixture /state
 node scripts\prepublish-check.mjs        # the publish gate
 ```
@@ -672,6 +867,13 @@ block carries the clone, `repair` puts a lost route back, `keys.json` holds no s
 a dispose releases both the route and the listener, and with the feature off nothing
 is renamed.
 
+`error-report-host-test.mjs` is the host test for error collection: classifying failures
+into infrastructure and the user's own, folding reports into their windows, and
+delivering them — one per request — to a collector brought up on a loopback address. It
+is the same host half the two previous host tests drive, so the `/dsh-rustvy/errors`
+route, the `errorReport` block in `/state` and the queue on disk are checked together
+with what actually ends up in a report that was sent.
+
 The client test renders the settings page with a mini-React whose hook cells are
 keyed per component instance, and asserts: the section is named Rustvy; the three
 outbound addresses are real links that open outside the app; every file path is
@@ -697,6 +899,18 @@ interactions in a row spend one key read, opening the switch always reads, and a
 choice spends one POST with no follow-up read; and an unload that leaves nothing of
 its own in the picker or the popup. Separately, it asserts that a key value appears
 in no URL and is gone from the page once the add is done.
+
+It also draws the error-collection block: the switch with its exact label — on by
+default, including when the fixture `/state` knows nothing of a `collectErrors` field at
+all — the promise underneath it, asserted by substring (what never leaves, that
+collection fires only on a fault of the provider, that the monitor sends no probes of its
+own), the status rows with the collector's address, the truncated anonymous identifier,
+the counters, the last answer and the failures by kind, and both buttons: disabled while
+collection is off, posting `{ action: 'test' }` and `{ action: 'flush' }` to
+`/dsh-rustvy/errors`, and reporting whether the collector took the delivery. A host half
+older than the feature is checked separately: without the `errorReport` block the page
+still draws the switch and its description, draws no status rows at all, and does not
+throw.
 
 The mark-drawing half is **not** covered by an automated suite in this repository,
 and that is worth knowing up front. It works on the DOM of an already-open page, so

@@ -1258,9 +1258,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      *
      * @param path - the route that was called.
      * @param payload - the answer the host gave.
+     * @param body - what was posted, for the routes whose one answer reads
+     *   differently per action; `/errors` is the only such route so far.
      * @returns `{ kind, text }`, where kind picks the colour.
      */
-    function noticeFor(path, payload) {
+    function noticeFor(path, payload, body) {
       if (path === '/apply-models') {
         if (payload.ok === false) return { kind: 'bad', text: `Список моделей не записан: ${payload.error ?? 'причина не сообщена'}` }
         if (payload.upToDate === true) return { kind: 'ok', text: `Список моделей уже актуален: ${payload.count ?? 0}.` }
@@ -1292,6 +1294,49 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           kind: 'warn',
           text: `${base} Список моделей устарел — новые: ${listOf(sync.plan?.added)}, убраны: ${listOf(sync.plan?.removed)}.`,
         }
+      }
+      if (path === '/errors') {
+        // A refusal here arrives as HTTP 200 with `ok: false` and the host's own
+        // reason, and it is warned about rather than reported as broken: nothing
+        // failed, the page asked a switched-off feature to send something.
+        if (payload.ok === false) {
+          return { kind: 'warn', text: String(payload.error ?? 'Сборщик отказал: причина не сообщена') }
+        }
+        // The answer is the fresh summary, bare or under `errorReport`. `lastStatus`
+        // decides whether the delivery landed rather than `lastError`, because the
+        // error is the last failure on record and survives a delivery that went
+        // through after it.
+        const report = payload.errorReport ?? payload
+        const counters = `всего ${report.sent ?? 0}, в очереди ${report.queued ?? 0}`
+        const lastError = report.lastError === null || report.lastError === undefined ? '' : String(report.lastError)
+        const lastStatus = typeof report.lastStatus === 'number' ? report.lastStatus : null
+        const reached = lastStatus === null ? lastError === '' : lastStatus >= 200 && lastStatus < 300
+        const refused = lastError === '' ? `HTTP ${lastStatus}` : lastError
+        // The two buttons answer different questions, so the notice names what each
+        // of them was for: a test event is about the collector's own answer, a flush
+        // is about whether the backlog on disk went anywhere. A `400` is separate
+        // from every other refusal because the host drops that report as unusable
+        // rather than retrying it — promising it is still on disk would be a lie —
+        // while a `429` or a `5xx` means "busy", not "bad", and stays queued.
+        if (!reached && lastStatus === 400) {
+          return {
+            kind: 'warn',
+            text: `Сборщик отклонил отчёт как непригодный: ${refused}. `
+              + `Он отброшен, а не оставлен в очереди (${counters}).`,
+          }
+        }
+        if (body?.action === 'flush') {
+          return reached
+            ? { kind: 'ok', text: `Очередь отправлена сборщику: ${counters}.` }
+            : {
+                kind: 'warn',
+                text: `Сборщик не принял очередь: ${refused}. `
+                  + `Неотправленное осталось на диске (${counters}) и уйдёт, когда сайт ответит.`,
+              }
+        }
+        return reached
+          ? { kind: 'ok', text: `Тестовое событие отправлено: ответ HTTP ${lastStatus ?? '—'} (${counters}).` }
+          : { kind: 'warn', text: `Тестовое событие не дошло: ${refused}. Оно осталось в очереди (${counters}).` }
       }
       return { kind: 'ok', text: 'Сохранено.' }
     }
@@ -2329,7 +2374,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           })
           const payload = await response.json().catch(() => ({}))
           if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`)
-          setNotice(noticeFor(path, payload))
+          setNotice(noticeFor(path, payload, body))
           await reload()
           await refresh()
         } catch (error) {
@@ -2346,6 +2391,28 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       const fetched = status?.fetchedAt === null || status?.fetchedAt === undefined
         ? 'никогда'
         : new Date(status.fetchedAt).toLocaleString()
+
+      /**
+       * The error collector's own summary, and the three renderings of it that need
+       * a rule rather than a field read.
+       *
+       * Every field is optional on purpose: a host half older than the collector
+       * answers `/state` without the block, and the page still has to draw — with
+       * «—» where a value would be, and without a status block at all when the
+       * whole summary is missing.
+       */
+      const report = status?.errorReport
+      const kinds = Object.entries(report?.byKind ?? {})
+        .map(([kind, count]) => `${kind}: ${count}`)
+        .join('; ')
+      const installId = String(report?.installId ?? '')
+      const lastAnswer = [
+        report?.lastStatus === null || report?.lastStatus === undefined ? null : `HTTP ${report.lastStatus}`,
+        report?.lastSentAt === null || report?.lastSentAt === undefined
+          ? null
+          : new Date(report.lastSentAt).toLocaleString(),
+      ].filter(part => part !== null).join(', ')
+      const collecting = config.collectErrors !== false
 
       return h('div', { style: { font, color: C.label, padding: '4px 2px 24px', maxWidth: '760px' } },
         h('h2', { style: { fontSize: '15px', fontWeight: 600, margin: '0 0 6px' } }, 'Rustvy'),
@@ -2434,7 +2501,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           h(PathRow, { name: 'настройки плагина' }, paths.config ?? ''),
           h(PathRow, { name: 'копия списка моделей' }, paths.backup ?? ''),
           h(PathRow, { name: 'патч профиля' }, paths.patch ?? ''),
-          h(PathRow, { name: 'каталог кэша' }, paths.cache ?? '')),
+          h(PathRow, { name: 'каталог кэша' }, paths.cache ?? ''),
+          // The collector's two files, when this host half has them: an older one
+          // reports no such paths, and an absent row is the honest rendering of it.
+          paths.install === undefined ? null : h(PathRow, { name: 'анонимный идентификатор' }, paths.install),
+          paths.errorsQueue === undefined ? null : h(PathRow, { name: 'очередь ошибок' }, paths.errorsQueue)),
 
         h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '16px', lineHeight: 1.6 } },
           'Адреса открываются в новой вкладке. Пути — только текст: браузер не открывает чужие файлы, '
@@ -2542,12 +2613,73 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 
         h(KeysSection),
 
+        // The error collector's own box, rather than a row beside the mark switches:
+        // this is the one setting on the page that sends anything off the machine, so
+        // what leaves, what never does and when it fires are part of the control and
+        // not a footnote to it. The endpoint is shown rather than offered — it is
+        // repointed by an environment variable or by hand in `config.json`, and a
+        // field here would suggest the page owns it.
+        h('div', {
+          style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
+        },
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '6px' } }, 'Сбор ошибок Rustvy'),
+
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer' } },
+            h('input', {
+              type: 'checkbox',
+              checked: collecting,
+              onChange: event => { void post('/config', { collectErrors: event.target.checked }, 'save') },
+            }),
+            h('span', { style: { fontSize: '12.5px' } }, 'Собирать ошибки rustvy')),
+
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '4px' } },
+            'Одна строка на сбой: идентификатор модели, собственный текст ошибки провайдера, HTTP-статус, '
+            + 'когда он есть, длительность попытки, имя маршрута, анонимный идентификатор '
+            + 'установки и версия плагина. Не отправляются никогда: промпты, содержание сообщений и чатов, '
+            + 'содержимое и пути файлов, API-ключи, идентификатор сессии и вообще всё, что называет вас или вашу '
+            + 'машину. Срабатывает сбор только на поломке инфраструктуры провайдера — upstream_502, upstream_503, '
+            + 'таймаут соединения, недоступный сайт — и никогда на закончившейся подписке, исчерпанной квоте, '
+            + 'ограничении частоты запросов или неверном ключе. Коллектору уходит только сбой: удачный запрос '
+            + 'не отправляется никогда, и аптайм на мониторе — это отсутствие ошибок в окне. Проверочных '
+            + 'запросов, которые сжигали бы ваши токены, нет ни у плагина, ни у монитора: именно по этим строкам '
+            + 'видно, какие модели лежат и у скольких людей это происходит прямо сейчас. Отчёт, который не '
+            + 'удалось доставить, остаётся очередью на диске и уходит, '
+            + 'когда сайт отвечает, поэтому авария попадает в монитор с настоящими временами, а не с моментом '
+            + 'восстановления связи. Пожалуйста, оставьте сбор включённым: он ничего не стоит и является '
+            + 'единственным источником, из которого монитор знает про аптайм.'),
+
+          report === undefined ? null : h('div', null,
+            h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '10px 0 6px' } }, 'Состояние сборщика'),
+            h(Row, { name: 'адрес сборщика' }, String(report.endpoint ?? config.uptimeEndpoint ?? '—')),
+            h(Row, { name: 'анонимный id' },
+              installId === '' ? '—' : installId.length > 24 ? `${installId.slice(0, 24)}…` : installId),
+            h(Row, { name: 'отправлено' }, String(report.sent ?? 0)),
+            h(Row, { name: 'в очереди' }, String(report.queued ?? 0)),
+            h(Row, { name: 'отброшено' }, String(report.dropped ?? 0)),
+            h(Row, { name: 'последний ответ' }, lastAnswer === '' ? '—' : lastAnswer),
+            report.lastError === null || report.lastError === undefined
+              ? null
+              : h(Row, { name: 'ошибка отправки', tone: C.warn }, String(report.lastError)),
+            h(Row, { name: 'сбои по видам' }, kinds === '' ? '—' : kinds)),
+
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px', flexWrap: 'wrap' } },
+            h(Button, {
+              onClick: () => { void post('/errors', { action: 'test' }, 'errtest') },
+              disabled: busy !== '' || !collecting,
+            }, busy === 'errtest' ? 'Отправка…' : 'Отправить тестовое событие'),
+            h(Button, {
+              onClick: () => { void post('/errors', { action: 'flush' }, 'errflush') },
+              disabled: busy !== '' || !collecting,
+            }, busy === 'errflush' ? 'Отправка…' : 'Отправить очередь сейчас')),
+        ),
+
         h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6 } },
           h('div', null, 'Значок рисуется маской CSS, залитой текущим цветом строки, — тот же приём, что и на сайте провайдера, поэтому одна и та же картинка подходит и светлой, и тёмной теме.'),
           h('div', null, 'Модель, которой нет в зеркале, определяется по началу её идентификатора (claude-*, gpt-*, glm-*, kimi-*, qwen-*, deepseek-* и так далее). Если и это не сработало, вместо значка рисуется монограмма из первых букв производителя.'),
           h('div', null, 'Каталог обновляется сам раз в сутки и при каждом нажатии кнопки выше; уже загруженные значки берутся из кэша профиля, поэтому список моделей открывается мгновенно и без сети.'),
           h('div', null, 'Список моделей маршрута берётся с того же адреса, что и сами запросы, поэтому новая модель провайдера появляется в выборе без правки конфигов руками. Перед записью показывается расхождение: какие модели добавятся, какие уберутся и у каких изменятся окно контекста, лимит вывода, модальности или уровни рассуждения. Ручные настройки совместимости протокола сохраняются, предыдущий список остаётся в копии для отката.'),
           h('div', null, 'Кнопка «Показать блок для ручной правки» отдаёт ровно тот YAML, который записался бы сам, — вместе с полями подключения маршрута. Его можно скопировать и вставить в патч профиля, если автоматическая запись не нужна: содержимое одинаковое, различается только тем, кто его положил в файл.'),
+          h('div', null, 'Сбор ошибок Rustvy — единственный блок страницы, который отправляет что-то за пределы машины, и отправляет он одну строку на сбой самого провайдера коллектору монитора: удачные запросы не отправляются вовсе, ни содержания разговора, ни ключей, ни путей к файлам в этой строке нет, а отчёт, который сайт не принял, дожидается его на диске и уходит позже.'),
           h('div', { style: { color: status?.error === undefined ? C.labelSecondary : C.warn } },
             status?.error === undefined
               ? 'Правки файлов плагина применяются на лету, без перезапуска приложения.'
