@@ -2854,12 +2854,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       const collecting = config.collectErrors !== false
 
       return h('div', { style: { font, color: C.label, padding: '4px 2px 24px', maxWidth: '760px' } },
-        h('h2', { style: { fontSize: '15px', fontWeight: 600, margin: '0 0 6px' } }, 'Rustvy'),
-        h('p', { style: { color: C.labelSecondary, margin: '0 0 18px', fontSize: '12.5px' } },
-          'Значок производителя перед названием модели в списке выбора и в кнопке модели, '
-          + 'и список моделей маршрута, синхронный тому, что провайдер отдаёт сейчас. '
-          + 'Каталог и сами значки зеркалятся хост-половиной с сайта провайдера в кэш профиля, '
-          + 'поэтому страница берёт их с локального адреса и не выходит в интернет сама.'),
+        // The heading carries the gap to the first toggle itself: the paragraph that
+        // used to supply it is gone, and 6px would put a checkbox under the title.
+        h('h2', { style: { fontSize: '15px', fontWeight: 600, margin: '0 0 18px' } }, 'Rustvy'),
 
         h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px', cursor: 'pointer' } },
           h('input', {
@@ -2923,41 +2920,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                 },
               }, notice.text)),
 
-        h('div', {
-          style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
-        },
-          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '6px' } }, 'Зеркало каталога'),
-          h(Row, { name: 'версия каталога' }, status?.version === null || status?.version === undefined ? '—' : String(status.version)),
-          h(Row, { name: 'моделей' }, String(status?.models ?? 0)),
-          h(Row, { name: 'иконок в кэше' }, String(status?.logos ?? 0)),
-          h(Row, { name: 'обновлён' }, fetched),
-          h(Row, { name: 'маршрут' }, status?.route ?? '—'),
-          h(Row, { name: 'прокси процесса' }, status?.proxy ?? 'none'),
-          h(Row, { name: 'сборка' }, `${status?.build ?? '—'} (ревизия ${status?.revision ?? '—'})`),
-          status?.error === undefined
-            ? null
-            : h(Row, { name: 'последняя ошибка', tone: C.warn }, status.error),
-
-          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '10px 0 6px' } }, 'Адреса'),
-          origin === '' ? null : h(LinkRow, { name: 'сайт провайдера', href: origin }),
-          origin === '' ? null : h(LinkRow, { name: 'страница каталога', href: `${origin}/models` }),
-          sync.modelsUrl === undefined ? null : h(LinkRow, { name: 'список моделей', href: sync.modelsUrl }),
-
-          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '10px 0 6px' } }, 'Файлы'),
-          h(PathRow, { name: 'зеркало каталога' }, paths.catalog ?? ''),
-          h(PathRow, { name: 'настройки плагина' }, paths.config ?? ''),
-          h(PathRow, { name: 'копия списка моделей' }, paths.backup ?? ''),
-          h(PathRow, { name: 'патч профиля' }, paths.patch ?? ''),
-          h(PathRow, { name: 'каталог кэша' }, paths.cache ?? ''),
-          // The collector's two files, when this host half has them: an older one
-          // reports no such paths, and an absent row is the honest rendering of it.
-          paths.install === undefined ? null : h(PathRow, { name: 'анонимный идентификатор' }, paths.install),
-          paths.errorsQueue === undefined ? null : h(PathRow, { name: 'очередь ошибок' }, paths.errorsQueue)),
-
-        h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '16px', lineHeight: 1.6 } },
-          'Адреса открываются в новой вкладке. Пути — только текст: браузер не открывает чужие файлы, '
-          + 'но их можно скопировать и открыть самому. Патч профиля — тот файл, где живёт строка маршрута; '
-          + 'править его руками стоит тогда, когда автоматическая запись не подходит.'),
+        // First on the page, because it is the one thing here that answers the question
+        // the page was opened with — is the model I am about to pick answering right
+        // now — while everything below it is configuration. Moved as it stands: same
+        // component, same props, same margins.
+        h(UptimeSection, { enabled: config.uptimeView !== false }),
 
         h('div', {
           style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '14px', background: C.surface },
@@ -3061,13 +3028,13 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         h(KeysSection),
 
         // The error collector's own box, rather than a row beside the mark switches:
-        // this is the one setting on the page that sends anything off the machine, so
-        // what leaves, what never does and when it fires are part of the control and
-        // not a footnote to it. The switch and its promise are the whole box — the
-        // collector readout that used to sit under them is gone on purpose, because
-        // counters nobody asked for read as noise next to a question that does want
-        // an answer. What collection did, and what it could not deliver, is still on
-        // the host's own loopback route.
+        // this is the one setting on the page that sends anything off the machine. The
+        // box is a caption and a switch and nothing else. The readout that used to sit
+        // under them is gone, and so is the paragraph that said what leaves and what
+        // never does — that disclosure now lives in the READMEs and in
+        // `docs/error-report.md`, where a reader can reach it without this page
+        // carrying a wall of text. What collection did, and what it could not deliver,
+        // is still on the host's own loopback route.
         h('div', {
           style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
         },
@@ -3080,40 +3047,57 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
               onChange: event => { void post('/config', { collectErrors: event.target.checked }, 'save') },
             }),
             h('span', { style: { fontSize: '12.5px' } }, 'Собирать ошибки rustvy')),
-
-          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '4px' } },
-            'Одна строка на сбой: идентификатор модели, собственный текст ошибки провайдера, HTTP-статус, '
-            + 'когда он есть, длительность попытки, имя маршрута, анонимный идентификатор '
-            + 'установки и версия плагина. Не отправляются никогда: промпты, содержание сообщений и чатов, '
-            + 'содержимое и пути файлов, API-ключи, идентификатор сессии и вообще всё, что называет вас или вашу '
-            + 'машину. Срабатывает сбор только на поломке инфраструктуры провайдера — upstream_502, upstream_503, '
-            + 'таймаут соединения, недоступный сайт — и никогда на закончившейся подписке, исчерпанной квоте, '
-            + 'ограничении частоты запросов или неверном ключе. Коллектору уходит только сбой: удачный запрос '
-            + 'не отправляется никогда, и аптайм на мониторе — это отсутствие ошибок в окне. Проверочных '
-            + 'запросов, которые сжигали бы ваши токены, нет ни у плагина, ни у монитора: именно по этим строкам '
-            + 'видно, какие модели лежат и у скольких людей это происходит прямо сейчас. Отчёт, который не '
-            + 'удалось доставить, остаётся очередью на диске и уходит, '
-            + 'когда сайт отвечает, поэтому авария попадает в монитор с настоящими временами, а не с моментом '
-            + 'восстановления связи. Пожалуйста, оставьте сбор включённым: он ничего не стоит и является '
-            + 'единственным источником, из которого монитор знает про аптайм.'),
         ),
 
-        // The other half of the same story: the box above is what this install
-        // reported, this one is what the collector made of everybody's reports.
-        h(UptimeSection, { enabled: config.uptimeView !== false }),
+        // Last of the sections, and the paragraph that explains its rows moves with it:
+        // the text describes the «Адреса», «Пути» and «Патч профиля» lines below, and
+        // left above «Модели провайдера» it would explain rows that are no longer there.
+        // It ends up next to the warning at the foot of the page, which is right — that
+        // warning is about this box's catalog read and nothing else.
+        h('div', {
+          style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
+        },
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '6px' } }, 'Зеркало каталога'),
+          h(Row, { name: 'версия каталога' }, status?.version === null || status?.version === undefined ? '—' : String(status.version)),
+          h(Row, { name: 'моделей' }, String(status?.models ?? 0)),
+          h(Row, { name: 'иконок в кэше' }, String(status?.logos ?? 0)),
+          h(Row, { name: 'обновлён' }, fetched),
+          h(Row, { name: 'маршрут' }, status?.route ?? '—'),
+          h(Row, { name: 'прокси процесса' }, status?.proxy ?? 'none'),
+          h(Row, { name: 'сборка' }, `${status?.build ?? '—'} (ревизия ${status?.revision ?? '—'})`),
+          status?.error === undefined
+            ? null
+            : h(Row, { name: 'последняя ошибка', tone: C.warn }, status.error),
 
-        h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6 } },
-          h('div', null, 'Значок рисуется маской CSS, залитой текущим цветом строки, — тот же приём, что и на сайте провайдера, поэтому одна и та же картинка подходит и светлой, и тёмной теме.'),
-          h('div', null, 'Модель, которой нет в зеркале, определяется по началу её идентификатора (claude-*, gpt-*, glm-*, kimi-*, qwen-*, deepseek-* и так далее). Если и это не сработало, вместо значка рисуется монограмма из первых букв производителя.'),
-          h('div', null, 'Каталог обновляется сам раз в сутки и при каждом нажатии кнопки выше; уже загруженные значки берутся из кэша профиля, поэтому список моделей открывается мгновенно и без сети.'),
-          h('div', null, 'Список моделей маршрута берётся с того же адреса, что и сами запросы, поэтому новая модель провайдера появляется в выборе без правки конфигов руками. Перед записью показывается расхождение: какие модели добавятся, какие уберутся и у каких изменятся окно контекста, лимит вывода, модальности или уровни рассуждения. Ручные настройки совместимости протокола сохраняются, предыдущий список остаётся в копии для отката.'),
-          h('div', null, 'Кнопка «Показать блок для ручной правки» отдаёт ровно тот YAML, который записался бы сам, — вместе с полями подключения маршрута. Его можно скопировать и вставить в патч профиля, если автоматическая запись не нужна: содержимое одинаковое, различается только тем, кто его положил в файл.'),
-          h('div', null, 'Сбор ошибок Rustvy — единственный блок страницы, который отправляет что-то за пределы машины, и отправляет он одну строку на сбой самого провайдера коллектору монитора: удачные запросы не отправляются вовсе, ни содержания разговора, ни ключей, ни путей к файлам в этой строке нет, а отчёт, который сайт не принял, дожидается его на диске и уходит позже.'),
-          h('div', null, 'Блок «Аптайм моделей» показывает то, что коллектор сделал из этих строк: числа в нём его собственные, плагин ничего не считает сам, иначе панель и страница монитора расходились бы в ответе на один вопрос. Пустой ответ — «ошибок нет» — обычный, а не аварийный: агрегация коллектора ещё пишется, и панель говорит ровно то, что знает. Те же три статуса рисуются точкой в списке моделей у строк, которые коллектор назвал.'),
-          h('div', { style: { color: status?.error === undefined ? C.labelSecondary : C.warn } },
-            status?.error === undefined
-              ? 'Правки файлов плагина применяются на лету, без перезапуска приложения.'
-              : 'Каталог не получен — значки рисуются по правилам и монограммам. Проверьте прокси и нажмите «Обновить».')),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '10px 0 6px' } }, 'Адреса'),
+          origin === '' ? null : h(LinkRow, { name: 'сайт провайдера', href: origin }),
+          origin === '' ? null : h(LinkRow, { name: 'страница каталога', href: `${origin}/models` }),
+          sync.modelsUrl === undefined ? null : h(LinkRow, { name: 'список моделей', href: sync.modelsUrl }),
+
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '10px 0 6px' } }, 'Файлы'),
+          h(PathRow, { name: 'зеркало каталога' }, paths.catalog ?? ''),
+          h(PathRow, { name: 'настройки плагина' }, paths.config ?? ''),
+          h(PathRow, { name: 'копия списка моделей' }, paths.backup ?? ''),
+          h(PathRow, { name: 'патч профиля' }, paths.patch ?? ''),
+          h(PathRow, { name: 'каталог кэша' }, paths.cache ?? ''),
+          // The collector's two files, when this host half has them: an older one
+          // reports no such paths, and an absent row is the honest rendering of it.
+          paths.install === undefined ? null : h(PathRow, { name: 'анонимный идентификатор' }, paths.install),
+          paths.errorsQueue === undefined ? null : h(PathRow, { name: 'очередь ошибок' }, paths.errorsQueue)),
+
+        h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '16px', lineHeight: 1.6 } },
+          'Адреса открываются в новой вкладке. Пути — только текст: браузер не открывает чужие файлы, '
+          + 'но их можно скопировать и открыть самому. Патч профиля — тот файл, где живёт строка маршрута; '
+          + 'править его руками стоит тогда, когда автоматическая запись не подходит.'),
+
+        // Not prose: the one place this page reports a catalog read that failed, and
+        // the only reason the closing block survives at all. It renders when there is
+        // something to report and renders nothing otherwise, so the page ends on its
+        // last control rather than on a reassurance nobody asked for.
+        status?.error === undefined
+          ? null
+          : h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6 } },
+              'Каталог не получен — значки рисуются по правилам и монограммам. Проверьте прокси и нажмите «Обновить».'),
       )
     }
 

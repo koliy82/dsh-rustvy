@@ -278,7 +278,7 @@ try {
   const gate = errors.createReporter({
     // The real collector's address, so this fixture cannot be mistaken for a
     // private one; `send` is injected, so nothing here reaches the network.
-    endpoint: 'http://185.94.29.228:3789/api/report',
+    endpoint: 'http://185.75.189.247:8249/api/report',
     identity: { id: 'publish-gate' },
     send: async report => { gateSent.push(report); return { status: 200 } },
     now: () => gateClock,

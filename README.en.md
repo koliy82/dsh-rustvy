@@ -184,6 +184,13 @@ whichever chat is open, without leaving the conversation.
 
 **Settings → Rustvy**
 
+Top to bottom the page runs: the switches and fields, then the **«Аптайм моделей»** box,
+**«Модели провайдера»**, **«Ключи на несколько чатов»**, **«Сбор ошибок Rustvy»** and, at
+the very bottom, **«Зеркало каталога»** with its addresses and files. Uptime comes first
+because it is the only block that answers the question the page is opened with — is the
+model about to be picked alive — and the mirror comes last, next to the warning about a
+failed catalog read that only it is the subject of.
+
 Marks:
 
 | Control | Default | Meaning |
@@ -244,14 +251,17 @@ Error collection:
 
 The switch has a block of its own, «Сбор ошибок Rustvy», because it is the only setting
 on the page that sends anything off the machine — one line per failure of the provider
-goes to the monitor's collector. What leaves, what never does and when it fires is
-written right underneath it, and that is the whole of the block: there are no counters
-and no send buttons on the page. The state of the collection — the collector's address,
-the anonymous identifier, the sent, queued and dropped counters, the last answer, the
-last send error and the failures by kind — is still served by the host's own loopback
+goes to the monitor's collector. The block itself is a caption and a switch and nothing
+more: no explanation under the switch, no counters and no send buttons on the page. What
+leaves, what never does and when collection fires is written in
+[Error collection and uptime](#error-collection-and-uptime) below and in
+`docs/error-report.md` — the disclosure did not disappear with the text on the page, it
+moved somewhere it can be read in full. The state of the collection — the collector's
+address, the anonymous identifier, the sent, queued and dropped counters, the last answer,
+the last send error and the failures by kind — is still served by the host's own loopback
 routes, `/dsh-rustvy/state` and `/dsh-rustvy/errors`, and that is where it is read, not
 in the interface. The address — `uptimeEndpoint`,
-`http://185.94.29.228:3789/api/report` by default — has no field of its own: it is
+`http://185.75.189.247:8249/api/report` by default — has no field of its own: it is
 repointed without a release by the `DSH_RUSTVY_UPTIME_ENDPOINT` environment variable or
 by hand in `<profile>\.dsh-rustvy\config.json`.
 
@@ -586,7 +596,7 @@ The collector takes it on `POST /api/report`; `meta` is the only object in it, a
 everything else sits at the top level, because a great many of these are stored and read
 back grouped by model and hour.
 
-The default address is `http://185.94.29.228:3789/api/report`: the monitor's public
+The default address is `http://185.75.189.247:8249/api/report`: the monitor's public
 collector, on bare HTTP over a bare IP deliberately for now. It is
 repointed without a release, through the `uptimeEndpoint` field in
 `<profile>\.dsh-rustvy\config.json` or the `DSH_RUSTVY_UPTIME_ENDPOINT` environment
@@ -848,7 +858,7 @@ Each capability degrades on its own:
 | `configEditor` — for the ring | an existing key's value can still be replaced, but a new key's route cannot be added: the add form is disabled and the section says why |
 | a key route lost to a hand edit of `cordis.patch.yml` or to a model-list revert | the key stays in the ring, its route is listed under `routes.missing`, that chat's requests go out on the profile's route with a visible reason, and **«Починить маршруты»** (`{ action: 'repair' }`) writes the ring's routes again |
 | the uptime collector | reports stay queued on disk and leave when the site answers, so an outage still reaches the monitor with its real timestamps; requests to the provider are unaffected either way, and the backlog and the last send error are served by the loopback routes `/dsh-rustvy/state` and `/dsh-rustvy/errors` — the settings page shows neither |
-| a host half older than error collection | `/state` arrives without the `errorReport` block and without the two new paths: the settings page draws the switch and its promise identically either way, because it draws no part of the collection summary, and the file paths appear only when the host names them |
+| a host half older than error collection | `/state` arrives without the `errorReport` block and without the two new paths: the settings page draws the switch identically either way, because it draws no part of the collection summary, and the file paths appear only when the host names them |
 | the monitor's view at the collector | the mirror serves the last good answer with `stale: true`, and the panel shows that cached picture with the moment it is from; with no cache at all it is a `502`, and the panel names the reason instead of spinning. The picker's dots go with the data while the vendor marks stay: requests to the provider are unaffected either way |
 
 ## Layout
@@ -989,16 +999,20 @@ in no URL and is gone from the page once the add is done.
 
 It also draws the error-collection block: the switch with its exact label — on by
 default, including when the fixture `/state` knows nothing of a `collectErrors` field at
-all — and the promise underneath it, asserted by substring (what never leaves, that
-collection fires only on a fault of the provider, that a successful request is never
-sent, that nobody sends probes of their own). Its absence is asserted separately: the
-fixture carries a complete `errorReport`, and the page still shows neither the «Состояние
-сборщика» caption, nor any of the eight summary rows, nor a single value of theirs — no
-anonymous identifier, no breakdown by kind, no moment of the last delivery — nor either
-send button, and the recorded requests contain no call to `/dsh-rustvy/errors` at all. A
-removal nobody asserts is a removal that comes back. A host half older than the feature is
-checked too: without the `errorReport` block the page draws exactly what it draws with
-one, and does not throw.
+all. Absence is asserted separately, and not only of the summary: the fixture carries a
+complete `errorReport`, and the page still shows neither the «Состояние сборщика» caption,
+nor any of the eight summary rows, nor a single value of theirs — no anonymous identifier,
+no breakdown by kind, no moment of the last delivery — nor either send button, and the
+recorded requests contain no call to `/dsh-rustvy/errors` at all. The prose the page no
+longer carries is checked the same way: nineteen sentences it used to render — the
+introduction under the heading, the promise under the collection switch and the seven
+paragraphs that closed the page — are looked for in the tree and not found, while the
+features they described are still there. A removal nobody asserts is a removal that comes
+back. The one line that survived the removal is checked positively: the «Каталог не
+получен» warning renders when the fixture `/state` carries an `error` and renders nothing
+when it does not, because it is not prose but the only place the page reports a catalog
+read that failed. A host half older than the feature is checked too: without the
+`errorReport` block the page draws exactly what it draws with one, and does not throw.
 
 It draws the uptime box too, against two fixtures, because only the all-green one has
 ever come back from the live collector. Asserted: the summary and the per-model rows

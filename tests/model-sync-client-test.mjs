@@ -255,7 +255,7 @@ const STATE = {
   // invented one.
   errorReport: {
     enabled: true,
-    endpoint: 'http://185.94.29.228:3789/api/report',
+    endpoint: 'http://185.75.189.247:8249/api/report',
     installId: 'a3f0c81b7d4e4f2a9c6b5d8e1f0a2b3c',
     queued: 2,
     sent: 5,
@@ -385,7 +385,7 @@ const UPTIME_GREEN = {
       buckets: bucketStrip(48), events: [], lastError: null,
     },
   ],
-  monitorUrl: 'http://185.94.29.228:3789/',
+  monitorUrl: 'http://185.75.189.247:8249/',
 }
 
 const UPTIME_POPULATED = {
@@ -407,14 +407,14 @@ const UPTIME_POPULATED = {
       id: 'glm-5.3', name: 'GLM 5.3', errors: 2, uptime: 97, status: 'slow',
       buckets: bucketStrip(48, { 9: 1, 31: 1 }),
       events: [{ t: 1792606000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT', plugin: 'dsh-rustvy' }],
-      lastError: { t: 1792613000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT 185.94.29.228:443' },
+      lastError: { t: 1792613000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT 185.75.189.247:443' },
     },
     {
       id: 'gpt-5', name: 'GPT-5', errors: 0, uptime: 100, status: 'up',
       buckets: bucketStrip(48), events: [], lastError: null,
     },
   ],
-  monitorUrl: 'http://185.94.29.228:3789/',
+  monitorUrl: 'http://185.75.189.247:8249/',
 }
 
 /**
@@ -699,13 +699,25 @@ const texts = collect(tree, 'input').filter(item => item.props.type === 'text')
 const numbers = collect(tree, 'input').filter(item => item.props.type === 'number')
 const selects = collect(tree, 'select')
 const boxes = collect(tree, 'input').filter(item => item.props.type === 'checkbox')
+/**
+ * One dropdown, found by a value only its own option list carries.
+ *
+ * By option rather than by position: the page's sections move — the uptime panel now
+ * sits above the model-sync box and brings a dropdown of its own — and an assertion
+ * keyed to `selects[0]` silently retargets itself at whichever control happens to be
+ * first. Keyed to an option, it cannot.
+ */
+const selectWith = (node, value) => collect(node, 'select')
+  .find(item => collect(item, 'option').some(option => option.props.value === value))
 check('the route is editable', texts.some(item => item.props.value === 'rustvy'), texts.map(i => i.props.value).join('|'))
 check('the profile row is editable', texts.some(item => item.props.value === 'llm-pi-ai'))
 check('the origin is editable', texts.some(item => item.props.value === 'https://rustvy.xyz'))
 check('the mark size is editable', numbers.length === 1 && numbers[0].props.value === '16', JSON.stringify(numbers.map(i => i.props.value)))
 check('all three dropdowns render', selects.length === 3, String(selects.length))
-check('auto-apply defaults to explicit', selects[0]?.props.value === 'explicit', String(selects[0]?.props.value))
-check('the name source defaults to the provider label', selects[1]?.props.value === 'displayName', String(selects[1]?.props.value))
+check('auto-apply defaults to explicit', selectWith(tree, 'explicit')?.props.value === 'explicit',
+  String(selectWith(tree, 'explicit')?.props.value))
+check('the name source defaults to the provider label', selectWith(tree, 'displayName')?.props.value === 'displayName',
+  String(selectWith(tree, 'displayName')?.props.value))
 check('nine switches render', boxes.length === 9, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
@@ -722,8 +734,8 @@ check('blurring the field posts the new value',
   requests.some(r => r.path.endsWith('/config') && JSON.parse(r.body).modelRoute === 'rustvy-2'),
   JSON.stringify(requests.filter(r => r.path.endsWith('/config')).map(r => r.body)))
 
-// a dropdown saves on change
-selects[0].props.onChange({ target: { value: 'always' } })
+// a dropdown saves on change — found again in the current tree, by its own option
+selectWith(tree, 'explicit').props.onChange({ target: { value: 'always' } })
 await settle()
 check('changing the dropdown posts the new mode',
   requests.some(r => r.path.endsWith('/config') && JSON.parse(r.body).modelAutoApply === 'always'))
@@ -1059,19 +1071,53 @@ check('the collection switch carries its exact label', collectSwitch !== undefin
 // missing field as a refusal.
 check('an absent collectErrors renders as on', collectSwitch?.props.checked === true,
   String(collectSwitch?.props.checked))
-check('the description asks the user to leave it on',
-  text.includes('Пожалуйста, оставьте сбор включённым'))
-check('the description names what never leaves the machine',
-  text.includes('содержание сообщений и чатов') && text.includes('содержимое и пути файлов')
-  && text.includes('идентификатор сессии'))
-check('the description says only failures are sent, and that nobody probes',
-  text.includes('удачный запрос не отправляется никогда') && text.includes('отсутствие ошибок в окне')
-  && text.includes('которые сжигали бы ваши токены'))
-check('the description limits collection to the provider own faults',
-  text.includes('upstream_502') && text.includes('закончившейся подписке')
-  && text.includes('ограничении частоты'))
-check('the description says an undelivered report is queued',
-  text.includes('остаётся очередью на диске'))
+// Every sentence the page used to carry and no longer does — the intro under the
+// heading, the promise under the collection switch, and the seven paragraphs that
+// closed the page. Asserted as absence, with the fixture still complete and the
+// features still on screen: a removal nobody checks is a removal that comes back, and
+// a probe that passed only because the data was missing would prove nothing. The
+// disclosure itself did not disappear, it moved — both READMEs and
+// `docs/error-report.md` still carry what is sent and what never is.
+const REMOVED_PROSE = [
+  'не выходит в интернет сама',
+  'Одна строка на сбой',
+  'Пожалуйста, оставьте сбор включённым',
+  'содержание сообщений и чатов',
+  'содержимое и пути файлов',
+  'удачный запрос не отправляется никогда',
+  'отсутствие ошибок в окне',
+  'которые сжигали бы ваши токены',
+  'закончившейся подписке',
+  'ограничении частоты',
+  'остаётся очередью на диске',
+  'Значок рисуется маской CSS',
+  'Модель, которой нет в зеркале',
+  'Каталог обновляется сам',
+  'Список моделей маршрута берётся',
+  'Кнопка «Показать блок для ручной правки»',
+  'Сбор ошибок Rustvy — единственный блок',
+  'Блок «Аптайм моделей» показывает',
+  'Правки файлов плагина применяются на лету',
+]
+check('no sentence of the removed prose is left on the page',
+  REMOVED_PROSE.every(probe => !text.includes(probe)),
+  REMOVED_PROSE.filter(probe => text.includes(probe)).join(' | '))
+check('the features the prose described are still on the page',
+  switchNamed(tree, COLLECT_LABEL) !== undefined && text.includes('Аптайм моделей')
+  && findButton(tree, 'Обновить каталог и иконки') !== undefined
+  && findButton(tree, 'Записать список моделей') !== undefined)
+
+// The one line that shared the closing block and survived it, because it is not prose:
+// it is the only place this page reports a catalog read that failed.
+STATE.error = 'connect ETIMEDOUT https://rustvy.xyz'
+tree = await view()
+text = allText(tree)
+check('a failed catalog read is still reported on the page',
+  text.includes('Каталог не получен') && text.includes('Проверьте прокси и нажмите «Обновить»'))
+delete STATE.error
+tree = await view()
+text = allText(tree)
+check('and nothing is said when the catalog is fine', !text.includes('Каталог не получен'))
 check('both collector files are shown as copyable paths',
   text.includes('C:\\profile\\.dsh-rustvy\\install.json')
   && text.includes('C:\\profile\\.dsh-rustvy\\errors-queue.json'))
@@ -1115,20 +1161,21 @@ check('turning collection back on posts the same field',
   requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).collectErrors === true),
   JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
 tree = await view()
-check('and the box is still just the switch and its promise',
+check('and the box is still just its caption and the switch',
   switchNamed(tree, COLLECT_LABEL)?.props.checked === true
-  && allText(tree).includes('Пожалуйста, оставьте сбор включённым')
-  && !allText(tree).includes('Состояние сборщика'))
+  && allText(tree).includes('Сбор ошибок Rustvy')
+  && !allText(tree).includes('Состояние сборщика')
+  && !allText(tree).includes('Одна строка на сбой'))
 
 // A host half older than the collector answers `/state` without the block at all. The
-// page has to draw exactly what it draws with one — the switch and the promise — and
-// nothing that would need a field the answer does not carry.
+// page has to draw exactly what it draws with one — the switch, and nothing that would
+// need a field the answer does not carry.
 const REPORT = STATE.errorReport
 delete STATE.errorReport
 tree = await view()
 text = allText(tree)
-check('an older host half still gets the switch and its description',
-  switchNamed(tree, COLLECT_LABEL)?.props.checked === true && text.includes('Пожалуйста, оставьте сбор включённым'))
+check('an older host half still gets the switch',
+  switchNamed(tree, COLLECT_LABEL)?.props.checked === true && text.includes('Сбор ошибок Rustvy'))
 STATE.errorReport = REPORT
 tree = await view()
 check('and looks the same with the summary put back',
@@ -1175,7 +1222,7 @@ check('the range switch defaults to a day and offers the three windows',
 check('the footer names the moment and the store',
   text.includes(`обновлено ${new Date(1792617332644).toLocaleString()}`) && text.includes('хранилище mongo'))
 check('the monitor itself is a real outbound link',
-  collect(tree, 'a').some(item => item.props.href === 'http://185.94.29.228:3789/' && item.props.target === '_blank'))
+  collect(tree, 'a').some(item => item.props.href === 'http://185.75.189.247:8249/' && item.props.target === '_blank'))
 
 requests.length = 0
 rangeSwitch(tree).props.onChange({ target: { value: '7d' } })
@@ -1264,6 +1311,40 @@ check('turning the view back on posts the same field',
   requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).uptimeView === true))
 tree = await view()
 check('and the panel comes back with it', uptimeRows(tree).length === 3, String(uptimeRows(tree).length))
+
+// --- the order of the page ---------------------------------------------------
+// Everything above finds its section by caption, which survives a move without a word
+// of complaint — so the order is pinned here on its own. This is the order that was
+// asked for: the uptime panel first, because it answers the question the page is opened
+// with, and the catalog mirror last, next to the warning that reports its failures.
+const SECTIONS = [
+  ['the uptime panel', text => text.startsWith('Аптайм моделей')],
+  ['the provider models box', text => text.includes('Модели провайдера')],
+  ['the key ring', text => text.includes('Ключи на несколько чатов')],
+  ['the error collection box', text => text.includes('Сбор ошибок Rustvy')],
+  ['the catalog mirror', text => text.startsWith('Зеркало каталога')],
+]
+const placed = SECTIONS.map(([name, probe]) => ({
+  name,
+  at: (tree.children ?? []).findIndex(child => probe(allText(child))),
+}))
+check('every section is a top-level block of the page',
+  placed.every(section => section.at >= 0), JSON.stringify(placed))
+check('and they stand in the order the page was asked for',
+  placed.every((section, index) => index === 0 || section.at > placed[index - 1].at),
+  placed.map(section => `${section.at} ${section.name}`).join(' → '))
+// The same order from the other side: by box rather than by block, so a section that
+// lost its border or gained an extra wrapper is caught too.
+const bordered = collect(tree, 'div').filter(item => typeof item.props.style?.border === 'string')
+check('the first bordered box on the page is the uptime panel',
+  bordered.length > 0 && allText(bordered[0]).startsWith('Аптайм моделей'),
+  allText(bordered[0] ?? null).slice(0, 48))
+check('and the last one is the catalog mirror',
+  bordered.length > 0 && allText(bordered[bordered.length - 1]).startsWith('Зеркало каталога'),
+  allText(bordered[bordered.length - 1] ?? null).slice(0, 48))
+check('the mirror paragraph moved down with the box it explains',
+  allText(tree.children[placed[4].at + 1] ?? null).includes('Адреса открываются в новой вкладке'),
+  allText(tree.children[placed[4].at + 1] ?? null).slice(0, 48))
 
 /* -------------------------- the composer selector ------------------------- */
 // The key choice lives in exactly one place in a conversation: the composer's tool

