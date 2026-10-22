@@ -309,16 +309,6 @@ let KEYS = structuredClone(KEYS_FIXTURE)
 const SESSION_KEYS = { 's-1': null }
 /** `'ok'`, or `'missing'` to answer 404 with an empty body like an older host half. */
 let KEYS_MODE = 'ok'
-/** `'ok'`, `'down'` for a transport failure, or `'refused'` for the collector's `400`. */
-let ERRORS_MODE = 'ok'
-/**
- * `'bare'` for the envelope `POST /dsh-rustvy/errors` really answers with — the
- * summary spread at the top level — or `'wrapped'` for the nested `errorReport`
- * block that only `GET /state` uses. The bare one is the default because it is the
- * branch production takes; the wrapped one exists so `noticeFor`'s tolerance for it
- * is asserted rather than merely written.
- */
-let ERRORS_ENVELOPE = 'bare'
 
 /** One host-side key mutation, answered with a fresh list plus the result field. */
 function mutateKeys(body) {
@@ -366,6 +356,73 @@ function mutateKeys(body) {
   }
   return { ok: false, error: `неизвестное действие ${body.action}` }
 }
+
+/* ------------------------- uptime-view fixtures -------------------------- */
+// Two answers, because only one of them has ever come back from the live collector:
+// its aggregation is still being written, so `total: 0` with every model green is what
+// the server really says today, and that has to render as a finding rather than as a
+// panel that failed to load. The populated one is built from the monitor page's own
+// JavaScript — `events`, `byCode` and `lastError` have never been proven by an answer,
+// which is exactly why a test has to hold their shape.
+
+/** `count` buckets of an even window, with non-zero counts at the given indexes. */
+function bucketStrip(count, hits = {}) {
+  return Array.from({ length: count }, (_, index) => ({ from: 1792530932644 + index * 1800000, count: hits[index] ?? 0 }))
+}
+
+const UPTIME_GREEN = {
+  ok: true, range: '24h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
+  stale: false, healthy: true, storage: 'mongo', total: 0,
+  summary: { totalModels: 12, operational: 12, slow: 0, down: 0, uptime: 100, totalErrors: 0 },
+  byCode: [],
+  models: [
+    {
+      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, uptime: 100, status: 'up',
+      buckets: bucketStrip(48), events: [], lastError: null,
+    },
+    {
+      id: 'gpt-5', name: 'GPT-5', errors: 0, uptime: 100, status: 'up',
+      buckets: bucketStrip(48), events: [], lastError: null,
+    },
+  ],
+  monitorUrl: 'http://185.94.29.228:3789/',
+}
+
+const UPTIME_POPULATED = {
+  ok: true, range: '24h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
+  stale: false, healthy: false, storage: 'mongo', total: 7,
+  summary: { totalModels: 12, operational: 10, slow: 1, down: 1, uptime: 92, totalErrors: 7 },
+  byCode: [{ code: 'upstream_502', count: 5 }, { code: 'connect_timeout', count: 2 }],
+  models: [
+    {
+      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 5, uptime: 61, status: 'down',
+      buckets: bucketStrip(48, { 3: 1, 17: 2, 44: 2 }),
+      events: [{ t: 1792600000000, code: 'upstream_502', status: 502, message: 'upstream connect error', plugin: 'dsh-rustvy' }],
+      lastError: {
+        t: 1792616000000, code: 'upstream_502', status: 502,
+        message: 'upstream connect error or disconnect/reset before headers', plugin: 'dsh-rustvy',
+      },
+    },
+    {
+      id: 'glm-5.3', name: 'GLM 5.3', errors: 2, uptime: 97, status: 'slow',
+      buckets: bucketStrip(48, { 9: 1, 31: 1 }),
+      events: [{ t: 1792606000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT', plugin: 'dsh-rustvy' }],
+      lastError: { t: 1792613000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT 185.94.29.228:443' },
+    },
+    {
+      id: 'gpt-5', name: 'GPT-5', errors: 0, uptime: 100, status: 'up',
+      buckets: bucketStrip(48), events: [], lastError: null,
+    },
+  ],
+  monitorUrl: 'http://185.94.29.228:3789/',
+}
+
+/**
+ * `'green'` for the answer the live server gives today, `'populated'` for one carrying
+ * failures, `'stale'` for a cached payload behind an unreachable collector, `'refused'`
+ * for the host's own `ok: false`, and `'offline'` for a `502` with no cache at all.
+ */
+let UPTIME_MODE = 'green'
 
 const json = payload => ({ ok: true, status: 200, json: async () => payload })
 
@@ -423,42 +480,22 @@ globalThis.fetch = async (url, init = {}) => {
     const body = JSON.parse(init.body ?? '{}')
     if (body.apiKeys !== undefined) KEYS.enabled = body.apiKeys !== false
     if (body.collectErrors !== undefined) STATE.config.collectErrors = body.collectErrors !== false
+    if (body.uptimeView !== undefined) STATE.config.uptimeView = body.uptimeView !== false
     return json(STATE)
   }
-  // `/errors` answers with the fresh summary in the shape the host really sends —
-  // `{ ok: true, ...summary }`, bare at the top level, where only `GET /state` nests
-  // that same block as `errorReport`. `ERRORS_MODE` picks how the collector answers:
-  // `'down'` is a transport failure with the reports still on disk, `'refused'` is a
-  // `400` — a report the collector will not take and the host therefore drops rather
-  // than retries. `ERRORS_ENVELOPE = 'wrapped'` answers the nested shape instead and
-  // moves nothing at all, so one and the same summary can be read through both.
-  if (path.endsWith('/errors')) {
-    const body = JSON.parse(init.body ?? '{}')
-    const report = STATE.errorReport
-    if (method === 'POST' && ERRORS_ENVELOPE !== 'wrapped') {
-      report.attempts += 1
-      if (ERRORS_MODE === 'down') {
-        report.failures += 1
-        report.lastStatus = 0
-        report.lastError = 'connect ECONNREFUSED 185.94.29.228:3789'
-      } else if (ERRORS_MODE === 'refused') {
-        report.failed += 1
-        report.dropped += body.action === 'test' ? 1 : report.queued
-        report.queued = body.action === 'test' ? report.queued : 0
-        report.lastStatus = 400
-        report.lastError = 'the collector answered 400'
-      } else {
-        report.successes += 1
-        report.sent += body.action === 'test' ? 1 : report.queued
-        report.queued = 0
-        report.lastStatus = 200
-        report.lastSentAt = 1792473300000
-        report.lastError = null
-      }
+  // The host's mirror of the collector's own view. It answers with the range it was
+  // asked for, because a mirror that quietly answered a different window would let a
+  // range switch look like it worked while showing the same numbers.
+  if (path.startsWith('/dsh-rustvy/uptime.json')) {
+    const asked = new URL(path, 'http://local').searchParams.get('range') ?? '24h'
+    if (UPTIME_MODE === 'offline') {
+      return { ok: false, status: 502, json: async () => ({ ok: false, error: 'коллектор недоступен, а кешированного ответа нет' }) }
     }
-    return json(ERRORS_ENVELOPE === 'wrapped'
-      ? { ok: true, errorReport: report }
-      : { ok: true, ...report })
+    if (UPTIME_MODE === 'refused') return json({ ok: false, error: 'аптайм выключен настройкой плагина' })
+    const base = UPTIME_MODE === 'populated' || UPTIME_MODE === 'stale' ? UPTIME_POPULATED : UPTIME_GREEN
+    return json(UPTIME_MODE === 'stale'
+      ? { ...structuredClone(base), range: asked, stale: true, fetchedAt: 1792600000000, error: 'коллектор не ответил за 10 секунд' }
+      : { ...structuredClone(base), range: asked })
   }
   const payload = path.endsWith('/apply-models')
     ? { ok: true, applied: true, count: 12, plan: STATE.modelSync }
@@ -666,10 +703,10 @@ check('the route is editable', texts.some(item => item.props.value === 'rustvy')
 check('the profile row is editable', texts.some(item => item.props.value === 'llm-pi-ai'))
 check('the origin is editable', texts.some(item => item.props.value === 'https://rustvy.xyz'))
 check('the mark size is editable', numbers.length === 1 && numbers[0].props.value === '16', JSON.stringify(numbers.map(i => i.props.value)))
-check('both dropdowns render', selects.length === 2, String(selects.length))
+check('all three dropdowns render', selects.length === 3, String(selects.length))
 check('auto-apply defaults to explicit', selects[0]?.props.value === 'explicit', String(selects[0]?.props.value))
 check('the name source defaults to the provider label', selects[1]?.props.value === 'displayName', String(selects[1]?.props.value))
-check('eight switches render', boxes.length === 8, String(boxes.length))
+check('nine switches render', boxes.length === 9, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -907,11 +944,12 @@ check('the key list comes back with the host route',
 
 // --- the fields the host half added on top of the contract ----------------
 text = allText(tree)
-// Eight, not seven: the page's own switches plus the ring's master switch, and the
-// error-collection switch below. The ring switch is the seventh of them, which is
-// the index the block after this one drives.
+// Nine, not eight: the page's own display switches — now including the uptime one —
+// plus the ring's master switch and the error-collection switch below it. Found by
+// label rather than by index, so a switch added above it cannot silently retarget
+// this block at some other checkbox.
 check('the master switch for the ring is offered',
-  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 8
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 9
   && text.includes('Ключи на несколько чатов'))
 check('the key count is shown against the limit', text.includes('2 из 12'))
 check('each key reports how many models its route serves', text.includes('моделей: 12'))
@@ -924,7 +962,7 @@ check('both key files are shown as copyable paths',
 check('no repair is offered while every route is written', findButton(tree, 'Починить маршруты') === undefined)
 
 requests.length = 0
-const ringSwitch = collect(tree, 'input').filter(item => item.props.type === 'checkbox')[6]
+const ringSwitch = switchNamed(tree, 'Ключи на несколько чатов')
 check('the master switch reads the host answer', ringSwitch.props.checked === true)
 ringSwitch.props.onChange({ target: { checked: false } })
 await settle()
@@ -934,7 +972,7 @@ check('the master switch posts the config field',
 tree = await view()
 check('the ring explains that it is off, and offers the switch back',
   allText(tree).includes('Ключи выключены') && findButton(tree, '+').props.disabled === true)
-collect(tree, 'input').filter(item => item.props.type === 'checkbox')[6].props.onChange({ target: { checked: true } })
+switchNamed(tree, 'Ключи на несколько чатов').props.onChange({ target: { checked: true } })
 await settle()
 tree = await view()
 check('the ring comes back on', findButton(tree, '+').props.disabled === false)
@@ -976,11 +1014,15 @@ tree = await view()
 check('the "+" returns below the limit', findButton(tree, '+').props.disabled === false)
 
 /* ------------------------ error collection and uptime ---------------------- */
-// The one setting on this page that sends anything off the machine, so it is
-// asserted the way a user meets it: the switch and its exact label, the promise
-// written underneath it, the counters the reports move, and what the two buttons
-// post. The prose is checked by substring on purpose — a page that quietly dropped
-// "never sends your prompts" would otherwise still pass every structural check.
+// The one setting on this page that sends anything off the machine, so it is asserted
+// the way a user meets it: the switch, its exact label, and the promise written
+// underneath it. The prose is checked by substring on purpose — a page that quietly
+// dropped "never sends your prompts" would otherwise still pass every structural check.
+//
+// The collector readout that used to sit under that promise is gone, and the block
+// below asserts its absence rather than its contents. The fixture still carries a full
+// `errorReport`, so the data is demonstrably in the page's hands and demonstrably not
+// drawn from: a removal nobody asserts is a removal that comes back.
 
 /** The checkbox of the `label` whose whole text is one caption. */
 function switchNamed(node, caption) {
@@ -999,6 +1041,12 @@ function rowValue(node, name) {
   })
   return row === undefined ? undefined : allText(row.children[1]).trim()
 }
+
+/** Every row the collector readout carried, plus the caption above them. */
+const COLLECTOR_ROWS = [
+  'адрес сборщика', 'анонимный id', 'отправлено', 'в очереди',
+  'отброшено', 'последний ответ', 'ошибка отправки', 'сбои по видам',
+]
 
 const COLLECT_LABEL = 'Собирать ошибки rustvy'
 tree = await view()
@@ -1024,28 +1072,29 @@ check('the description limits collection to the provider own faults',
   && text.includes('ограничении частоты'))
 check('the description says an undelivered report is queued',
   text.includes('остаётся очередью на диске'))
-check('the endpoint is shown read-only, with no field to edit it',
-  rowValue(tree, 'адрес сборщика') === 'http://185.94.29.228:3789/api/report'
-  && !collect(tree, 'input').some(item => item.props.value === 'http://185.94.29.228:3789/api/report'),
-  String(rowValue(tree, 'адрес сборщика')))
-check('the anonymous id is shown truncated',
-  rowValue(tree, 'анонимный id') === 'a3f0c81b7d4e4f2a9c6b5d8e…', String(rowValue(tree, 'анонимный id')))
-check('the sent, queued and dropped counters are shown',
-  rowValue(tree, 'отправлено') === '5' && rowValue(tree, 'в очереди') === '2' && rowValue(tree, 'отброшено') === '0',
-  JSON.stringify([rowValue(tree, 'отправлено'), rowValue(tree, 'в очереди'), rowValue(tree, 'отброшено')]))
-check('the last answer carries the status and a local time',
-  rowValue(tree, 'последний ответ') === `HTTP 200, ${new Date(1792472700000).toLocaleString()}`,
-  String(rowValue(tree, 'последний ответ')))
-check('a delivery that went through reports no send error', rowValue(tree, 'ошибка отправки') === undefined)
-check('the failures are broken down by kind',
-  rowValue(tree, 'сбои по видам') === 'upstream_502: 4; connect_timeout: 2; dns: 1',
-  String(rowValue(tree, 'сбои по видам')))
 check('both collector files are shown as copyable paths',
   text.includes('C:\\profile\\.dsh-rustvy\\install.json')
   && text.includes('C:\\profile\\.dsh-rustvy\\errors-queue.json'))
-check('both send buttons are offered while collection is on',
-  findButton(tree, 'Отправить тестовое событие')?.props.disabled === false
-  && findButton(tree, 'Отправить очередь сейчас')?.props.disabled === false)
+
+// The readout is not there — with a complete summary sitting in the answer, which is
+// what makes this an assertion about the interface rather than about missing data.
+check('no collector readout is drawn over a full errorReport',
+  !text.includes('Состояние сборщика') && COLLECTOR_ROWS.every(name => rowValue(tree, name) === undefined),
+  COLLECTOR_ROWS.filter(name => rowValue(tree, name) !== undefined).join('|'))
+// Three values only the readout could have put on the page: the anonymous id, the
+// by-kind rendering, and the moment of the last delivery. (`HTTP 200` is no probe at
+// all — the key ring's own test result says exactly that.)
+check('and no value of it leaks into the page either',
+  !text.includes('a3f0c81b7d4e4f2a9c6b5d8e') && !text.includes('upstream_502: 4')
+  && !text.includes(new Date(1792472700000).toLocaleString()))
+check('neither send button is offered',
+  findButton(tree, 'Отправить тестовое событие') === undefined
+  && findButton(tree, 'Отправить очередь сейчас') === undefined)
+requests.length = 0
+tree = await view()
+check('and the page never calls the collector route',
+  !requests.some(item => item.path.includes('/dsh-rustvy/errors')),
+  JSON.stringify(requests.map(item => item.path)))
 
 requests.length = 0
 collectSwitch.props.onChange({ target: { checked: false } })
@@ -1055,9 +1104,9 @@ check('the switch posts its own config field',
   JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
 tree = await view()
 check('the switch reads the host answer back', switchNamed(tree, COLLECT_LABEL).props.checked === false)
-check('both send buttons are disabled while collection is off',
-  findButton(tree, 'Отправить тестовое событие').props.disabled === true
-  && findButton(tree, 'Отправить очередь сейчас').props.disabled === true)
+check('a switched-off collection draws no readout either',
+  !allText(tree).includes('Состояние сборщика')
+  && findButton(tree, 'Отправить очередь сейчас') === undefined)
 
 requests.length = 0
 switchNamed(tree, COLLECT_LABEL).props.onChange({ target: { checked: true } })
@@ -1066,92 +1115,155 @@ check('turning collection back on posts the same field',
   requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).collectErrors === true),
   JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
 tree = await view()
-check('the buttons come back with the switch',
-  findButton(tree, 'Отправить тестовое событие').props.disabled === false
-  && findButton(tree, 'Отправить очередь сейчас').props.disabled === false)
+check('and the box is still just the switch and its promise',
+  switchNamed(tree, COLLECT_LABEL)?.props.checked === true
+  && allText(tree).includes('Пожалуйста, оставьте сбор включённым')
+  && !allText(tree).includes('Состояние сборщика'))
 
-// A flush into an outage first, because it is the case the queue exists for: the
-// events must be seen not to have moved, and the warning must not read as a success.
-ERRORS_MODE = 'down'
-requests.length = 0
-findButton(tree, 'Отправить очередь сейчас').props.onClick()
-await settle()
-check('the flush button posts the flush action',
-  requests.some(item => item.path === '/dsh-rustvy/errors' && item.method === 'POST'
-    && JSON.parse(item.body ?? '{}').action === 'flush'),
-  JSON.stringify(requests.map(item => item.body)))
-tree = await view()
-text = allText(tree)
-check('a collector that is down is reported as a warning, not a success',
-  text.includes('Сборщик не принял очередь') && text.includes('ECONNREFUSED')
-  && !text.includes('Очередь отправлена сборщику'))
-check('the failed delivery is shown in the status block',
-  rowValue(tree, 'ошибка отправки') === 'connect ECONNREFUSED 185.94.29.228:3789',
-  String(rowValue(tree, 'ошибка отправки')))
-check('the events stay queued when the site does not answer', rowValue(tree, 'в очереди') === '2',
-  String(rowValue(tree, 'в очереди')))
-
-ERRORS_MODE = 'ok'
-requests.length = 0
-findButton(tree, 'Отправить тестовое событие').props.onClick()
-await settle()
-const errorRequest = requests.find(item => item.path === '/dsh-rustvy/errors' && item.method === 'POST')
-check('the test button posts to /errors', errorRequest !== undefined,
-  JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
-check('it asks for one synthetic event', JSON.parse(errorRequest.body).action === 'test', String(errorRequest?.body))
-// One literal, asserted through both envelopes: the host spreads the summary into its
-// answer, and `noticeFor` also accepts it nested, so the same summary has to produce
-// the same sentence whichever way it arrived.
-const TEST_NOTICE = 'Тестовое событие отправлено: ответ HTTP 200 (всего 6, в очереди 0).'
-tree = await view()
-text = allText(tree)
-check('the notice reports what the collector took', text.includes(TEST_NOTICE),
-  String(text.includes('Тестовое событие')))
-check('a delivery that went through drops the send-error row', rowValue(tree, 'ошибка отправки') === undefined)
-
-// The same summary nested under `errorReport` — the shape only `GET /state` uses, and
-// answered here without moving a single counter — has to render the identical notice.
-// `noticeFor` claims to read either envelope; a claim nothing exercises is not a
-// tolerance, it is a guess.
-ERRORS_ENVELOPE = 'wrapped'
-findButton(tree, 'Отправить тестовое событие').props.onClick()
-await settle()
-tree = await view()
-check('a summary nested under errorReport renders the same notice', allText(tree).includes(TEST_NOTICE))
-ERRORS_ENVELOPE = 'bare'
-
-// A `400` is the collector refusing the report itself — neither `message` nor `code`
-// in it — and the host drops that one rather than retrying it. The notice has to say
-// so: "still queued, it will go when the site answers" would promise something nothing
-// keeps. A `429` or a `5xx` means busy and stays queued, which is the case above.
-ERRORS_MODE = 'refused'
-findButton(tree, 'Отправить тестовое событие').props.onClick()
-await settle()
-tree = await view()
-text = allText(tree)
-check('a report refused as unusable is said to be dropped rather than kept',
-  text.includes('Сборщик отклонил отчёт как непригодный') && text.includes('the collector answered 400')
-  && text.includes('Он отброшен, а не оставлен в очереди'))
-check('the dropped report is counted', rowValue(tree, 'отброшено') === '1',
-  String(rowValue(tree, 'отброшено')))
-ERRORS_MODE = 'ok'
-
-// A host half older than the collector answers `/state` without the block. The page
-// still has to draw — switch, prose and buttons — and draw no status rows at all,
-// rather than throwing on a field that is not there.
+// A host half older than the collector answers `/state` without the block at all. The
+// page has to draw exactly what it draws with one — the switch and the promise — and
+// nothing that would need a field the answer does not carry.
 const REPORT = STATE.errorReport
 delete STATE.errorReport
 tree = await view()
 text = allText(tree)
 check('an older host half still gets the switch and its description',
   switchNamed(tree, COLLECT_LABEL)?.props.checked === true && text.includes('Пожалуйста, оставьте сбор включённым'))
-check('and no status rows it has nothing to fill them with',
-  rowValue(tree, 'адрес сборщика') === undefined && rowValue(tree, 'сбои по видам') === undefined
-  && !text.includes('Состояние сборщика'))
 STATE.errorReport = REPORT
 tree = await view()
-check('the status block comes back with the summary',
-  rowValue(tree, 'адрес сборщика') === 'http://185.94.29.228:3789/api/report')
+check('and looks the same with the summary put back',
+  switchNamed(tree, COLLECT_LABEL)?.props.checked === true
+  && !allText(tree).includes('Состояние сборщика')
+  && !allText(tree).includes('a3f0c81b7d4e4f2a9c6b5d8e'))
+
+/* ------------------------------ the uptime view ---------------------------- */
+// The other half of the same story: the error box above is what this install
+// reported, this one is what the collector made of everybody's reports. Every number
+// asserted here is the collector's own, because a panel that recomputed uptime locally
+// could disagree with the monitor's web page about the same model.
+
+/** The model rows the uptime box drew, in document order. */
+function uptimeRows(node) {
+  return collect(node, 'div').filter(item => item.props.className === 'dmi-up-row')
+}
+
+/** One row of the box, found by the model name it shows. */
+function uptimeRow(node, name) {
+  return uptimeRows(node).find(row => allText(row).includes(name))
+}
+
+/** The range switch: the one dropdown whose value is a window rather than a mode. */
+function rangeSwitch(node) {
+  return collect(node, 'select').find(item => ['24h', '7d', '30d'].includes(item.props.value))
+}
+
+UPTIME_MODE = 'green'
+tree = await view()
+text = allText(tree)
+check('the page names the uptime box', text.includes('Аптайм моделей'))
+check('the summary is the collector own arithmetic, not a recount',
+  text.includes('операционно 12 из 12') && text.includes('деградируют 0') && text.includes('лежат 0')
+  && text.includes('аптайм 100%') && text.includes('ошибок за период 0'))
+check('an all-green window is a finding, drawn in words',
+  uptimeRows(tree).length === 2 && text.includes('ошибок нет'), String(uptimeRows(tree).length))
+check('and carries no error styling',
+  uptimeRows(tree).every(row => row.props['data-dmi-status'] === 'up') && !text.includes('последняя ошибка'))
+check('the range switch defaults to a day and offers the three windows',
+  rangeSwitch(tree)?.props.value === '24h'
+  && collect(rangeSwitch(tree), 'option').map(option => option.props.value).join(',') === '24h,7d,30d',
+  String(rangeSwitch(tree)?.props.value))
+check('the footer names the moment and the store',
+  text.includes(`обновлено ${new Date(1792617332644).toLocaleString()}`) && text.includes('хранилище mongo'))
+check('the monitor itself is a real outbound link',
+  collect(tree, 'a').some(item => item.props.href === 'http://185.94.29.228:3789/' && item.props.target === '_blank'))
+
+requests.length = 0
+rangeSwitch(tree).props.onChange({ target: { value: '7d' } })
+await settle()
+tree = await view()
+check('the range switch asks the mirror for that window',
+  requests.some(item => item.path.includes('/uptime.json') && item.path.includes('range=7d')),
+  JSON.stringify(requests.map(item => item.path).filter(item => item.includes('uptime'))))
+check('and the box keeps the window it was switched to', rangeSwitch(tree)?.props.value === '7d')
+check('the window is UI state, not a setting: nothing was posted to /config',
+  !requests.some(item => item.path.endsWith('/config')),
+  JSON.stringify(requests.map(item => item.path)))
+
+UPTIME_MODE = 'populated'
+rangeSwitch(tree).props.onChange({ target: { value: '24h' } })
+await settle()
+tree = await view()
+text = allText(tree)
+const downRow = uptimeRow(tree, 'OPUS 5.5')
+const slowRow = uptimeRow(tree, 'GLM 5.3')
+check('a model that is down is drawn as down',
+  downRow?.props['data-dmi-status'] === 'down' && allText(downRow).includes('Down'))
+check('its error count and uptime are the collector numbers',
+  allText(downRow).includes('ошибок 5') && allText(downRow).includes('61%'))
+check('its last error is quoted with a time, a code and the provider own text',
+  allText(downRow).includes('последняя ошибка') && allText(downRow).includes('upstream_502')
+  && allText(downRow).includes('upstream connect error or disconnect/reset before headers'))
+check('and its age in the monitor own words', allText(downRow).includes('назад'))
+check('a degraded model is drawn as degraded',
+  slowRow?.props['data-dmi-status'] === 'slow' && allText(slowRow).includes('Degraded'))
+check('a model with errors gets bars rather than the empty word',
+  collect(downRow, 'span').filter(item => item.props.title !== undefined).length === 48
+  && !allText(downRow).includes('ошибок нет'),
+  String(collect(downRow, 'span').filter(item => item.props.title !== undefined).length))
+check('a clean model in the same window still says so',
+  allText(uptimeRow(tree, 'GPT-5')).includes('ошибок нет'))
+check('the summary counts what the collector counted',
+  text.includes('операционно 10 из 12') && text.includes('лежат 1') && text.includes('ошибок за период 7'))
+
+UPTIME_MODE = 'stale'
+tree = await view()
+text = allText(tree)
+check('a stale answer says it is cached, and from when',
+  text.includes('показано кешированное от') && text.includes(new Date(1792600000000).toLocaleString())
+  && text.includes('коллектор не ответил за 10 секунд'))
+check('and still draws the models it holds', uptimeRows(tree).length === 3, String(uptimeRows(tree).length))
+
+UPTIME_MODE = 'offline'
+tree = await view()
+text = allText(tree)
+check('a collector with no cache is reported rather than spun on',
+  text.includes('Коллектор не ответил') && text.includes('коллектор недоступен, а кешированного ответа нет')
+  && !text.includes('Читаем состояние моделей'))
+check('and the box still offers to ask again', findButton(tree, 'Обновить') !== undefined)
+
+UPTIME_MODE = 'refused'
+tree = await view()
+check('a host that refuses the view says so in its own words',
+  allText(tree).includes('аптайм выключен настройкой плагина'))
+
+UPTIME_MODE = 'populated'
+tree = await view()
+const UPTIME_LABEL = 'Показывать аптайм моделей'
+check('the uptime switch is offered with the other display switches',
+  switchNamed(tree, UPTIME_LABEL)?.props.checked === true)
+requests.length = 0
+switchNamed(tree, UPTIME_LABEL).props.onChange({ target: { checked: false } })
+await settle()
+check('the uptime switch posts its own config field',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).uptimeView === false),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+tree = await view()
+text = allText(tree)
+check('a switched-off view explains itself instead of drawing numbers',
+  text.includes('Аптайм выключен настройкой') && !text.includes('операционно'))
+requests.length = 0
+tree = await view()
+check('and costs no read at all',
+  !requests.some(item => item.path.includes('/uptime.json')),
+  JSON.stringify(requests.map(item => item.path)))
+
+requests.length = 0
+switchNamed(tree, UPTIME_LABEL).props.onChange({ target: { checked: true } })
+await settle()
+check('turning the view back on posts the same field',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).uptimeView === true))
+tree = await view()
+check('and the panel comes back with it', uptimeRows(tree).length === 3, String(uptimeRows(tree).length))
 
 /* -------------------------- the composer selector ------------------------- */
 // The key choice lives in exactly one place in a conversation: the composer's tool
@@ -1322,6 +1434,51 @@ await pass()
 check('a second pass leaves the hidden groups alone', hiddenOf(menu).length === 3, String(hiddenOf(menu).length))
 check('and still hides nothing it should not', hiddenOf(plainMenu).length === 0)
 
+// --- the uptime dots --------------------------------------------------------
+// The dots ride the same pass as the marks, so they are checked where the marks are:
+// a row the collector named carries one, a row it did not name carries none, and
+// neither the vendor mark nor the clone-group hiding notices the difference.
+const uptimeMenu = buildPickerMenu([{ label: 'rustvy', models: ['claude-opus-5-5', 'mistral-large-3'] }])
+await pass()
+const rowNamed = model => uptimeMenu.querySelectorAll('[role="menuitemradio"]').find(row => row.attributes.title === model)
+const dotOf = row => row.querySelectorAll('.dmi-uptime-dot')[0]
+const knownRow = rowNamed('claude-opus-5-5')
+const unknownRow = rowNamed('mistral-large-3')
+check('a model the collector named carries a status dot',
+  dotOf(knownRow) !== undefined && dotOf(knownRow).attributes['data-dmi-status'] === 'down',
+  String(dotOf(knownRow)?.attributes['data-dmi-status']))
+check('the dot explains itself on hover',
+  String(dotOf(knownRow)?.title ?? '').includes('Аптайм 61%')
+  && String(dotOf(knownRow)?.title ?? '').includes('ошибок 5')
+  && String(dotOf(knownRow)?.title ?? '').includes('за 24 часа'),
+  String(dotOf(knownRow)?.title))
+check('a model the collector did not name carries none', dotOf(unknownRow) === undefined,
+  String(unknownRow.querySelectorAll('.dmi-uptime-dot').length))
+check('the dot leaves the vendor mark alone', knownRow.querySelectorAll('.dmi-mark').length === 1,
+  String(knownRow.querySelectorAll('.dmi-mark').length))
+await pass()
+check('a second pass draws no second dot', knownRow.querySelectorAll('.dmi-uptime-dot').length === 1,
+  String(knownRow.querySelectorAll('.dmi-uptime-dot').length))
+
+// A view that is switched off takes its dots with it on the next pass, rather than
+// leaving a claim about a model in a menu the user can still open. Fired through the
+// same event the settings page fires, because that is how a change reaches the
+// decorator in the application.
+const reloadDecorator = async () => {
+  window.dispatchEvent({ type: 'dsh-rustvy:changed', detail: {} })
+  await settle()
+}
+STATE.config.uptimeView = false
+await reloadDecorator()
+check('a switched-off view leaves no dot in any menu',
+  documentStub.querySelectorAll('.dmi-uptime-dot').length === 0,
+  String(documentStub.querySelectorAll('.dmi-uptime-dot').length))
+check('and leaves every vendor mark where it was',
+  knownRow.querySelectorAll('.dmi-mark').length === 1 && menu.querySelectorAll('.dmi-mark').length > 0)
+STATE.config.uptimeView = true
+await reloadDecorator()
+check('the dots come back with the view', dotOf(rowNamed('claude-opus-5-5')) !== undefined)
+
 // --- the interaction throttle ---------------------------------------------
 // Every pointerdown and focusin in the whole application reaches this half, and
 // each read costs the host a credential resolve per key — so an interaction
@@ -1380,6 +1537,11 @@ check('the next interaction is throttled by the answer that POST brought home',
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)
 check('unload took the marks with it', menu.querySelectorAll('.dmi-mark').length === 0)
+// The dots are this half's writing in the host's menu exactly like the marks are, and
+// a dot left behind would keep claiming an uptime nobody is asking about any more.
+check('unload took the uptime dots with it',
+  documentStub.querySelectorAll('.dmi-uptime-dot').length === 0,
+  String(documentStub.querySelectorAll('.dmi-uptime-dot').length))
 // The groups this half hid are its doing, so an unload has to give them back:
 // leaving the class behind would hide a whole provider with nothing able to
 // restore it, since the stylesheet that reads the class goes too.

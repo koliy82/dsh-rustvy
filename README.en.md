@@ -191,6 +191,7 @@ Marks:
 | Показывать иконки моделей | on | master switch for the marks; off removes every mark and leaves the model list alone |
 | Иконка в кнопке выбранной модели | on | also mark the composer's model button, not just the menu rows |
 | Прятать логотипы других скинов | on | hide a skin's own lockup in a row this plugin marked |
+| Показывать аптайм моделей | on | the «Аптайм моделей» box on this page and the status dot in the model picker; off reads the collector's mirror at all |
 | Размер значка, px | 16 | 10–32 |
 
 Model list:
@@ -243,29 +244,28 @@ Error collection:
 
 The switch has a block of its own, «Сбор ошибок Rustvy», because it is the only setting
 on the page that sends anything off the machine — one line per failure of the provider
-goes to the monitor's collector. What leaves,
-what never does and when it fires is written right underneath it. The same block shows
-the state of the collection: the collector's address, the anonymous identifier, the sent,
-queued and dropped counters, the last answer and the last send error, and the failures
-broken down by kind. The address — `uptimeEndpoint`, `http://185.94.29.228:3789/api/report`
-by default — is shown rather than
-offered: there is no field for it, and it is repointed without a release by the
-`DSH_RUSTVY_UPTIME_ENDPOINT` environment variable or by hand in
-`<profile>\.dsh-rustvy\config.json`. The two buttons do exactly what they say:
-**Отправить тестовое событие** queues one synthetic event and flushes it immediately,
-**Отправить очередь сейчас** sends what has accumulated; both are disabled while
-collection is off.
+goes to the monitor's collector. What leaves, what never does and when it fires is
+written right underneath it, and that is the whole of the block: there are no counters
+and no send buttons on the page. The state of the collection — the collector's address,
+the anonymous identifier, the sent, queued and dropped counters, the last answer, the
+last send error and the failures by kind — is still served by the host's own loopback
+routes, `/dsh-rustvy/state` and `/dsh-rustvy/errors`, and that is where it is read, not
+in the interface. The address — `uptimeEndpoint`,
+`http://185.94.29.228:3789/api/report` by default — has no field of its own: it is
+repointed without a release by the `DSH_RUSTVY_UPTIME_ENDPOINT` environment variable or
+by hand in `<profile>\.dsh-rustvy\config.json`.
 
-Stored in `<profile>\.dsh-rustvy\config.json`. Four environment variables
+Stored in `<profile>\.dsh-rustvy\config.json`. Five environment variables
 override it, for a deployment that points the mirror and the collector elsewhere or
-wants the plugin mounted but inert, or mounted but silent: `DSH_RUSTVY_ORIGIN` and
-`DSH_RUSTVY_DISABLED=1`, `DSH_RUSTVY_UPTIME_ENDPOINT` and `DSH_RUSTVY_NO_ERRORS=1`.
+wants the plugin mounted but inert, mounted but silent, or mounted without the uptime
+panel: `DSH_RUSTVY_ORIGIN` and `DSH_RUSTVY_DISABLED=1`, `DSH_RUSTVY_UPTIME_ENDPOINT`,
+`DSH_RUSTVY_NO_ERRORS=1` and `DSH_RUSTVY_NO_UPTIME=1`.
 The first repoints the provider's site, the second disables the plugin whole. The third
 repoints the uptime collector and overrides both the default and `config.json`: only an
 address that parses as `http`/`https` is accepted, trailing slashes are stripped, and an
-unusable value is ignored, leaving the setting in force. The fourth, set to `1` or
-`true`, forces collection off regardless of the setting — the same device by which
-`DSH_RUSTVY_DISABLED` silences the marks.
+unusable value is ignored, leaving the setting in force. The fourth and the fifth, each
+set to `1` or `true`, force error collection and the uptime view off regardless of the
+setting — the same device by which `DSH_RUSTVY_DISABLED` silences the marks.
 
 ## Where the pictures come from
 
@@ -440,6 +440,7 @@ not move.
 | Per-chat picks | `<profile>\.dsh-rustvy\session-keys.json` — `sessionId → keyId` |
 | The install's anonymous identifier | `<profile>\.dsh-rustvy\install.json` — a random UUID and a creation date; it belongs to error collection rather than to the ring, and lives beside the plugin's other files |
 | Undelivered error reports | `<profile>\.dsh-rustvy\errors-queue.json` — the queue of reports the uptime collector has not accepted yet |
+| The monitor's last view | `<profile>\.dsh-rustvy\uptime.json` — the cached collector answer the panel shows with a `stale` note when the collector is unreachable; it belongs to the uptime view rather than to the ring |
 
 No file of this plugin ever holds a key value: not `keys.json`, not
 `session-keys.json`, not the settings, not the profile backup a revert reads, not the
@@ -637,11 +638,12 @@ broke is over there, and not in the request you composed.
 ### Successes go nowhere
 
 The collector receives failures only: a report about a request that succeeded is never
-sent. Successes are still observed locally, for exactly two reasons — the counters on the
-settings page, and settling a model's still-folding failure the moment a request goes
-through again, so that report reaches the collector at the instant of recovery rather
-than at the end of a folding window; the gap between the two timestamps is the length of
-the outage.
+sent. Successes are still observed locally, for one thing — settling a model's
+still-folding failure the moment a request goes through again, so that report reaches the
+collector at the instant of recovery rather than at the end of a folding window; the gap
+between the two timestamps is the length of the outage. The counters successes move are
+still served by the host in `errorReport`, but the settings page draws none of them, as
+it draws no part of the collection summary.
 
 The consequence is worth stating plainly: uptime on the monitor is the absence of errors
 in a window, not a ratio of two kinds of report. A model nobody asked about looks the
@@ -716,6 +718,78 @@ new; it has no effect on the requests to the provider themselves, in any state. 
 report shape, the kind vocabulary and the collector's contract are described in
 [`docs/error-report.md`](docs/error-report.md).
 
+## Model uptime
+
+The same collector that takes the error reports hands back the monitor's view: which
+models are answering, how many people they are failing, and how long they have been
+failing. The plugin shows that view inside DSH — as a box on the settings page and as a
+dot in the model picker — so choosing a model does not mean opening a browser to look
+for a line that is already visible here.
+
+Every number in the box is the collector's own. The plugin recomputes nothing: a
+percentage worked out locally would disagree with the monitor's web page, and two
+answers to "is this model up" is worse than one.
+
+### Where it is read from
+
+The host half mirrors the collector's answer onto its own loopback route,
+`GET /dsh-rustvy/uptime.json?range=24h|7d|30d`, and the panel reads the mirror rather
+than the collector: the request stays inside the machine, and the mirror holds the last
+good answer, so an unreachable collector shows a cached picture with an explicit note
+rather than an empty box. It refreshes every 30 seconds while the settings page is open
+— the monitor's own page waits the same — and stops asking the moment the page is closed.
+
+### The three statuses
+
+| Status | Word | Colour |
+|---|---|---|
+| `up` | Operational, UP | `#22c55e` |
+| `slow` | Degraded, SLOW | `#f59e0b` |
+| `down` | Down, DOWN | `#ef4444` |
+
+The words and the colours come from the monitor's page, so the plugin and the site do
+not tell different stories about the same model. That is all they contribute: every
+surface behind them is an ordinary `--dsw-alias-*` theme token, because the monitor's
+page has one dark theme and this one has two.
+
+### Windows and strips
+
+The window switch — 24 hours, 7 days, 30 days, a day by default — is the panel's own
+state rather than a setting: it is not written to `config.json`, so one glance at last
+month does not become a preference every other surface inherits. The strip under each
+model is up to 48 buckets per window whatever its length, so a bucket's width changes
+with the window: half an hour over 24 hours, three and a half over 7 days, fifteen over
+30. Bars are scaled by `max(1, …counts)`, which is what makes a single error visible.
+
+### An empty answer is a normal one
+
+The collector's aggregation is still being written, and today it answers `total: 0` with
+no errors and empty buckets on all three windows. The panel draws that as a finding
+rather than as a failure: «ошибок нет» is an answer, and it is written in words instead
+of forty-eight empty bars. When the aggregation starts working, the same rows will show
+real outages and the page will not need changing for it. That is a property of the
+collector, not of the plugin.
+
+### The dots in the model picker
+
+A row the collector named gets a dot in the model picker, coloured by status, with a
+tooltip like «Аптайм 61% · ошибок 5 · за 24 часа». The dot describes the last 24 hours
+and only those: the panel's window does not move it, or its tooltip would lie about the
+number it is explaining. A row the collector did not name gets no dot at all — the
+absence of one means "the collector said nothing about this model", not "it is fine".
+The dots are drawn by the same pass that draws the vendor marks, so the marks' master
+switch takes them too, while «Показывать аптайм моделей» takes only them.
+
+### Turning it off
+
+With the **Показывать аптайм моделей** switch in **Settings → Rustvy** (on by default),
+with `uptimeView: false` in `<profile>\.dsh-rustvy\config.json`, or with the
+`DSH_RUSTVY_NO_UPTIME=1` environment variable, which hides the panel regardless of the
+setting. A view that is off
+reads nothing: neither the panel nor the dots appear, and no request goes to the mirror
+at all. The collector's answer shape, its fields and the mirror's contract are described
+in [`docs/uptime-view.md`](docs/uptime-view.md).
+
 ## Routes
 
 One prefix registration on the harness's own web server. Plugin routes are not
@@ -729,12 +803,13 @@ loopback only, a loopback `Host`, a same-origin `Sec-Fetch-Site` and a matching
 | `/dsh-rustvy/logo/<name>.svg` | GET, HEAD | one cached logo, fetched from the origin on first ask; `404` when the origin has no such mark, `400` for any name that is not `[A-Za-z0-9._-]+.svg` |
 | `/dsh-rustvy/models.json` | GET | the generated model list and its drift against the installed one; `?cached=1` reports the last computed plan instead of reading the endpoint again |
 | `/dsh-rustvy/models.yaml` | GET, HEAD | the same list as a paste-ready `cordis.patch.yml` row; `?cached=1` as above |
-| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path — `install` and `errorsQueue` among them — last error, the last computed drift, a key-ring summary, and an `errorReport` block: whether collection is on, the collector's address, the anonymous identifier, the sent, queued and dropped counters, the last answer, the last send error and the failures by kind. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks. A host half older than error collection sends neither the `errorReport` block nor the two new paths, and the settings page draws dashes instead |
+| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path — `install`, `errorsQueue` and `uptime` among them — last error, the last computed drift, a key-ring summary, and an `errorReport` block: whether collection is on, the collector's address, the anonymous identifier, the sent, queued and dropped counters, the last answer, the last send error and the failures by kind. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks. The settings page draws no part of the `errorReport` block — it is for whoever reads the route by hand — and a host half older than error collection sends neither it nor the two new paths |
 | `/dsh-rustvy/refresh` | POST | re-read the catalog, re-warm every logo it names, and report — or, when the write mode allows it, apply — the model list |
 | `/dsh-rustvy/apply-models` | POST | write the generated list into the route profile through `ctx.configEditor` |
 | `/dsh-rustvy/revert-models` | POST | put the backed-up route profile back |
 | `/dsh-rustvy/config` | POST | write settings; never touches the network |
-| `/dsh-rustvy/errors` | GET, POST | GET: the collection summary — the same `errorReport` block `/state` carries. POST `{ action: 'test' }` queues one synthetic event and flushes it immediately, `{ action: 'flush' }` sends what has accumulated; both answer with the fresh summary, so one POST is enough to repaint. A refusal is HTTP 200 with `{ ok: false, error }`, the way a disabled feature answers on `/apply-models` |
+| `/dsh-rustvy/errors` | GET, POST | loopback diagnostics for error collection, which the interface no longer surfaces: neither a button nor a status row on the settings page leads here. GET: the collection summary — the same `errorReport` block `/state` carries. POST `{ action: 'test' }` queues one synthetic event and flushes it immediately, `{ action: 'flush' }` sends what has accumulated; both answer with the fresh summary. A refusal is HTTP 200 with `{ ok: false, error }`, the way a disabled feature answers on `/apply-models`. The route keeps working: it is how delivery is checked by hand, when nobody wants to look at a screen for it |
+| `/dsh-rustvy/uptime.json` | GET | the mirror of the monitor's view: `?range=24h\|7d\|30d` (`24h` by default) and the collector's answer as it came — `summary`, `models` with their `status`, `uptime`, `errors`, `buckets`, `events` and `lastError`, `byCode`, `generatedAt`, `storage` and `monitorUrl`. When the collector is unreachable it serves the last good answer with `stale: true`, a `fetchedAt` and an `error`; with no cache at all, `502` and `{ ok: false, error }`. With the view switched off, `200` and `{ ok: false, error }`, the way every disabled feature answers |
 | `/dsh-rustvy/keys` | GET, POST | GET: the whole ring — keys with a mask and a fingerprint, the default key, the hidden provider groups, the missing and stale routes, the substitution counters, the last refusal, both file paths, and whether `credentials` and `configEditor` are available. POST: one action on the ring (`add`, `set`, `rename`, `default`, `remove`, `repair`, `test`); a success answers with a fresh GET plus the action's own field, so one POST repaints everything. A refusal is `409` with `{ ok: false, error }`, an unknown action `400`. A key value is accepted in the body only |
 | `/dsh-rustvy/session-key` | GET, POST | GET with `?sessionId=`: which key this chat sends its requests with (`keyId`), whether the choice is its own (`picked`), and the whole `GET /keys` answer besides; `400` without an id. POST `{ sessionId, keyId }` records the choice and answers with the same payload; `keyId: null` returns the chat to the default key |
 
@@ -744,8 +819,8 @@ The host half reloads itself, the same way `dsh-proxy-gui` does: the loader row
 names this package, whose entry imports the implementation through a
 cache-busting `?rev=` query, and a one-second poll of the `lib` directory disposes
 the previous revision and starts the next one once a changed fingerprint repeats.
-`lib/host.js`, `lib/models.js`, `lib/keys.js`, `lib/errors.js` and `lib/net.js`
-therefore reload
+`lib/host.js`, `lib/models.js`, `lib/keys.js`, `lib/errors.js`, `lib/uptime.js` and
+`lib/net.js` therefore reload
 live; only an edit to the entry bootstrap itself needs a restart. The browser half arrives in an
 open page through the harness's own live plugin composition; a page refresh works
 too.
@@ -772,8 +847,9 @@ Each capability degrades on its own:
 | `credentials` | there is nowhere to put a key value: the ring stays at its one primary key, adding is unavailable, and the «API-ключи» section names the reason instead of showing a form that would fail |
 | `configEditor` — for the ring | an existing key's value can still be replaced, but a new key's route cannot be added: the add form is disabled and the section says why |
 | a key route lost to a hand edit of `cordis.patch.yml` or to a model-list revert | the key stays in the ring, its route is listed under `routes.missing`, that chat's requests go out on the profile's route with a visible reason, and **«Починить маршруты»** (`{ action: 'repair' }`) writes the ring's routes again |
-| the uptime collector | reports stay queued on disk and leave when the site answers, so an outage still reaches the monitor with its real timestamps; requests to the provider are unaffected either way, and the settings page shows the backlog and the last send error |
-| a host half older than error collection | `/state` arrives without the `errorReport` block and without the two new paths: the page draws dashes where the status rows would be and offers neither send button |
+| the uptime collector | reports stay queued on disk and leave when the site answers, so an outage still reaches the monitor with its real timestamps; requests to the provider are unaffected either way, and the backlog and the last send error are served by the loopback routes `/dsh-rustvy/state` and `/dsh-rustvy/errors` — the settings page shows neither |
+| a host half older than error collection | `/state` arrives without the `errorReport` block and without the two new paths: the settings page draws the switch and its promise identically either way, because it draws no part of the collection summary, and the file paths appear only when the host names them |
+| the monitor's view at the collector | the mirror serves the last good answer with `stale: true`, and the panel shows that cached picture with the moment it is from; with no cache at all it is a `502`, and the panel names the reason instead of spinning. The picker's dots go with the data while the vendor marks stay: requests to the provider are unaffected either way |
 
 ## Layout
 
@@ -784,6 +860,7 @@ Each capability degrades on its own:
 | `lib/models.js` | pure mapping: what an origin publishes → one route-profile entry, the drift between two lists, and the YAML for a manual edit |
 | `lib/keys.js` | pure ring arithmetic: labels, credential-reference and route names, the ring and pick documents, and reconciling a provider map with the ring |
 | `lib/errors.js` | classifying a failure as infrastructure or as the user's own, scrubbing secrets and paths out of its text, the install's anonymous identifier, and the folding report queue with its file on disk |
+| `lib/uptime.js` | the pure shape of the monitor's view: the ranges it accepts, coercing the collector's answer into the fields the panel draws, cutting strings and clamping percentages. It reads no network and keeps no cache — `lib/host.js` owns both |
 | `lib/net.js` | one outbound GET on the process's route, then the environment's proxy |
 | `client/client.js` | hand-authored browser bundle: the decorator, the settings page, the composer's key switch, and the hiding of clone groups in the model menu |
 | `locale/en.json`, `ru.json`, `zh.json` | the plugins-menu title and description |
@@ -793,14 +870,16 @@ Each capability degrades on its own:
 | `scripts/prepublish-check.mjs` | the publish gate: everything that can install fine and still be wrong |
 | `tests/` | the mapping, the YAML emitter, the key ring, and the host and browser halves |
 
-`lib/models.js` and `lib/keys.js` are deliberately pure — no network, no
+`lib/models.js`, `lib/keys.js` and `lib/uptime.js` are deliberately pure — no network, no
 filesystem, no Cordis — so the mapping can be checked against a real origin's
-answer, and the ring arithmetic against an invented profile, without mounting
+answer, the ring arithmetic against an invented profile, and the shape of the monitor's
+view against a collector's answer, without mounting
 anything. `lib/errors.js` touches no network either: its sender is injected, precisely
 because a queue whose transport is imported cannot be reasoned about at the moment the
 site it reports on is the thing that is down. That module does read and write its own two
 files — an install identity that could only be created inside a mounted host would be
-nothing to build on. `lib/host.js` owns everything with a lifetime, and is what a reload
+nothing to build on. `lib/host.js` owns everything with a lifetime, including the reading
+of the monitor's view and the cache of its last good answer, and is what a reload
 replaces.
 
 ## Tests
@@ -811,6 +890,7 @@ node tests\yaml-roundtrip-test.mjs       # emitter vs two real YAML parsers, aga
 node tests\model-sync-host-test.mjs      # host: fake webServer + configEditor, real origin fetch
 node tests\api-keys-host-test.mjs        # the key ring: fake credentials, configEditor and event bus, no network
 node tests\error-report-host-test.mjs    # error collection: classification, folding and delivery to a local collector
+node tests\uptime-host-test.mjs          # the monitor's view: the mirror, the cached answer and its stale note
 node tests\model-sync-client-test.mjs    # browser: mini-React + stubbed DOM, fixture /state
 node scripts\prepublish-check.mjs        # the publish gate
 ```
@@ -874,6 +954,13 @@ is the same host half the two previous host tests drive, so the `/dsh-rustvy/err
 route, the `errorReport` block in `/state` and the queue on disk are checked together
 with what actually ends up in a report that was sent.
 
+`uptime-host-test.mjs` is the host test for the monitor's view: the mirror on
+`/dsh-rustvy/uptime.json`, its three windows, the cache of the last good answer on disk,
+and the `stale` note with its `fetchedAt` and reason when the collector is unreachable.
+It also checks that the mirror recomputes nothing — the collector's answer is handed
+over as it came — and that a switched-off view answers `{ ok: false }` without making a
+request at all.
+
 The client test renders the settings page with a mini-React whose hook cells are
 keyed per component instance, and asserts: the section is named Rustvy; the three
 outbound addresses are real links that open outside the app; every file path is
@@ -902,15 +989,32 @@ in no URL and is gone from the page once the add is done.
 
 It also draws the error-collection block: the switch with its exact label — on by
 default, including when the fixture `/state` knows nothing of a `collectErrors` field at
-all — the promise underneath it, asserted by substring (what never leaves, that
-collection fires only on a fault of the provider, that the monitor sends no probes of its
-own), the status rows with the collector's address, the truncated anonymous identifier,
-the counters, the last answer and the failures by kind, and both buttons: disabled while
-collection is off, posting `{ action: 'test' }` and `{ action: 'flush' }` to
-`/dsh-rustvy/errors`, and reporting whether the collector took the delivery. A host half
-older than the feature is checked separately: without the `errorReport` block the page
-still draws the switch and its description, draws no status rows at all, and does not
-throw.
+all — and the promise underneath it, asserted by substring (what never leaves, that
+collection fires only on a fault of the provider, that a successful request is never
+sent, that nobody sends probes of their own). Its absence is asserted separately: the
+fixture carries a complete `errorReport`, and the page still shows neither the «Состояние
+сборщика» caption, nor any of the eight summary rows, nor a single value of theirs — no
+anonymous identifier, no breakdown by kind, no moment of the last delivery — nor either
+send button, and the recorded requests contain no call to `/dsh-rustvy/errors` at all. A
+removal nobody asserts is a removal that comes back. A host half older than the feature is
+checked too: without the `errorReport` block the page draws exactly what it draws with
+one, and does not throw.
+
+It draws the uptime box too, against two fixtures, because only the all-green one has
+ever come back from the live collector. Asserted: the summary and the per-model rows
+with their `up`, `slow` and `down` statuses; the window switch, which asks the mirror
+for `?range=7d`, keeps the window it was given and posts nothing to `/config`, since it
+is the panel's state rather than a setting; the all-green answer drawn as the words
+«ошибок нет» with no error styling; a populated one drawn as a `down` model with its
+error count, its last error and a strip of 48 buckets; a cached answer showing its
+`fetchedAt` and the warning with its reason; and an unreachable collector naming the
+reason and keeping the «Обновить» button instead of spinning forever. The picker's dots
+are checked separately: a row the collector named carries a dot of its status with a
+tooltip and keeps its vendor mark, a row it did not name carries none, a second pass
+draws no second dot, and a switched-off view takes the dots while leaving the marks. The
+uptime switch is checked the way every other one is — it posts its own field to
+`/config`, and off means the panel explains itself in words and makes no request to the
+mirror at all.
 
 The mark-drawing half is **not** covered by an automated suite in this repository,
 and that is worth knowing up front. It works on the DOM of an already-open page, so

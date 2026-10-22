@@ -51,6 +51,22 @@ window.__ModuleLoader__.load({
     /** Class of one drawn mark. */
     const MARK = 'dmi-mark'
 
+    /**
+     * Class of one uptime dot this half drew into a picker row.
+     *
+     * Its own class rather than a second `dmi-mark`: the observer has to tell this
+     * half's own writes from the host's, the unload has to take the dots with it,
+     * and a dot is not a vendor mark — it says whether the model is answering, not
+     * who makes it.
+     */
+    const DOT = 'dmi-uptime-dot'
+
+    /** Range the picker's dots describe; the settings box picks its own. */
+    const DOT_RANGE = '24h'
+
+    /** How long the picker keeps its uptime read before an interaction re-reads it. */
+    const UPTIME_TTL_MS = 30_000
+
     /** Body attribute that turns on "one mark per row" for competing skins. */
     const HIDE_FLAG = 'data-dmi-hide-other'
 
@@ -99,6 +115,37 @@ window.__ModuleLoader__.load({
       ok: 'var(--dsw-alias-state-success-primary)',
       bad: 'var(--dsw-alias-state-error-primary)',
       warn: 'var(--dsw-alias-state-warn-primary)',
+      /**
+       * The collector's own three status colours, taken from its monitor page so the
+       * plugin and the web monitor tell the same story. Accents only — dots, bars and
+       * the status word: every surface behind them is `C.surface` and `C.border`,
+       * because the collector's page has one dark theme and this one has two.
+       */
+      up: '#22c55e',
+      slow: '#f59e0b',
+      down: '#ef4444',
+    }
+
+    /** The three statuses the collector reports, and how each reads here. */
+    const STATUSES = Object.freeze({
+      up: { label: 'Operational', short: 'UP', color: C.up },
+      slow: { label: 'Degraded', short: 'SLOW', color: C.slow },
+      down: { label: 'Down', short: 'DOWN', color: C.down },
+    })
+
+    /**
+     * One status word, resolved against the collector's own vocabulary.
+     *
+     * Anything it does not name falls back to `up` rather than to an error state: a
+     * model with no reports in the window is a model nothing complained about, and
+     * inventing a fourth status for an unknown string would say more than the wire
+     * did.
+     *
+     * @param status - the collector's `status` field.
+     * @returns `{ label, short, color }`.
+     */
+    function statusOf(status) {
+      return STATUSES[typeof status === 'string' ? status : ''] ?? STATUSES.up
     }
 
     /** The one sans stack this half types with, shared by CSS rules and inline styles. */
@@ -133,6 +180,7 @@ window.__ModuleLoader__.load({
 .${MARK}[data-dmi-mono]{background-color:transparent;-webkit-mask:none;mask:none;display:inline-flex;align-items:center;justify-content:center;border:1px solid currentColor;border-radius:4px;font-size:calc(var(--dmi-size) * .58);font-weight:700;line-height:1;letter-spacing:.01em;opacity:.7;box-sizing:border-box}
 body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [${ROW_FLAG}] svg[data-combine-word]{display:none!important}
 .${HIDDEN_GROUP}{display:none!important}
+.${DOT}{--dmi-dot:7px;flex:none;width:var(--dmi-dot);height:var(--dmi-dot);min-width:var(--dmi-dot);border-radius:50%;background:var(--dmi-dot-color,currentColor);opacity:.95;pointer-events:none;vertical-align:middle;margin-inline-end:5px}
 .dmi-glyph{display:inline-flex;flex:none;align-items:center;justify-content:center}
 .dmi-glyph svg{display:block;width:100%;height:100%}
 .dmi-key-sep{height:1px;flex:none;margin:4px 8px;background:${C.border}}
@@ -185,6 +233,24 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       size: 16,
       markTrigger: true,
       hideOtherMarks: true,
+      /**
+       * The collector's uptime view, as the picker's dots see it.
+       *
+       * Two maps over one list, for the same reason the catalog has `byId` and
+       * `byName`: a row names a model by its display name as often as by its id, and
+       * a dot that only matched one of the two would flicker between rows that mean
+       * the same model. Only the range the dots claim to describe is absorbed — a
+       * box switched to 30 days must not repaint the picker's «за 24 часа».
+       */
+      uptimeView: true,
+      uptime: new Map(),
+      uptimeByName: new Map(),
+      uptimeLoadedAt: 0,
+      uptimeRevision: 0,
+      uptimeError: null,
+      uptimeStale: false,
+      /** The last answer, so a throttled caller can render without re-reading. */
+      uptimePayload: null,
       byId: new Map(),
       byName: new Map(),
       records: [],
@@ -256,6 +322,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 
     /** A key-list read is in flight; coalesces the burst a menu open causes. */
     let keysLoading = null
+
+    /** An uptime read is in flight; coalesces the same burst for the same reason. */
+    let uptimeLoading = null
 
     /**
      * How young a key-list read may be before an interaction re-reads it.
@@ -579,6 +648,118 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
+     * The dot this half already drew into one row, if any.
+     *
+     * Read from `children` for the reason `ownMark` reads from `children`: a nested
+     * row owns its own dot, and a parent must not mistake it for its own.
+     *
+     * @param row - the row element.
+     * @returns the dot element, or `null`.
+     */
+    function ownDot(row) {
+      for (const child of Array.from(row.children ?? [])) {
+        if (child.classList?.contains(DOT) === true) return child
+      }
+      return null
+    }
+
+    /**
+     * The uptime record one row's text names, if the view knows that model.
+     *
+     * Tried by id and by display name, on the whole label and on its first token,
+     * because a row says "OPUS 5.5" as readily as "claude-opus-5-5" — the same two
+     * forms `resolve` tries for the catalog. A prefix match is last and longest wins,
+     * so `claude-opus-5-5` is never claimed by `claude-opus-5`.
+     *
+     * @param text - the row's visible name text.
+     * @returns the collector's model record, or `undefined`.
+     */
+    function uptimeFor(text) {
+      const raw = normalize(text)
+      if (raw === '') return undefined
+      const first = raw.split(/\s+/u)[0]
+      for (const candidate of [raw, stripPrefix(raw), first, stripPrefix(first)]) {
+        if (candidate === '') continue
+        const byId = state.uptime.get(candidate)
+        if (byId !== undefined) return byId
+        const byName = state.uptimeByName.get(candidate)
+        if (byName !== undefined) return byName
+      }
+      let best
+      let bestKey = ''
+      for (const candidate of [raw, first]) {
+        for (const key of state.uptime.keys()) {
+          if (key.length < 3 || !candidate.startsWith(key)) continue
+          const next = candidate.charAt(key.length)
+          if (next !== '' && /\w/u.test(next)) continue
+          if (key.length > bestKey.length) {
+            best = state.uptime.get(key)
+            bestKey = key
+          }
+        }
+      }
+      return best
+    }
+
+    /**
+     * Build one uptime dot.
+     *
+     * @param model - the collector's record for it.
+     * @param status - the resolved status word.
+     * @param title - the text a hover explains it with.
+     * @returns the element to insert.
+     */
+    function buildDot(model, status, title) {
+      const span = document.createElement('span')
+      span.className = DOT
+      span.setAttribute('aria-hidden', 'true')
+      span.dataset.dmiStatus = status
+      span.dataset.dmiModel = normalize(model?.id)
+      span.style.setProperty('--dmi-dot-color', statusOf(status).color)
+      span.title = title
+      return span
+    }
+
+    /**
+     * Draw one row's uptime dot, replacing a stale one.
+     *
+     * Idempotent in exactly the way `decorateRow` is: a dot that already says what the
+     * answer says is left alone, so the observer never feeds on this half's own writes
+     * and a repaint costs no DOM at all. A row the view does not know loses any dot it
+     * had, because a stale dot is a claim about a model the collector stopped naming.
+     *
+     * @param row - the row element.
+     * @param text - the row's visible name text.
+     * @param surface - `'row'` or `'trigger'`; only rows are dotted.
+     * @returns true when the DOM changed.
+     */
+    function decorateDot(row, text, surface) {
+      const existing = ownDot(row)
+      const model = surface === 'row' && state.uptimeView ? uptimeFor(text) : undefined
+      if (model === undefined) {
+        if (existing === null) return false
+        existing.remove()
+        return true
+      }
+      const status = typeof model.status === 'string' ? model.status : 'up'
+      const uptime = Number.isFinite(model.uptime) ? model.uptime : null
+      const errors = Number.isFinite(model.errors) ? model.errors : null
+      const title = `Аптайм ${uptime === null ? '—' : `${uptime}%`} · ошибок ${errors === null ? '—' : errors} · за 24 часа`
+      const id = normalize(model.id)
+      if (existing !== null) {
+        if (existing.dataset.dmiStatus === status && existing.dataset.dmiModel === id && existing.title === title) {
+          return false
+        }
+        existing.remove()
+      }
+      // After the vendor mark when the row has one, so the two read as one lead-in
+      // rather than as a dot floating somewhere in the middle of the label.
+      const mark = ownMark(row)
+      row.insertBefore(buildDot(model, status, title), mark === null ? row.firstChild : mark.nextSibling)
+      return true
+    }
+
+    /**
      * One decoration pass over a subtree.
      *
      * Idempotent: a row that already carries the right mark is left alone, which
@@ -596,9 +777,13 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         for (const node of nameNodes(root)) {
           const found = rowOf(node)
           if (found === undefined) continue
-          const entry = resolve(nameOf(found.row, node))
-          if (entry === undefined) continue
-          if (decorateRow(found.row, entry, found.surface)) drawn += 1
+          const text = nameOf(found.row, node)
+          const entry = resolve(text)
+          if (entry !== undefined && decorateRow(found.row, entry, found.surface)) drawn += 1
+          // Dotted whether or not the row earned a vendor mark: a model the mirrored
+          // catalog does not list still has an uptime, and a row with a dot and no
+          // mark is a row this half knows nothing about except that it is answering.
+          if (decorateDot(found.row, text, found.surface)) drawn += 1
         }
       } finally {
         suppress = false
@@ -620,11 +805,15 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       else body.removeAttribute(HIDE_FLAG)
     }
 
-    /** Remove every mark this half drew, on unload or when icons are switched off. */
+    /** Remove every mark and dot this half drew, on unload or when they are switched off. */
     function clearMarks() {
       suppress = true
       try {
         for (const mark of document.querySelectorAll(`.${MARK}`)) mark.remove()
+        // The dots go with the marks: both are this half's own writing in the host's
+        // menu, and an unload that left one behind would leave a claim about a model
+        // with nothing on the page able to correct it.
+        for (const dot of document.querySelectorAll(`.${DOT}`)) dot.remove()
         for (const row of document.querySelectorAll(`[${ROW_FLAG}]`)) row.removeAttribute(ROW_FLAG)
         // The provider groups this half hid are its doing too: an unload that left
         // the class behind would leave a whole provider's models invisible with
@@ -835,6 +1024,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       state.size = Number.isFinite(payload.config?.size) ? payload.config.size : 16
       state.markTrigger = payload.config?.markTrigger !== false
       state.hideOtherMarks = payload.config?.hideOtherMarks !== false
+      state.uptimeView = payload.config?.uptimeView !== false
       state.version = payload.version ?? null
       state.fetchedAt = payload.fetchedAt ?? null
       state.error = payload.error ?? null
@@ -884,6 +1074,15 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         clearMarks()
         decorate(document)
         hideCloneGroups()
+        // The uptime read goes second because the catalog answer is what carries the
+        // toggle: a switch that is off must cost no request at all, not even one that
+        // is then ignored. What it brings back is one more pass over the same rows,
+        // and only when it actually moved something.
+        if (state.uptimeView) {
+          const before = state.uptimeRevision
+          await loadUptime(DOT_RANGE)
+          if (state.uptimeRevision !== before) decorate(document)
+        }
         return summary
       } catch (error) {
         state.ready = false
@@ -891,6 +1090,107 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         clearMarks()
         return undefined
       }
+    }
+
+    /* ----------------------------- model uptime ----------------------------- */
+    /*
+     * The collector's own numbers, mirrored by the host half onto a loopback route
+     * and drawn twice: a panel on the settings page, and one dot per model row in the
+     * picker. Nothing here is computed by this half — a percentage invented locally
+     * would disagree with the monitor's own web page, and two answers to "is this
+     * model up" is worse than one.
+     *
+     * The empty answer is the normal one today, and it is rendered as a state of its
+     * own rather than as a failure: the collector's aggregation is still being
+     * written, so "no errors in this window" is what an honest panel says, and a
+     * spinner or a red line over it would be the lie.
+     */
+
+    /**
+     * Fold one uptime answer into the state the picker's dots read.
+     *
+     * Only the range the dots claim to describe is absorbed, so a settings box
+     * looking at 30 days cannot repaint a picker whose titles say «за 24 часа».
+     *
+     * @param payload - the mirror's answer.
+     * @param range - the range it was asked for.
+     * @returns the payload, so a caller can render from it directly.
+     */
+    function absorbUptime(payload, range) {
+      const answer = typeof payload === 'object' && payload !== null ? payload : {}
+      state.uptimeError = typeof answer.error === 'string' ? answer.error : null
+      state.uptimeStale = answer.stale === true
+      state.uptimePayload = answer
+      state.uptimeLoadedAt = Date.now()
+      state.uptimeRevision += 1
+      if (range !== DOT_RANGE) return answer
+      const byId = new Map()
+      const byName = new Map()
+      for (const model of Array.isArray(answer.models) ? answer.models : []) {
+        if (typeof model !== 'object' || model === null) continue
+        const id = normalize(model.id)
+        const name = normalize(model.name)
+        if (id !== '' && !byId.has(id)) byId.set(id, model)
+        if (name !== '' && !byName.has(name)) byName.set(name, model)
+      }
+      // A refused answer (`ok: false`: the view is switched off, or there is no cache
+      // to fall back on) carries no models, and the dots have to go with them rather
+      // than keep describing a window nobody is asking about any more.
+      state.uptime = answer.ok === false ? new Map() : byId
+      state.uptimeByName = answer.ok === false ? new Map() : byName
+      return answer
+    }
+
+    /**
+     * Read the mirrored uptime view for one range.
+     *
+     * Never throws and never rejects: an unreachable collector is a state to render,
+     * not an error to surface, and the picker must not lose its vendor marks because
+     * the monitor is down. Concurrent calls for one range share a single request —
+     * the settings page polling and an interaction arriving in the same tick want the
+     * same answer — and sequential ones are throttled to the collector's own 30 s
+     * cadence, so a burst of clicks costs at most one loopback read per half minute.
+     *
+     * @param range - `24h`, `7d` or `30d`; the picker's own range by default.
+     * @param options - `{ force: true }` to bypass the throttle.
+     * @returns a promise of the answer, or of `null` when there was none.
+     */
+    function loadUptime(range = DOT_RANGE, options) {
+      const want = typeof range === 'string' && range !== '' ? range : DOT_RANGE
+      if (uptimeLoading !== null && uptimeLoading.range === want) return uptimeLoading.promise
+      if (options?.force !== true && Date.now() - state.uptimeLoadedAt < UPTIME_TTL_MS) {
+        return Promise.resolve(state.uptimePayload)
+      }
+      const promise = (async () => {
+        try {
+          const response = await fetch(`${API}/uptime.json?range=${encodeURIComponent(want)}`, {
+            headers: { accept: 'application/json' },
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok) {
+            state.uptimeError = typeof payload?.error === 'string' ? payload.error : `HTTP ${response.status}`
+            state.uptimeStale = false
+            state.uptimePayload = null
+            state.uptimeLoadedAt = Date.now()
+            state.uptimeRevision += 1
+            if (want === DOT_RANGE) {
+              state.uptime = new Map()
+              state.uptimeByName = new Map()
+            }
+            return null
+          }
+          return absorbUptime(payload, want)
+        } catch (error) {
+          state.uptimeError = error instanceof Error ? error.message : String(error)
+          state.uptimeLoadedAt = Date.now()
+          state.uptimeRevision += 1
+          return null
+        } finally {
+          uptimeLoading = null
+        }
+      })()
+      uptimeLoading = { range: want, promise }
+      return promise
     }
 
     /* ------------------------------ API keys ------------------------------ */
@@ -1258,11 +1558,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      *
      * @param path - the route that was called.
      * @param payload - the answer the host gave.
-     * @param body - what was posted, for the routes whose one answer reads
-     *   differently per action; `/errors` is the only such route so far.
      * @returns `{ kind, text }`, where kind picks the colour.
      */
-    function noticeFor(path, payload, body) {
+    function noticeFor(path, payload) {
       if (path === '/apply-models') {
         if (payload.ok === false) return { kind: 'bad', text: `Список моделей не записан: ${payload.error ?? 'причина не сообщена'}` }
         if (payload.upToDate === true) return { kind: 'ok', text: `Список моделей уже актуален: ${payload.count ?? 0}.` }
@@ -1294,49 +1592,6 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           kind: 'warn',
           text: `${base} Список моделей устарел — новые: ${listOf(sync.plan?.added)}, убраны: ${listOf(sync.plan?.removed)}.`,
         }
-      }
-      if (path === '/errors') {
-        // A refusal here arrives as HTTP 200 with `ok: false` and the host's own
-        // reason, and it is warned about rather than reported as broken: nothing
-        // failed, the page asked a switched-off feature to send something.
-        if (payload.ok === false) {
-          return { kind: 'warn', text: String(payload.error ?? 'Сборщик отказал: причина не сообщена') }
-        }
-        // The answer is the fresh summary, bare or under `errorReport`. `lastStatus`
-        // decides whether the delivery landed rather than `lastError`, because the
-        // error is the last failure on record and survives a delivery that went
-        // through after it.
-        const report = payload.errorReport ?? payload
-        const counters = `всего ${report.sent ?? 0}, в очереди ${report.queued ?? 0}`
-        const lastError = report.lastError === null || report.lastError === undefined ? '' : String(report.lastError)
-        const lastStatus = typeof report.lastStatus === 'number' ? report.lastStatus : null
-        const reached = lastStatus === null ? lastError === '' : lastStatus >= 200 && lastStatus < 300
-        const refused = lastError === '' ? `HTTP ${lastStatus}` : lastError
-        // The two buttons answer different questions, so the notice names what each
-        // of them was for: a test event is about the collector's own answer, a flush
-        // is about whether the backlog on disk went anywhere. A `400` is separate
-        // from every other refusal because the host drops that report as unusable
-        // rather than retrying it — promising it is still on disk would be a lie —
-        // while a `429` or a `5xx` means "busy", not "bad", and stays queued.
-        if (!reached && lastStatus === 400) {
-          return {
-            kind: 'warn',
-            text: `Сборщик отклонил отчёт как непригодный: ${refused}. `
-              + `Он отброшен, а не оставлен в очереди (${counters}).`,
-          }
-        }
-        if (body?.action === 'flush') {
-          return reached
-            ? { kind: 'ok', text: `Очередь отправлена сборщику: ${counters}.` }
-            : {
-                kind: 'warn',
-                text: `Сборщик не принял очередь: ${refused}. `
-                  + `Неотправленное осталось на диске (${counters}) и уйдёт, когда сайт ответит.`,
-              }
-        }
-        return reached
-          ? { kind: 'ok', text: `Тестовое событие отправлено: ответ HTTP ${lastStatus ?? '—'} (${counters}).` }
-          : { kind: 'warn', text: `Тестовое событие не дошло: ${refused}. Оно осталось в очереди (${counters}).` }
       }
       return { kind: 'ok', text: 'Сохранено.' }
     }
@@ -2334,6 +2589,203 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
+     * A collector timestamp in the words its own monitor page uses.
+     *
+     * The ladder is theirs rather than this half's invention, so a moment read here
+     * and the same moment read on the web monitor do not disagree about how long ago
+     * something happened.
+     *
+     * @param at - epoch ms, or anything that is not a number.
+     * @param now - the moment to measure from; the current one by default.
+     * @returns «только что», «N мин назад», «N ч назад», «N дн назад» or «—».
+     */
+    function relativeTime(at, now = Date.now()) {
+      if (!Number.isFinite(at)) return '—'
+      const minutes = Math.floor((now - at) / 60_000)
+      if (minutes < 1) return 'только что'
+      if (minutes < 60) return `${minutes} мин назад`
+      const hours = Math.floor(minutes / 60)
+      if (hours < 24) return `${hours} ч назад`
+      return `${Math.floor(hours / 24)} дн назад`
+    }
+
+    /**
+     * One model's line in the uptime box.
+     *
+     * The dot, the status word and the bar all take the same colour, because a row that
+     * said "Degraded" in amber next to a green bar would be two answers to one
+     * question. Every number is the collector's own, and one the wire left out is drawn
+     * as «—» rather than as a zero.
+     *
+     * @param props - `{ model }`, one entry of the collector's `models`.
+     */
+    function UptimeRow(props) {
+      const model = typeof props.model === 'object' && props.model !== null ? props.model : {}
+      const status = typeof model.status === 'string' ? model.status : 'up'
+      const tone = statusOf(status)
+      const errors = Number.isFinite(model.errors) ? model.errors : null
+      const uptime = Number.isFinite(model.uptime) ? model.uptime : null
+      const buckets = Array.isArray(model.buckets) ? model.buckets : []
+      const counts = buckets.map(bucket => (Number.isFinite(bucket?.count) ? bucket.count : 0))
+      const peak = Math.max(1, ...counts)
+      const events = Array.isArray(model.events) ? model.events : []
+      // Forty-eight empty bars say nothing a word does not say better, and "no errors
+      // in this window" is the answer the collector gives most days.
+      const hasErrors = counts.some(count => count > 0) || events.length > 0
+      const last = typeof model.lastError === 'object' && model.lastError !== null ? model.lastError : null
+      return h('div', { className: 'dmi-up-row', 'data-dmi-status': status, style: { marginBottom: '9px' } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', flexWrap: 'wrap' } },
+          h('span', {
+            className: 'dmi-up-dot',
+            'data-dmi-status': status,
+            style: { width: '8px', height: '8px', minWidth: '8px', borderRadius: '50%', background: tone.color, flex: 'none' },
+          }),
+          h('span', { style: { fontSize: '12.5px', flex: '1 1 auto', minWidth: 0 } }, String(model.name ?? model.id ?? '—')),
+          h('span', { style: { fontSize: '11.5px', fontWeight: 600, color: tone.color } }, tone.label),
+          h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, uptime === null ? '—' : `${uptime}%`),
+          h('span', {
+            style: { flex: 'none', width: '54px', height: '4px', borderRadius: '2px', background: C.border, overflow: 'hidden' },
+          },
+          h('span', {
+            style: {
+              display: 'block',
+              height: '100%',
+              width: `${Math.max(0, Math.min(100, uptime ?? 0))}%`,
+              background: tone.color,
+            },
+          })),
+          h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `ошибок ${errors === null ? '—' : errors}`),
+          last === null
+            ? null
+            : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `последняя ${relativeTime(last.t)}`)),
+
+        last === null
+          ? null
+          : h('div', {
+              style: { color: C.labelSecondary, fontSize: '11.5px', margin: '2px 0 0 15px', wordBreak: 'break-word' },
+            },
+            `последняя ошибка ${Number.isFinite(last.t) ? new Date(last.t).toLocaleString() : '—'} — ${String(last.code ?? '—')} ${String(last.message ?? '')}`),
+
+        h('div', { style: { display: 'flex', gap: '1px', alignItems: 'flex-end', height: '16px', margin: '4px 0 0 15px' } },
+          hasErrors
+            ? counts.map((count, index) => h('span', {
+                key: index,
+                title: count === 0 ? 'ошибок нет' : String(count),
+                style: {
+                  flex: '1 1 0',
+                  height: `${Math.max(6, Math.round((count / peak) * 100))}%`,
+                  borderRadius: '1px',
+                  background: count === 0 ? C.border : C.down,
+                },
+              }))
+            : h('span', { style: { color: C.labelSecondary, fontSize: '11px' } }, 'ошибок нет')))
+    }
+
+    /**
+     * The collector's uptime view, as one box on the settings page.
+     *
+     * Every number here is the collector's own: this half reads the host's mirror and
+     * draws it, so the panel and the monitor's web page cannot disagree about what "up"
+     * means. That includes the empty answer, which is the normal one while the
+     * collector's aggregation is still being written — «ошибок нет» is a finding rather
+     * than a failure to load, and it is drawn as one instead of as a spinner or a red
+     * line.
+     *
+     * The range is this component's own state on purpose: it is a way of looking at the
+     * data rather than a setting, and writing it to `/config` would turn one user's
+     * glance at last month into a preference every other surface inherits.
+     *
+     * @param props - `{ enabled }`, the page's own reading of `config.uptimeView`.
+     */
+    function UptimeSection(props) {
+      const enabled = props.enabled !== false
+      const [range, setRange] = React.useState('24h')
+      const [data, setData] = React.useState(undefined)
+      const [busy, setBusy] = React.useState(false)
+
+      /**
+       * One read of the mirror.
+       *
+       * Forced, because every caller is deliberate — mounting, changing range, pressing
+       * the button — and a deliberate read answered from the throttle would look like
+       * the button did nothing.
+       *
+       * @param want - the range to ask for.
+       */
+      const read = React.useCallback(async want => {
+        setBusy(true)
+        try {
+          setData(await loadUptime(want, { force: true }))
+        } finally {
+          setBusy(false)
+        }
+      }, [])
+
+      React.useEffect(() => {
+        if (!enabled) {
+          setData(undefined)
+          return undefined
+        }
+        void read(range)
+        // The collector's own page polls every 30 s and the host mirrors that answer,
+        // so this keeps the same cadence and stops the moment the page is closed: a
+        // panel nobody is looking at has no business asking.
+        const timer = setInterval(() => { void read(range) }, 30_000)
+        return () => clearInterval(timer)
+      }, [enabled, range, read])
+
+      const summary = typeof data?.summary === 'object' && data.summary !== null ? data.summary : {}
+      const models = Array.isArray(data?.models) ? data.models : []
+      const refused = typeof data?.error === 'string' && data.error !== '' ? data.error : state.uptimeError
+      const generatedAt = Number.isFinite(data?.generatedAt) ? new Date(data.generatedAt).toLocaleString() : '—'
+      const cachedAt = Number.isFinite(data?.fetchedAt) ? new Date(data.fetchedAt).toLocaleString() : '—'
+      const monitorUrl = typeof data?.monitorUrl === 'string' && data.monitorUrl !== '' ? data.monitorUrl : null
+
+      return h('div', {
+        style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
+      },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' } },
+          h('span', { style: { color: C.labelSecondary, fontSize: '11.5px', flex: '1 1 auto' } }, 'Аптайм моделей'),
+          enabled
+            ? h(Select, {
+                value: range,
+                options: [['24h', '24 часа'], ['7d', '7 дней'], ['30d', '30 дней']],
+                onChange: value => setRange(value),
+              })
+            : null,
+          enabled
+            ? h(Button, { variant: 'small', onClick: () => { void read(range) }, disabled: busy },
+                busy ? 'Обновление…' : 'Обновить')
+            : null),
+
+        !enabled
+          ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6 } },
+              'Аптайм выключен настройкой «Показывать аптайм моделей»: панель ничего не читает, и точки в списке моделей не рисуются.')
+          : data === undefined
+            ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px' } }, 'Читаем состояние моделей…')
+            : data === null || data.ok === false
+              ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6 } },
+                  `Коллектор не ответил: ${refused ?? 'причина не сообщена'}. Кнопка «Обновить» спрашивает ещё раз.`)
+              : h('div', null,
+                  data.stale === true
+                    ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '6px' } },
+                        `показано кешированное от ${cachedAt}; коллектор недоступен: ${refused ?? 'причина не сообщена'}`)
+                    : null,
+                  h('div', { style: { fontSize: '12.5px', marginBottom: '8px' } },
+                    `операционно ${summary.operational ?? '—'} из ${summary.totalModels ?? '—'} · деградируют ${summary.slow ?? '—'} · лежат ${summary.down ?? '—'} · аптайм ${summary.uptime ?? '—'}% · ошибок за период ${summary.totalErrors ?? '—'}`),
+                  models.length === 0
+                    ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px' } },
+                        'Коллектор не назвал ни одной модели за этот период.')
+                    : models.map(model => h(UptimeRow, { key: String(model?.id ?? model?.name ?? ''), model })),
+                  h('div', {
+                    style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', flexWrap: 'wrap', color: C.labelSecondary, fontSize: '11.5px' },
+                  },
+                  h('span', null, `обновлено ${generatedAt} · хранилище ${typeof data?.storage === 'string' && data.storage !== '' ? data.storage : '—'}`),
+                  monitorUrl === null ? null : h(Link, { href: monitorUrl }, 'открыть полный монитор'))),
+      )
+    }
+
+    /**
      * The settings page.
      *
      * Two blocks, because the mirror now does two jobs: what it holds for the
@@ -2374,7 +2826,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           })
           const payload = await response.json().catch(() => ({}))
           if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`)
-          setNotice(noticeFor(path, payload, body))
+          setNotice(noticeFor(path, payload))
           await reload()
           await refresh()
         } catch (error) {
@@ -2393,25 +2845,12 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         : new Date(status.fetchedAt).toLocaleString()
 
       /**
-       * The error collector's own summary, and the three renderings of it that need
-       * a rule rather than a field read.
+       * Whether collection is on.
        *
-       * Every field is optional on purpose: a host half older than the collector
-       * answers `/state` without the block, and the page still has to draw — with
-       * «—» where a value would be, and without a status block at all when the
-       * whole summary is missing.
+       * Read as "not explicitly off" rather than as a truth test, because a host half
+       * older than the field answers `/state` without it and the default is on: a
+       * missing `collectErrors` must not draw the switch as off.
        */
-      const report = status?.errorReport
-      const kinds = Object.entries(report?.byKind ?? {})
-        .map(([kind, count]) => `${kind}: ${count}`)
-        .join('; ')
-      const installId = String(report?.installId ?? '')
-      const lastAnswer = [
-        report?.lastStatus === null || report?.lastStatus === undefined ? null : `HTTP ${report.lastStatus}`,
-        report?.lastSentAt === null || report?.lastSentAt === undefined
-          ? null
-          : new Date(report.lastSentAt).toLocaleString(),
-      ].filter(part => part !== null).join(', ')
       const collecting = config.collectErrors !== false
 
       return h('div', { style: { font, color: C.label, padding: '4px 2px 24px', maxWidth: '760px' } },
@@ -2445,6 +2884,14 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             onChange: event => { void post('/config', { hideOtherMarks: event.target.checked }, 'save') },
           }),
           h('span', { style: { fontSize: '12.5px' } }, 'Прятать логотипы других скинов в строке, где нарисована эта иконка')),
+
+        h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px', cursor: 'pointer' } },
+          h('input', {
+            type: 'checkbox',
+            checked: config.uptimeView !== false,
+            onChange: event => { void post('/config', { uptimeView: event.target.checked }, 'save') },
+          }),
+          h('span', { style: { fontSize: '12.5px' } }, 'Показывать аптайм моделей')),
 
         h(FieldRow, { name: 'Размер значка, px', hint: 'от 10 до 32' },
           h(TextField, {
@@ -2616,9 +3063,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         // The error collector's own box, rather than a row beside the mark switches:
         // this is the one setting on the page that sends anything off the machine, so
         // what leaves, what never does and when it fires are part of the control and
-        // not a footnote to it. The endpoint is shown rather than offered — it is
-        // repointed by an environment variable or by hand in `config.json`, and a
-        // field here would suggest the page owns it.
+        // not a footnote to it. The switch and its promise are the whole box — the
+        // collector readout that used to sit under them is gone on purpose, because
+        // counters nobody asked for read as noise next to a question that does want
+        // an answer. What collection did, and what it could not deliver, is still on
+        // the host's own loopback route.
         h('div', {
           style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
         },
@@ -2647,31 +3096,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             + 'когда сайт отвечает, поэтому авария попадает в монитор с настоящими временами, а не с моментом '
             + 'восстановления связи. Пожалуйста, оставьте сбор включённым: он ничего не стоит и является '
             + 'единственным источником, из которого монитор знает про аптайм.'),
-
-          report === undefined ? null : h('div', null,
-            h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '10px 0 6px' } }, 'Состояние сборщика'),
-            h(Row, { name: 'адрес сборщика' }, String(report.endpoint ?? config.uptimeEndpoint ?? '—')),
-            h(Row, { name: 'анонимный id' },
-              installId === '' ? '—' : installId.length > 24 ? `${installId.slice(0, 24)}…` : installId),
-            h(Row, { name: 'отправлено' }, String(report.sent ?? 0)),
-            h(Row, { name: 'в очереди' }, String(report.queued ?? 0)),
-            h(Row, { name: 'отброшено' }, String(report.dropped ?? 0)),
-            h(Row, { name: 'последний ответ' }, lastAnswer === '' ? '—' : lastAnswer),
-            report.lastError === null || report.lastError === undefined
-              ? null
-              : h(Row, { name: 'ошибка отправки', tone: C.warn }, String(report.lastError)),
-            h(Row, { name: 'сбои по видам' }, kinds === '' ? '—' : kinds)),
-
-          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px', flexWrap: 'wrap' } },
-            h(Button, {
-              onClick: () => { void post('/errors', { action: 'test' }, 'errtest') },
-              disabled: busy !== '' || !collecting,
-            }, busy === 'errtest' ? 'Отправка…' : 'Отправить тестовое событие'),
-            h(Button, {
-              onClick: () => { void post('/errors', { action: 'flush' }, 'errflush') },
-              disabled: busy !== '' || !collecting,
-            }, busy === 'errflush' ? 'Отправка…' : 'Отправить очередь сейчас')),
         ),
+
+        // The other half of the same story: the box above is what this install
+        // reported, this one is what the collector made of everybody's reports.
+        h(UptimeSection, { enabled: config.uptimeView !== false }),
 
         h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6 } },
           h('div', null, 'Значок рисуется маской CSS, залитой текущим цветом строки, — тот же приём, что и на сайте провайдера, поэтому одна и та же картинка подходит и светлой, и тёмной теме.'),
@@ -2680,6 +3109,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           h('div', null, 'Список моделей маршрута берётся с того же адреса, что и сами запросы, поэтому новая модель провайдера появляется в выборе без правки конфигов руками. Перед записью показывается расхождение: какие модели добавятся, какие уберутся и у каких изменятся окно контекста, лимит вывода, модальности или уровни рассуждения. Ручные настройки совместимости протокола сохраняются, предыдущий список остаётся в копии для отката.'),
           h('div', null, 'Кнопка «Показать блок для ручной правки» отдаёт ровно тот YAML, который записался бы сам, — вместе с полями подключения маршрута. Его можно скопировать и вставить в патч профиля, если автоматическая запись не нужна: содержимое одинаковое, различается только тем, кто его положил в файл.'),
           h('div', null, 'Сбор ошибок Rustvy — единственный блок страницы, который отправляет что-то за пределы машины, и отправляет он одну строку на сбой самого провайдера коллектору монитора: удачные запросы не отправляются вовсе, ни содержания разговора, ни ключей, ни путей к файлам в этой строке нет, а отчёт, который сайт не принял, дожидается его на диске и уходит позже.'),
+          h('div', null, 'Блок «Аптайм моделей» показывает то, что коллектор сделал из этих строк: числа в нём его собственные, плагин ничего не считает сам, иначе панель и страница монитора расходились бы в ответе на один вопрос. Пустой ответ — «ошибок нет» — обычный, а не аварийный: агрегация коллектора ещё пишется, и панель говорит ровно то, что знает. Те же три статуса рисуются точкой в списке моделей у строк, которые коллектор назвал.'),
           h('div', { style: { color: status?.error === undefined ? C.labelSecondary : C.warn } },
             status?.error === undefined
               ? 'Правки файлов плагина применяются на лету, без перезапуска приложения.'
@@ -2729,6 +3159,16 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         const onInteract = () => {
           if (disposed) return
           scheduleDecorate()
+          // The dots ride the same interactions the marks do, throttled inside
+          // `loadUptime` to the collector's own cadence: a menu opened twice in a row
+          // costs one loopback read per half minute, and only an answer that moved
+          // something earns a second pass.
+          if (state.uptimeView) {
+            const beforeUptime = state.uptimeRevision
+            void loadUptime(DOT_RANGE).then(() => {
+              if (state.uptimeRevision !== beforeUptime) scheduleDecorate()
+            })
+          }
           if (state.sessionId === null) return
           const before = state.keysRevision
           void loadKeys(state.sessionId).then(() => {
@@ -2746,8 +3186,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             for (const node of [...record.addedNodes, ...record.removedNodes]) {
               if (node.nodeType !== 1) continue
               const element = /** @type {Element} */ (node)
-              if (element.classList?.contains(MARK)) continue
+              if (element.classList?.contains(MARK) || element.classList?.contains(DOT)) continue
               if (element.querySelector?.(`.${MARK}`) !== null) continue
+              if (element.querySelector?.(`.${DOT}`) !== null) continue
               return true
             }
             return false

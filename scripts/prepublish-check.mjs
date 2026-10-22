@@ -153,7 +153,7 @@ const entry = manifest.main ?? 'lib/index.js'
 check('the main entry exists', existsSync(join(ROOT, entry)), String(entry))
 // The bootstrap re-imports these through a cache-busting query, so a renamed or
 // missing one is a plugin that loads and then silently stops reloading.
-for (const module of ['lib/host.js', 'lib/models.js', 'lib/keys.js', 'lib/net.js', 'lib/errors.js']) {
+for (const module of ['lib/host.js', 'lib/models.js', 'lib/keys.js', 'lib/net.js', 'lib/errors.js', 'lib/uptime.js']) {
   check(`${module} exists`, existsSync(join(ROOT, module)))
 }
 check('the client bundle exists', existsSync(join(ROOT, 'client/client.js')))
@@ -297,6 +297,55 @@ try {
   gate.dispose()
 } catch (error) {
   check('lib/errors.js imports', false, error.message)
+}
+
+// The uptime view module is pure too, and it is the one piece of this plugin that
+// renders a *remote* document straight into a browser. Two of its rules are worth a
+// gate check because both fail silently in a way nobody would notice until a user
+// did: an unrecognised status must fall back to green, so a collector that invents a
+// fourth state cannot paint a working model red, and a percentage must be clamped, so
+// a bar cannot be asked to draw 140% or -3%.
+try {
+  const uptime = await import(`file://${join(ROOT, 'lib/uptime.js').replace(/\\/g, '/')}`)
+  const expected = ['isUptimeRange', 'normalizeUptimeView', 'bucketStats', 'statusOf', 'uptimeOf']
+  const missing = expected.filter(name => typeof uptime[name] !== 'function')
+  check('lib/uptime.js exports its whole surface', missing.length === 0, missing.join(', '))
+  check('lib/uptime.js exports the range whitelist the collector accepts',
+    Array.isArray(uptime.UPTIME_RANGES) && uptime.UPTIME_RANGES.join(',') === '24h,7d,30d'
+    && uptime.DEFAULT_RANGE === '24h' && uptime.isUptimeRange('7d') && !uptime.isUptimeRange('12h'),
+    `${uptime.UPTIME_RANGES?.join(',')} default ${uptime.DEFAULT_RANGE}`)
+
+  // The answer every user sees first: all green, nothing in it. The collector's
+  // aggregation currently ignores the reports it accepts, so this is the normal case
+  // and not the degenerate one, and it has to normalize without a single missing field.
+  const view = uptime.normalizeUptimeView({
+    generatedAt: 1792605459264, range: '24h', storage: 'mongo', healthy: true, total: 0,
+    summary: { totalModels: 1, operational: 1, slow: 0, down: 0, uptime: 100, totalErrors: 0 },
+    byCode: [],
+    models: [{ id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, uptime: 100, status: 'up', buckets: [], events: [], lastError: null }],
+  })
+  check('an all-green view normalizes with every field guaranteed',
+    view.ok === true && view.range === '24h' && view.generatedAt === 1792605459264
+    && view.storage === 'mongo' && view.summary.uptime === 100 && view.models.length === 1
+    && view.models[0].status === 'up' && view.models[0].lastError === null, JSON.stringify(view).slice(0, 120))
+
+  const odd = uptime.normalizeUptimeView({ models: [{ id: 'm', status: 'exploded', uptime: 140 }] }).models[0]
+  check('an unrecognised status falls back to up, not down', odd.status === 'up', odd.status)
+  check('a percentage is clamped to something a bar can draw', odd.uptime === 100, String(odd.uptime))
+  check('a model with no id is dropped rather than drawn unnamed',
+    uptime.normalizeUptimeView({ models: [{ name: 'no id' }, { id: 'kept' }] }).models.map(model => model.id).join(',') === 'kept', '')
+
+  const refused = uptime.normalizeUptimeView({ total: 3 })
+  check('a payload with no models is refused, in Russian',
+    refused.ok === false && typeof refused.error === 'string' && refused.error.length > 0, JSON.stringify(refused))
+  check('a non-object answer is refused too',
+    uptime.normalizeUptimeView('text').ok === false && uptime.normalizeUptimeView(null).ok === false, '')
+  const stats = uptime.bucketStats([{ from: 10, count: 3 }, { from: 5, count: 0 }])
+  check('bucket stats scale a strip without the client walking it',
+    stats.count === 2 && stats.max === 3 && stats.first === 5 && stats.last === 10 && stats.errors === 3
+    && uptime.bucketStats([]).max === 1, JSON.stringify(stats))
+} catch (error) {
+  check('lib/uptime.js imports', false, error.message)
 }
 
 /* --------------------------------- readme --------------------------------- */
