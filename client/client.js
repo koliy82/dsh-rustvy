@@ -52,17 +52,52 @@ window.__ModuleLoader__.load({
     const MARK = 'dmi-mark'
 
     /**
-     * Class of one uptime dot this half drew into a picker row.
+     * Class of one uptime badge this half drew into a picker row.
      *
      * Its own class rather than a second `dmi-mark`: the observer has to tell this
-     * half's own writes from the host's, the unload has to take the dots with it,
-     * and a dot is not a vendor mark — it says whether the model is answering, not
-     * who makes it.
+     * half's own writes from the host's, the unload has to take the badges with it,
+     * and a badge is not a vendor mark — it says how well the model has been
+     * answering, not who makes it.
      */
-    const DOT = 'dmi-uptime-dot'
+    const BADGE = 'dmi-uptime-badge'
 
-    /** Range the picker's dots describe; the settings box picks its own. */
-    const DOT_RANGE = '24h'
+    /**
+     * What the row's own trailing chip looks like, when it has one.
+     *
+     * The harness draws a pill of its own on some rows — the context count on the
+     * DeepSeek rows — and ours has to sit beside it rather than over it or beyond it,
+     * so the badge is inserted *before* a trailing chip and appended only where there
+     * is none. The class fragments are the host bundle's own; `svg` is here because a
+     * row that ends in an icon ends in a control, not in its name. What must never
+     * happen is the badge landing in front of the model's name, which is what a row
+     * without a trailing chip would do to a naive "insert before the last child".
+     */
+    const TRAILING_SELECTOR = '[class*="_check"], [class*="_badge"], [class*="_pill"], [class*="_tag"], [class*="_meta"], svg'
+
+    /**
+     * What the selected-model trigger's reasoning indicator looks like, when the build
+     * renders one.
+     *
+     * The badge was asked for between the model's name and that indicator, and the only
+     * honest way to honour that is to find the indicator rather than to count children:
+     * the trigger's furniture is the host's own, and its order is not this half's to
+     * assume. Matched by class fragment and by the data attributes a host uses for such a
+     * control, so a build that spells it `reasoning`, `effort` or `thinking` is covered
+     * alike. A trigger with no indicator — a model that has no reasoning, or a bundle
+     * that draws none — matches nothing, and the badge falls back to the position right
+     * after the name node, which is the same place on the shelf.
+     */
+    const REASONING_SELECTOR = '[class*="reasoning"], [class*="effort"], [class*="thinking"], [data-reasoning], [data-effort], [data-slot*="reasoning"]'
+
+    /**
+     * Range the picker's badges describe; the settings panel picks its own.
+     *
+     * An hour rather than a day, because a badge on the row you are about to pick has to
+     * answer "is it broken *now*" — a day-long window keeps a model red for hours after
+     * it recovered, which is exactly the misleading the state rule was written to stop.
+     * The panel keeps `24h` as its default, where there is room for the whole picture.
+     */
+    const BADGE_RANGE = '1h'
 
     /** How long the picker keeps its uptime read before an interaction re-reads it. */
     const UPTIME_TTL_MS = 30_000
@@ -116,36 +151,116 @@ window.__ModuleLoader__.load({
       bad: 'var(--dsw-alias-state-error-primary)',
       warn: 'var(--dsw-alias-state-warn-primary)',
       /**
-       * The collector's own three status colours, taken from its monitor page so the
-       * plugin and the web monitor tell the same story. Accents only — dots, bars and
-       * the status word: every surface behind them is `C.surface` and `C.border`,
-       * because the collector's page has one dark theme and this one has two.
+       * The collector's own state colours, taken from its monitor page so the plugin
+       * and the web monitor tell the same story. Accents only — badges, bars and the
+       * state word: every surface behind them is `C.surface` and `C.border`, because
+       * the collector's page has one dark theme and this one has two.
        */
       up: '#22c55e',
       slow: '#f59e0b',
       down: '#ef4444',
     }
 
-    /** The three statuses the collector reports, and how each reads here. */
-    const STATUSES = Object.freeze({
-      up: { label: 'Operational', short: 'UP', color: C.up },
-      slow: { label: 'Degraded', short: 'SLOW', color: C.slow },
-      down: { label: 'Down', short: 'DOWN', color: C.down },
+    /**
+     * The four states the collector's rule produces, and how each reads here.
+     *
+     * A state rather than a percentage, because this plugin reports errors and nothing
+     * else: with no successful requests and no traffic volume there is no denominator
+     * for "percent available", and the number the old formula produced was bucket
+     * occupancy — it moved with the window for the same events, saturated at 47 errors
+     * in a bucket, and could not tell one person's bad network from a provider outage.
+     * What is measurable is how many distinct installs reported, and how recently.
+     *
+     * `single` is amber and `issues`/`down` are red on purpose: one install reporting is
+     * most likely that install — its network, its key, its region — and painting it the
+     * colour of an outage would cry wolf on every bad evening.
+     */
+    const STATES = Object.freeze({
+      ok: Object.freeze({ label: 'Без ошибок', color: C.up }),
+      single: Object.freeze({ label: 'Локальный сбой', color: C.slow }),
+      issues: Object.freeze({ label: 'Сбои', color: C.down }),
+      down: Object.freeze({ label: 'Лежит', color: C.down }),
     })
 
     /**
-     * One status word, resolved against the collector's own vocabulary.
+     * The vocabulary a collector older than v2 answers with, mapped onto the current one.
      *
-     * Anything it does not name falls back to `up` rather than to an error state: a
-     * model with no reports in the window is a model nothing complained about, and
-     * inventing a fourth status for an unknown string would say more than the wire
-     * did.
+     * The plugin may be pointed at the currently deployed server for a while, and that
+     * server says `up | slow | down` with no `installs`, no `affectedPct` and no
+     * `minutesSinceLast`. A user on it should see a slightly poorer panel, never a wrong
+     * one — so the old words are translated rather than refused, and `slow` lands on
+     * `issues`, which is what it meant. The old rule cannot tell a local fault from an
+     * outage, so `single` simply never arrives from it.
+     */
+    const LEGACY_STATES = Object.freeze({ up: 'ok', slow: 'issues', down: 'down' })
+
+    /**
+     * One state word, resolved against both vocabularies.
+     *
+     * Anything neither names falls back to `ok` rather than to a failure state: a model
+     * with no reports in the window is a model nothing complained about, and inventing a
+     * fifth state for an unknown string would say more than the wire did.
      *
      * @param status - the collector's `status` field.
-     * @returns `{ label, short, color }`.
+     * @returns `'ok'`, `'single'`, `'issues'` or `'down'`.
      */
-    function statusOf(status) {
-      return STATUSES[typeof status === 'string' ? status : ''] ?? STATUSES.up
+    function stateOf(status) {
+      const word = typeof status === 'string' ? status : ''
+      if (STATES[word] !== undefined) return word
+      return LEGACY_STATES[word] ?? 'ok'
+    }
+
+    /**
+     * One state's rendering.
+     *
+     * @param status - the collector's `status` field, in either vocabulary.
+     * @returns `{ label, color }`.
+     */
+    function stateMeta(status) {
+      return STATES[stateOf(status)]
+    }
+
+    /**
+     * One Russian count in the right form.
+     *
+     * @param count - the number.
+     * @param forms - `[one, few, many]`, as in `['ошибка', 'ошибки', 'ошибок']`.
+     * @returns the form that count takes.
+     */
+    function plural(count, forms) {
+      const hundred = Math.abs(Math.trunc(count)) % 100
+      const ten = hundred % 10
+      if (hundred > 10 && hundred < 20) return forms[2]
+      if (ten > 1 && ten < 5) return forms[1]
+      if (ten === 1) return forms[0]
+      return forms[2]
+    }
+
+    /**
+     * The caveat that belongs next to an install count.
+     *
+     * «ошибок 3 от 1 установки» is a claim about breadth, and it is only as good as the
+     * identities behind it: a report that arrived with no usable `meta.id` could not be
+     * counted, so a window full of them reads as one person's problem when it may have
+     * been everybody's. That is the one number on the row a person acts on — whether to
+     * trust the model — so the caveat goes in the same breath as it, in the tooltip and
+     * on the row, and stays silent when nothing was anonymous, which is the common case
+     * and deserves no noise.
+     *
+     * The all-anonymous case is worded differently from the partial one on purpose: «все
+     * анонимные» says the breadth figure is not a measurement, where «2 из 3 анонимных»
+     * says it is one that undercounts.
+     *
+     * @param errors - how many errors the window holds.
+     * @param anonymous - how many of them carried no usable install id.
+     * @returns «все анонимные», «2 из 3 анонимных» or `null` when nothing was anonymous.
+     */
+    function anonymousNote(errors, anonymous) {
+      if (!Number.isFinite(anonymous) || anonymous <= 0) return null
+      const count = Number.isFinite(errors) ? errors : null
+      if (count === null) return `${anonymous} ${plural(anonymous, ['анонимный', 'анонимных', 'анонимных'])}`
+      if (anonymous >= count) return 'все анонимные'
+      return `${anonymous} из ${count} анонимных`
     }
 
     /** The one sans stack this half types with, shared by CSS rules and inline styles. */
@@ -180,7 +295,10 @@ window.__ModuleLoader__.load({
 .${MARK}[data-dmi-mono]{background-color:transparent;-webkit-mask:none;mask:none;display:inline-flex;align-items:center;justify-content:center;border:1px solid currentColor;border-radius:4px;font-size:calc(var(--dmi-size) * .58);font-weight:700;line-height:1;letter-spacing:.01em;opacity:.7;box-sizing:border-box}
 body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [${ROW_FLAG}] svg[data-combine-word]{display:none!important}
 .${HIDDEN_GROUP}{display:none!important}
-.${DOT}{--dmi-dot:7px;flex:none;width:var(--dmi-dot);height:var(--dmi-dot);min-width:var(--dmi-dot);border-radius:50%;background:var(--dmi-dot-color,currentColor);opacity:.95;pointer-events:none;vertical-align:middle;margin-inline-end:5px}
+.${BADGE}{margin:0 4px 0 auto;flex:none;display:inline-flex;align-items:center;justify-content:center;height:16px;min-width:16px;padding:0 6px;border-radius:8px;background:var(--dmi-badge-color,currentColor);color:#fff;font:600 10.5px/1 ${SANS};letter-spacing:.01em;white-space:nowrap;vertical-align:middle;box-sizing:border-box}
+.${BADGE}[data-dmi-surface="trigger"]{margin:0 6px 0 0;height:15px;min-width:15px;padding:0 5px;font-size:10px}
+.${BADGE}[data-dmi-shape="dot"]{width:7px;height:7px;min-width:7px;padding:0;border-radius:50%;opacity:.85}
+.${BADGE}[data-dmi-surface="trigger"][data-dmi-shape="dot"]{width:6px;height:6px;min-width:6px}
 .dmi-glyph{display:inline-flex;flex:none;align-items:center;justify-content:center}
 .dmi-glyph svg{display:block;width:100%;height:100%}
 .dmi-key-sep{height:1px;flex:none;margin:4px 8px;background:${C.border}}
@@ -234,13 +352,13 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       markTrigger: true,
       hideOtherMarks: true,
       /**
-       * The collector's uptime view, as the picker's dots see it.
+       * The collector's uptime view, as the picker's badges see it.
        *
        * Two maps over one list, for the same reason the catalog has `byId` and
        * `byName`: a row names a model by its display name as often as by its id, and
-       * a dot that only matched one of the two would flicker between rows that mean
-       * the same model. Only the range the dots claim to describe is absorbed — a
-       * box switched to 30 days must not repaint the picker's «за 24 часа».
+       * a badge that only matched one of the two would flicker between rows that mean
+       * the same model. Only the range the badges claim to describe is absorbed — a
+       * panel switched to 30 days must not repaint the picker's «за последний час».
        */
       uptimeView: true,
       uptime: new Map(),
@@ -648,17 +766,20 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * The dot this half already drew into one row, if any.
+     * The badge this half already drew into one row or trigger, if any.
      *
-     * Read from `children` for the reason `ownMark` reads from `children`: a nested
-     * row owns its own dot, and a parent must not mistake it for its own.
-     *
-     * @param row - the row element.
-     * @returns the dot element, or `null`.
+     * @param row - the row or trigger element.
+     * @param surface - `'row'` or `'trigger'`, which decides how deep to look.
+     * @returns the badge element, or `null`.
      */
-    function ownDot(row) {
+    function ownBadge(row, surface) {
+      // A trigger holds no nested rows, and its badge may have been placed next to a
+      // reasoning indicator that sits inside a wrapper of its own — so the search there
+      // is the whole subtree. A row's is not: a nested row (a skin's sub-pane) owns its
+      // own badge, and a parent must not mistake it for its own.
+      if (surface === 'trigger') return row.querySelector?.(`.${BADGE}`) ?? null
       for (const child of Array.from(row.children ?? [])) {
-        if (child.classList?.contains(DOT) === true) return child
+        if (child.classList?.contains(BADGE) === true) return child
       }
       return null
     }
@@ -702,60 +823,147 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * Build one uptime dot.
+     * Build one uptime badge.
+     *
+     * A state, not a percentage: `ok` is a quiet dot with nothing written on it, because
+     * the absence of trouble is not a number and a row of green zeros would be the
+     * noisiest quiet thing on the page; every other state is a pill carrying the error
+     * count, which is the part a person choosing a model actually acts on. Colour does
+     * the rest — amber for one install's own bad evening, red for a provider failing
+     * several people at once.
+     *
+     * Geometry is its own attribute rather than a consequence of the state, so an answer
+     * that says `issues` and reports no count still draws a dot instead of an empty red
+     * pill: the shape follows what there is to show, the colour follows what the
+     * collector concluded.
+     *
+     * The surface is recorded because the two are placed differently and a skin or a test
+     * has to tell them apart: a row's badge sits at the right edge beside the host's own
+     * chip, a trigger's between the model's name and its reasoning indicator.
      *
      * @param model - the collector's record for it.
-     * @param status - the resolved status word.
-     * @param title - the text a hover explains it with.
+     * @param stateWord - the resolved state word.
+     * @param title - the text a hover explains it with, and the accessible name.
+     * @param surface - `'row'` or `'trigger'`.
      * @returns the element to insert.
      */
-    function buildDot(model, status, title) {
+    function buildBadge(model, stateWord, title, surface) {
+      const errors = Number.isFinite(model?.errors) ? model.errors : null
+      const text = errors === null || errors === 0 ? '' : String(errors)
       const span = document.createElement('span')
-      span.className = DOT
-      span.setAttribute('aria-hidden', 'true')
-      span.dataset.dmiStatus = status
+      span.className = BADGE
+      span.dataset.dmiSurface = surface
+      span.dataset.dmiState = stateWord
+      span.dataset.dmiShape = text === '' ? 'dot' : 'pill'
       span.dataset.dmiModel = normalize(model?.id)
-      span.style.setProperty('--dmi-dot-color', statusOf(status).color)
+      span.dataset.dmiErrors = text
+      span.style.setProperty('--dmi-badge-color', STATES[stateWord].color)
+      span.textContent = text
       span.title = title
+      span.setAttribute('role', 'img')
+      span.setAttribute('aria-label', title)
       return span
     }
 
     /**
-     * Draw one row's uptime dot, replacing a stale one.
+     * The text one badge's hover explains it with.
      *
-     * Idempotent in exactly the way `decorateRow` is: a dot that already says what the
+     * How many errors, from how many installs, over which window, and how long ago the
+     * last one came. The install count is dropped when the answer carries none, because a
+     * collector older than v2 does not measure it and «от 0 установок» would be a lie
+     * about a number nobody took.
+     *
+     * @param model - the collector's record for the model.
+     * @param stateWord - the resolved state word.
+     * @returns the tooltip.
+     */
+    function badgeTitle(model, stateWord) {
+      const errors = Number.isFinite(model?.errors) ? model.errors : null
+      if (stateWord === 'ok' || errors === null || errors === 0) return 'ошибок не было за последний час'
+      const installs = Number.isFinite(model?.installs) ? model.installs : null
+      const spread = installs === null
+        ? `${errors} ${plural(errors, ['ошибка', 'ошибки', 'ошибок'])}`
+        : `${errors} ${plural(errors, ['ошибка', 'ошибки', 'ошибок'])} от `
+          + `${installs} ${plural(installs, ['установки', 'установок', 'установок'])}`
+      const note = anonymousNote(errors, model?.anonymous)
+      const recency = recencyOf(model)
+      return `${spread}${note === null ? '' : ` (${note})`} за последний час`
+        + (recency === null ? '' : ` · последняя ${recency}`)
+    }
+
+    /**
+     * Draw one uptime badge into a row or the selected-model trigger, replacing a stale
+     * one.
+     *
+     * Idempotent in exactly the way `decorateRow` is: a badge that already says what the
      * answer says is left alone, so the observer never feeds on this half's own writes
-     * and a repaint costs no DOM at all. A row the view does not know loses any dot it
-     * had, because a stale dot is a claim about a model the collector stopped naming.
+     * and a repaint costs no DOM at all. A surface whose model the collector did not name
+     * loses any badge it had, because a stale badge is a claim about a model nobody is
+     * reporting on any more — and "not named" has to stay visibly different from "named
+     * and fine", which is precisely why a healthy model gets a dot rather than nothing.
      *
-     * @param row - the row element.
-     * @param text - the row's visible name text.
-     * @param surface - `'row'` or `'trigger'`; only rows are dotted.
+     * On the trigger that rule has a second edge: the selected model changes without the
+     * button changing, and the label's new text resolves a different model on the next
+     * pass. The comparison against the badge already in place is what keeps it honest —
+     * the old badge is removed, a new one is drawn, and if the newly selected model is
+     * not one the collector named, nothing is drawn at all.
+     *
+     * The trigger badge rides the same «Иконка в кнопке выбранной модели» switch as the
+     * vendor mark: that switch is the user's word on whether this half writes into the
+     * trigger at all, and a badge in a trigger they asked to leave alone would go against
+     * it. Rows are unaffected by that switch.
+     *
+     * @param row - the row or trigger element.
+     * @param text - the visible name text that led here.
+     * @param surface - `'row'` or `'trigger'`.
+     * @param node - the name node the pass matched; the trigger's fallback anchor.
      * @returns true when the DOM changed.
      */
-    function decorateDot(row, text, surface) {
-      const existing = ownDot(row)
-      const model = surface === 'row' && state.uptimeView ? uptimeFor(text) : undefined
+    function decorateBadge(row, text, surface, node) {
+      const existing = ownBadge(row, surface)
+      const seat = surface === 'trigger' ? state.markTrigger : true
+      const model = seat && state.uptimeView ? uptimeFor(text) : undefined
       if (model === undefined) {
         if (existing === null) return false
         existing.remove()
         return true
       }
-      const status = typeof model.status === 'string' ? model.status : 'up'
-      const uptime = Number.isFinite(model.uptime) ? model.uptime : null
+      const badgeState = stateOf(model.status)
       const errors = Number.isFinite(model.errors) ? model.errors : null
-      const title = `Аптайм ${uptime === null ? '—' : `${uptime}%`} · ошибок ${errors === null ? '—' : errors} · за 24 часа`
+      const title = badgeTitle(model, badgeState)
       const id = normalize(model.id)
       if (existing !== null) {
-        if (existing.dataset.dmiStatus === status && existing.dataset.dmiModel === id && existing.title === title) {
-          return false
-        }
+        if (existing.dataset.dmiSurface === surface && existing.dataset.dmiState === badgeState
+          && existing.dataset.dmiModel === id
+          && existing.dataset.dmiErrors === (errors === null ? '' : String(errors))
+          && existing.title === title) return false
         existing.remove()
       }
-      // After the vendor mark when the row has one, so the two read as one lead-in
-      // rather than as a dot floating somewhere in the middle of the label.
-      const mark = ownMark(row)
-      row.insertBefore(buildDot(model, status, title), mark === null ? row.firstChild : mark.nextSibling)
+      const badge = buildBadge(model, badgeState, title, surface)
+      if (surface === 'trigger') {
+        // Between the name and the reasoning, when the build renders one — found by
+        // what it calls itself, not by counting children, because the trigger's
+        // furniture is the host's own and its order is not this half's to assume. With
+        // no indicator to steer by — a model that has no reasoning, or a bundle that
+        // does not draw one — the badge goes right after the name node, which is the
+        // same place on the shelf and the position the row's own layout gives it.
+        const reasoning = row.querySelector?.(REASONING_SELECTOR) ?? null
+        if (reasoning !== null && reasoning !== badge) {
+          reasoning.parentNode.insertBefore(badge, reasoning)
+          return true
+        }
+        const parent = node?.parentNode ?? row
+        parent.insertBefore(badge, node?.nextSibling ?? null)
+        return true
+      }
+      // Beside the row's own trailing chip when it has one, so the harness's pill and
+      // this badge are two neighbours at the right edge rather than one on top of the
+      // other; appended where the row ends in its name, which is where a badge belongs
+      // when there is nothing to make room for.
+      const kids = Array.from(row.children ?? [])
+      const last = kids[kids.length - 1]
+      const anchor = last !== undefined && last.matches?.(TRAILING_SELECTOR) === true ? last : null
+      row.insertBefore(badge, anchor)
       return true
     }
 
@@ -780,10 +988,12 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           const text = nameOf(found.row, node)
           const entry = resolve(text)
           if (entry !== undefined && decorateRow(found.row, entry, found.surface)) drawn += 1
-          // Dotted whether or not the row earned a vendor mark: a model the mirrored
-          // catalog does not list still has an uptime, and a row with a dot and no
+          // Badged whether or not the row earned a vendor mark: a model the mirrored
+          // catalog does not list still has an uptime, and a row with a badge and no
           // mark is a row this half knows nothing about except that it is answering.
-          if (decorateDot(found.row, text, found.surface)) drawn += 1
+          // The name node goes along, because a trigger with no reasoning indicator is
+          // anchored to it and a row ignores it.
+          if (decorateBadge(found.row, text, found.surface, node)) drawn += 1
         }
       } finally {
         suppress = false
@@ -805,15 +1015,15 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       else body.removeAttribute(HIDE_FLAG)
     }
 
-    /** Remove every mark and dot this half drew, on unload or when they are switched off. */
+    /** Remove every mark and badge this half drew, on unload or when they are switched off. */
     function clearMarks() {
       suppress = true
       try {
         for (const mark of document.querySelectorAll(`.${MARK}`)) mark.remove()
-        // The dots go with the marks: both are this half's own writing in the host's
-        // menu, and an unload that left one behind would leave a claim about a model
-        // with nothing on the page able to correct it.
-        for (const dot of document.querySelectorAll(`.${DOT}`)) dot.remove()
+        // The badges go with the marks: both are this half's own writing in the host's
+        // menu, and an unload that left one behind would leave a percentage nobody is
+        // reading any more on a row the user can still open.
+        for (const badge of document.querySelectorAll(`.${BADGE}`)) badge.remove()
         for (const row of document.querySelectorAll(`[${ROW_FLAG}]`)) row.removeAttribute(ROW_FLAG)
         // The provider groups this half hid are its doing too: an unload that left
         // the class behind would leave a whole provider's models invisible with
@@ -1080,7 +1290,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         // and only when it actually moved something.
         if (state.uptimeView) {
           const before = state.uptimeRevision
-          await loadUptime(DOT_RANGE)
+          await loadUptime(BADGE_RANGE)
           if (state.uptimeRevision !== before) decorate(document)
         }
         return summary
@@ -1094,11 +1304,18 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 
     /* ----------------------------- model uptime ----------------------------- */
     /*
-     * The collector's own numbers, mirrored by the host half onto a loopback route
-     * and drawn twice: a panel on the settings page, and one dot per model row in the
-     * picker. Nothing here is computed by this half — a percentage invented locally
-     * would disagree with the monitor's own web page, and two answers to "is this
-     * model up" is worse than one.
+     * The collector's own verdicts, mirrored by the host half onto a loopback route and
+     * drawn twice: a panel on the settings page, and one state badge per model row in the
+     * picker. Nothing here is computed by this half — a verdict invented locally would
+     * disagree with the monitor's own web page, and two answers to "is this model up" is
+     * worse than one. Nor is there an availability percentage to invent: only errors are
+     * ever reported, so a share of *successful* time has no denominator, and the one
+     * share this half does show — installs affected — means reach, not uptime.
+     *
+     * The two surfaces read different windows on purpose. The panel defaults to a day,
+     * where there is room for the whole picture; the badges read the last hour, because
+     * the question on a row you are about to pick is "is it broken now", and a day-long
+     * window keeps a model red for hours after it recovered.
      *
      * The empty answer is the normal one today, and it is rendered as a state of its
      * own rather than as a failure: the collector's aggregation is still being
@@ -1107,10 +1324,10 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      */
 
     /**
-     * Fold one uptime answer into the state the picker's dots read.
+     * Fold one uptime answer into the state the picker's badges read.
      *
-     * Only the range the dots claim to describe is absorbed, so a settings box
-     * looking at 30 days cannot repaint a picker whose titles say «за 24 часа».
+     * Only the range the badges claim to describe is absorbed, so a settings panel
+     * looking at 30 days cannot repaint a picker whose titles say «за последний час».
      *
      * @param payload - the mirror's answer.
      * @param range - the range it was asked for.
@@ -1123,7 +1340,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       state.uptimePayload = answer
       state.uptimeLoadedAt = Date.now()
       state.uptimeRevision += 1
-      if (range !== DOT_RANGE) return answer
+      if (range !== BADGE_RANGE) return answer
       const byId = new Map()
       const byName = new Map()
       for (const model of Array.isArray(answer.models) ? answer.models : []) {
@@ -1134,8 +1351,8 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         if (name !== '' && !byName.has(name)) byName.set(name, model)
       }
       // A refused answer (`ok: false`: the view is switched off, or there is no cache
-      // to fall back on) carries no models, and the dots have to go with them rather
-      // than keep describing a window nobody is asking about any more.
+      // to fall back on) carries no models, and the badges have to go with them rather
+      // than keep quoting a window nobody is asking about any more.
       state.uptime = answer.ok === false ? new Map() : byId
       state.uptimeByName = answer.ok === false ? new Map() : byName
       return answer
@@ -1151,12 +1368,12 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      * same answer — and sequential ones are throttled to the collector's own 30 s
      * cadence, so a burst of clicks costs at most one loopback read per half minute.
      *
-     * @param range - `24h`, `7d` or `30d`; the picker's own range by default.
+     * @param range - `1h`, `24h`, `7d` or `30d`; the badges' own window by default.
      * @param options - `{ force: true }` to bypass the throttle.
      * @returns a promise of the answer, or of `null` when there was none.
      */
-    function loadUptime(range = DOT_RANGE, options) {
-      const want = typeof range === 'string' && range !== '' ? range : DOT_RANGE
+    function loadUptime(range = BADGE_RANGE, options) {
+      const want = typeof range === 'string' && range !== '' ? range : BADGE_RANGE
       if (uptimeLoading !== null && uptimeLoading.range === want) return uptimeLoading.promise
       if (options?.force !== true && Date.now() - state.uptimeLoadedAt < UPTIME_TTL_MS) {
         return Promise.resolve(state.uptimePayload)
@@ -1173,7 +1390,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             state.uptimePayload = null
             state.uptimeLoadedAt = Date.now()
             state.uptimeRevision += 1
-            if (want === DOT_RANGE) {
+            if (want === BADGE_RANGE) {
               state.uptime = new Map()
               state.uptimeByName = new Map()
             }
@@ -1184,6 +1401,15 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           state.uptimeError = error instanceof Error ? error.message : String(error)
           state.uptimeLoadedAt = Date.now()
           state.uptimeRevision += 1
+          // A transport failure clears the badges exactly as a refused answer does, and
+          // for the same reason: the badge has no way to say "this is what we knew a
+          // while ago", so keeping one on screen would keep quoting an hour nobody has
+          // read since. The panel can afford to hold a cached picture because it labels
+          // it with the moment it is from; a badge cannot.
+          if (want === BADGE_RANGE) {
+            state.uptime = new Map()
+            state.uptimeByName = new Map()
+          }
           return null
         } finally {
           uptimeLoading = null
@@ -2589,19 +2815,67 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * A collector timestamp in the words its own monitor page uses.
+     * The width of one bucket per window, in words.
      *
-     * The ladder is theirs rather than this half's invention, so a moment read here
-     * and the same moment read on the web monitor do not disagree about how long ago
+     * The collector sends 60 one-minute buckets for an hour and 48 for every longer
+     * window, so the same strip means half an hour on a day, three and a half hours on a
+     * week and fifteen on a month. That is why the strip carries its width as a label:
+     * unlabelled, a strip over a week reads exactly like a strip over an hour.
+     */
+    const BUCKET_WIDTHS = Object.freeze({
+      '1h': '1 мин',
+      '24h': '30 мин',
+      '7d': '3,5 ч',
+      '30d': '15 ч',
+    })
+
+    /**
+     * The width of one bucket, for a window this half may not know.
+     *
+     * Measured from the buckets' own timestamps when the window is not in the table,
+     * because the collector decides how many buckets it sends and the strip is scaled to
+     * whatever arrived.
+     *
+     * @param range - the window the answer is for.
+     * @param buckets - the buckets that came with it.
+     * @returns «1 мин», «30 мин», «3,5 ч», … or `null` when nothing says.
+     */
+    function bucketWidth(range, buckets) {
+      const known = BUCKET_WIDTHS[typeof range === 'string' ? range : '']
+      if (known !== undefined) return known
+      const from = (Array.isArray(buckets) ? buckets : []).map(bucket => bucket?.from).filter(Number.isFinite)
+      if (from.length < 2) return null
+      const minutes = Math.round((from[1] - from[0]) / 60_000)
+      if (!(minutes > 0)) return null
+      if (minutes < 60) return `${minutes} мин`
+      const hours = Math.round((minutes / 60) * 10) / 10
+      return `${Number.isInteger(hours) ? hours : hours.toFixed(1).replace('.', ',')} ч`
+    }
+
+    /**
+     * One share as Russian typography wants it: a comma, and no trailing zero.
+     *
+     * @param value - a number in 0..100, or anything else.
+     * @returns «4,3%», «100%» or «—».
+     */
+    function pctText(value) {
+      if (!Number.isFinite(value)) return '—'
+      const rounded = Math.round(value * 10) / 10
+      return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1).replace('.', ',')}%`
+    }
+
+    /**
+     * An age in minutes, in the words the monitor's own page uses.
+     *
+     * The ladder is theirs rather than this half's invention, so a moment read here and
+     * the same moment read on the web monitor do not disagree about how long ago
      * something happened.
      *
-     * @param at - epoch ms, or anything that is not a number.
-     * @param now - the moment to measure from; the current one by default.
+     * @param minutes - how many minutes ago, or anything that is not a number.
      * @returns «только что», «N мин назад», «N ч назад», «N дн назад» or «—».
      */
-    function relativeTime(at, now = Date.now()) {
-      if (!Number.isFinite(at)) return '—'
-      const minutes = Math.floor((now - at) / 60_000)
+    function agoText(minutes) {
+      if (!Number.isFinite(minutes) || minutes < 0) return '—'
       if (minutes < 1) return 'только что'
       if (minutes < 60) return `${minutes} мин назад`
       const hours = Math.floor(minutes / 60)
@@ -2610,54 +2884,115 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
+     * A collector timestamp in the same words.
+     *
+     * @param at - epoch ms, or anything that is not a number.
+     * @param now - the moment to measure from; the current one by default.
+     * @returns the age, or «—».
+     */
+    function relativeTime(at, now = Date.now()) {
+      if (!Number.isFinite(at)) return '—'
+      return agoText(Math.floor((now - at) / 60_000))
+    }
+
+    /**
+     * How long ago one model's last error came.
+     *
+     * The collector's own `minutesSinceLast` when it sends one, its `lastAt` when it does
+     * not, and the last event's timestamp for an answer older than v2 — which has neither
+     * field but does keep `lastError`. Nothing at all when the model has no errors.
+     *
+     * @param model - the collector's record.
+     * @returns «4 мин назад», or `null` when there is no last error to date.
+     */
+    function recencyOf(model) {
+      if (Number.isFinite(model?.minutesSinceLast)) return agoText(model.minutesSinceLast)
+      if (Number.isFinite(model?.lastAt)) return agoText(Math.floor((Date.now() - model.lastAt) / 60_000))
+      const last = model?.lastError
+      if (Number.isFinite(last?.t)) return agoText(Math.floor((Date.now() - last.t) / 60_000))
+      return null
+    }
+
+    /**
      * One model's line in the uptime box.
      *
-     * The dot, the status word and the bar all take the same colour, because a row that
-     * said "Degraded" in amber next to a green bar would be two answers to one
+     * A state word rather than a percentage, because this plugin measures errors and
+     * nothing else: there is no denominator for "percent available", and the only share
+     * on the row is «затронуто N% установок» — how wide the trouble reached, which does
+     * have one. The dot, the state word and the bars all take the same colour, because a
+     * row that said "Сбои" in red next to a green bar would be two answers to one
      * question. Every number is the collector's own, and one the wire left out is drawn
-     * as «—» rather than as a zero.
+     * as «—» rather than as a zero — except a share with no denominator at all, which is
+     * omitted, since «затронуто 0%» would claim a measurement nobody made.
      *
-     * @param props - `{ model }`, one entry of the collector's `models`.
+     * @param props - `{ model, range }`, one entry of the collector's `models` and the
+     *   window it came from.
      */
     function UptimeRow(props) {
       const model = typeof props.model === 'object' && props.model !== null ? props.model : {}
-      const status = typeof model.status === 'string' ? model.status : 'up'
-      const tone = statusOf(status)
+      const status = stateOf(model.status)
+      const tone = STATES[status]
       const errors = Number.isFinite(model.errors) ? model.errors : null
-      const uptime = Number.isFinite(model.uptime) ? model.uptime : null
+      // A count of installs is only shown when the answer carries one: a collector older
+      // than v2 does not measure breadth, and «от 0 установок» would read as "nobody was
+      // affected" rather than as "we do not know".
+      const installs = Number.isFinite(model.installs) ? model.installs : null
+      const note = anonymousNote(errors, model.anonymous)
+      const caveat = note === null ? '' : ` (${note})`
+      const recency = recencyOf(model)
+      // A bar's slot is the array's own, never a timestamp divided by a width. The
+      // collector decides both the bucket edges — half-open `[from, from + width)`, with
+      // the newest closed at `now` — and how many it sends, and an event whose age is an
+      // exact multiple of the width lands in the next bucket by that convention. A
+      // consumer that recomputed the index client-side would draw that bar one slot off,
+      // and only for boundary events, which on the hour's minute-wide buckets means every
+      // post made on a minute. `bucketWidth` reads two `from` values for the strip's
+      // label and stops there: a width, not a position.
+      //
+      // The order is the producer's contract, and this half deliberately does not
+      // normalise it. Sorting ascending by `from` would repair a reversed array and do
+      // nothing at all for the bug that matters — counts sitting in the wrong bars of a
+      // perfectly well-formed array, ascending and uniformly stepped with both edges
+      // right, which no structural check a consumer could write would ever notice. That
+      // case is caught by the collector's own semantic tests, and a client-side sort
+      // would only make this side feel protected while protecting nothing.
       const buckets = Array.isArray(model.buckets) ? model.buckets : []
       const counts = buckets.map(bucket => (Number.isFinite(bucket?.count) ? bucket.count : 0))
       const peak = Math.max(1, ...counts)
       const events = Array.isArray(model.events) ? model.events : []
-      // Forty-eight empty bars say nothing a word does not say better, and "no errors
-      // in this window" is the answer the collector gives most days.
+      // Sixty empty bars say nothing a word does not say better, and "no errors in this
+      // window" is the answer the collector gives most days.
       const hasErrors = counts.some(count => count > 0) || events.length > 0
+      const width = bucketWidth(props.range, buckets)
       const last = typeof model.lastError === 'object' && model.lastError !== null ? model.lastError : null
-      return h('div', { className: 'dmi-up-row', 'data-dmi-status': status, style: { marginBottom: '9px' } },
+      // `undefined` means the field is not in the answer at all — a collector older than
+      // v2 — and `null` means it is there with nothing to divide by. Only the second one
+      // is worth a line of its own.
+      const affected = model.affectedPct === undefined ? undefined : model.affectedPct
+      return h('div', { className: 'dmi-up-row', 'data-dmi-state': status, style: { marginBottom: '9px' } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', flexWrap: 'wrap' } },
           h('span', {
             className: 'dmi-up-dot',
-            'data-dmi-status': status,
+            'data-dmi-state': status,
             style: { width: '8px', height: '8px', minWidth: '8px', borderRadius: '50%', background: tone.color, flex: 'none' },
           }),
           h('span', { style: { fontSize: '12.5px', flex: '1 1 auto', minWidth: 0 } }, String(model.name ?? model.id ?? '—')),
           h('span', { style: { fontSize: '11.5px', fontWeight: 600, color: tone.color } }, tone.label),
-          h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, uptime === null ? '—' : `${uptime}%`),
-          h('span', {
-            style: { flex: 'none', width: '54px', height: '4px', borderRadius: '2px', background: C.border, overflow: 'hidden' },
-          },
-          h('span', {
-            style: {
-              display: 'block',
-              height: '100%',
-              width: `${Math.max(0, Math.min(100, uptime ?? 0))}%`,
-              background: tone.color,
-            },
-          })),
-          h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `ошибок ${errors === null ? '—' : errors}`),
-          last === null
+          h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } },
+            errors === null
+              ? 'ошибок —'
+              : errors === 0
+                ? 'ошибок нет'
+                : installs === null
+                  ? `ошибок ${errors}${caveat}`
+                  : `ошибок ${errors} от ${installs} ${plural(installs, ['установки', 'установок', 'установок'])}${caveat}`),
+          recency === null
             ? null
-            : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `последняя ${relativeTime(last.t)}`)),
+            : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `последняя ${recency}`),
+          affected === undefined
+            ? null
+            : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } },
+                `затронуто ${pctText(affected)} установок`)),
 
         last === null
           ? null
@@ -2678,7 +3013,12 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                   background: count === 0 ? C.border : C.down,
                 },
               }))
-            : h('span', { style: { color: C.labelSecondary, fontSize: '11px' } }, 'ошибок нет')))
+            : h('span', { style: { color: C.labelSecondary, fontSize: '11px' } }, 'ошибок нет'),
+          // The strip's own scale, so a week of bars is not read as an hour of them.
+          width === null
+            ? null
+            : h('span', { style: { color: C.labelSecondary, fontSize: '10.5px', flex: 'none', marginLeft: '5px', alignSelf: 'center' } },
+                `1 столбик = ${width}`)))
     }
 
     /**
@@ -2735,6 +3075,10 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       }, [enabled, range, read])
 
       const summary = typeof data?.summary === 'object' && data.summary !== null ? data.summary : {}
+      // The breadth the collector measured: how many distinct installs reported in this
+      // window, and how many reported at all over the 30-day reference. `null` means the
+      // answer predates the field, which is not the same as zero.
+      const installs = typeof data?.installs === 'object' && data.installs !== null ? data.installs : null
       const models = Array.isArray(data?.models) ? data.models : []
       const refused = typeof data?.error === 'string' && data.error !== '' ? data.error : state.uptimeError
       const generatedAt = Number.isFinite(data?.generatedAt) ? new Date(data.generatedAt).toLocaleString() : '—'
@@ -2749,7 +3093,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           enabled
             ? h(Select, {
                 value: range,
-                options: [['24h', '24 часа'], ['7d', '7 дней'], ['30d', '30 дней']],
+                options: [['1h', '1 час'], ['24h', '24 часа'], ['7d', '7 дней'], ['30d', '30 дней']],
                 onChange: value => setRange(value),
               })
             : null,
@@ -2760,23 +3104,35 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 
         !enabled
           ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6 } },
-              'Аптайм выключен настройкой «Показывать аптайм моделей»: панель ничего не читает, и точки в списке моделей не рисуются.')
+              'Аптайм выключен настройкой «Показывать аптайм моделей»: панель ничего не читает, и значки аптайма в списке моделей не рисуются.')
           : data === undefined
             ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px' } }, 'Читаем состояние моделей…')
             : data === null || data.ok === false
+              // The window is named, because "the collector did not answer" and "the
+              // collector does not know this window" are different situations with
+              // different remedies: a v1 server answers an hour with a 400 while a day
+              // works fine, and a message that hides the range would send the user to
+              // check a collector that is perfectly healthy.
               ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6 } },
-                  `Коллектор не ответил: ${refused ?? 'причина не сообщена'}. Кнопка «Обновить» спрашивает ещё раз.`)
+                  `Коллектор не ответил за период «${range}»: ${refused ?? 'причина не сообщена'}. `
+                  + 'Кнопка «Обновить» спрашивает ещё раз.')
               : h('div', null,
                   data.stale === true
                     ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '6px' } },
                         `показано кешированное от ${cachedAt}; коллектор недоступен: ${refused ?? 'причина не сообщена'}`)
                     : null,
                   h('div', { style: { fontSize: '12.5px', marginBottom: '8px' } },
-                    `операционно ${summary.operational ?? '—'} из ${summary.totalModels ?? '—'} · деградируют ${summary.slow ?? '—'} · лежат ${summary.down ?? '—'} · аптайм ${summary.uptime ?? '—'}% · ошибок за период ${summary.totalErrors ?? '—'}`),
+                    `моделей ${summary.totalModels ?? '—'} · без ошибок ${summary.operational ?? '—'}`
+                    + ` · локально ${summary.single ?? 0} · сбои ${summary.issues ?? summary.slow ?? 0}`
+                    + ` · лежат ${summary.down ?? 0} · ошибок за период ${summary.totalErrors ?? data?.total ?? '—'}`
+                    // Dropped entirely when the answer has no install counts: an older
+                    // collector measures nothing about breadth, and dashes in the header
+                    // would be noise rather than honesty.
+                    + (installs === null ? '' : ` · затронуто ${installs.window ?? '—'} из ${installs.reference ?? '—'} установок`)),
                   models.length === 0
                     ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px' } },
                         'Коллектор не назвал ни одной модели за этот период.')
-                    : models.map(model => h(UptimeRow, { key: String(model?.id ?? model?.name ?? ''), model })),
+                    : models.map(model => h(UptimeRow, { key: String(model?.id ?? model?.name ?? ''), model, range })),
                   h('div', {
                     style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', flexWrap: 'wrap', color: C.labelSecondary, fontSize: '11.5px' },
                   },
@@ -3143,13 +3499,13 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         const onInteract = () => {
           if (disposed) return
           scheduleDecorate()
-          // The dots ride the same interactions the marks do, throttled inside
+          // The badges ride the same interactions the marks do, throttled inside
           // `loadUptime` to the collector's own cadence: a menu opened twice in a row
           // costs one loopback read per half minute, and only an answer that moved
           // something earns a second pass.
           if (state.uptimeView) {
             const beforeUptime = state.uptimeRevision
-            void loadUptime(DOT_RANGE).then(() => {
+            void loadUptime(BADGE_RANGE).then(() => {
               if (state.uptimeRevision !== beforeUptime) scheduleDecorate()
             })
           }
@@ -3170,9 +3526,9 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             for (const node of [...record.addedNodes, ...record.removedNodes]) {
               if (node.nodeType !== 1) continue
               const element = /** @type {Element} */ (node)
-              if (element.classList?.contains(MARK) || element.classList?.contains(DOT)) continue
+              if (element.classList?.contains(MARK) || element.classList?.contains(BADGE)) continue
               if (element.querySelector?.(`.${MARK}`) !== null) continue
-              if (element.querySelector?.(`.${DOT}`) !== null) continue
+              if (element.querySelector?.(`.${BADGE}`) !== null) continue
               return true
             }
             return false

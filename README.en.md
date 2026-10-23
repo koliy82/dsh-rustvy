@@ -196,9 +196,9 @@ Marks:
 | Control | Default | Meaning |
 |---|---|---|
 | Показывать иконки моделей | on | master switch for the marks; off removes every mark and leaves the model list alone |
-| Иконка в кнопке выбранной модели | on | also mark the composer's model button, not just the menu rows |
+| Иконка в кнопке выбранной модели | on | also mark the composer's model button, not just the menu rows; it also takes the uptime badge off that button |
 | Прятать логотипы других скинов | on | hide a skin's own lockup in a row this plugin marked |
-| Показывать аптайм моделей | on | the «Аптайм моделей» box on this page and the status dot in the model picker; off reads the collector's mirror at all |
+| Показывать аптайм моделей | on | the «Аптайм моделей» box on this page and the state badge in the model picker and on the selected-model button; off reads the collector's mirror at all |
 | Размер значка, px | 16 | 10–32 |
 
 Model list:
@@ -261,7 +261,7 @@ address, the anonymous identifier, the sent, queued and dropped counters, the la
 the last send error and the failures by kind — is still served by the host's own loopback
 routes, `/dsh-rustvy/state` and `/dsh-rustvy/errors`, and that is where it is read, not
 in the interface. The address — `uptimeEndpoint`,
-`http://185.75.189.247:8249/api/report` by default — has no field of its own: it is
+`http://185.75.189.247:3789/api/report` by default — has no field of its own: it is
 repointed without a release by the `DSH_RUSTVY_UPTIME_ENDPOINT` environment variable or
 by hand in `<profile>\.dsh-rustvy\config.json`.
 
@@ -596,7 +596,7 @@ The collector takes it on `POST /api/report`; `meta` is the only object in it, a
 everything else sits at the top level, because a great many of these are stored and read
 back grouped by model and hour.
 
-The default address is `http://185.75.189.247:8249/api/report`: the monitor's public
+The default address is `http://185.75.189.247:3789/api/report`: the monitor's public
 collector, on bare HTTP over a bare IP deliberately for now. It is
 repointed without a release, through the `uptimeEndpoint` field in
 `<profile>\.dsh-rustvy\config.json` or the `DSH_RUSTVY_UPTIME_ENDPOINT` environment
@@ -732,63 +732,159 @@ report shape, the kind vocabulary and the collector's contract are described in
 
 The same collector that takes the error reports hands back the monitor's view: which
 models are answering, how many people they are failing, and how long they have been
-failing. The plugin shows that view inside DSH — as a box on the settings page and as a
-dot in the model picker — so choosing a model does not mean opening a browser to look
-for a line that is already visible here.
+failing. The plugin shows that view inside DSH — as a box on the settings page and as an
+uptime badge in the model picker — so choosing a model does not mean opening a browser to
+look for a line that is already visible here.
 
-Every number in the box is the collector's own. The plugin recomputes nothing: a
-percentage worked out locally would disagree with the monitor's web page, and two
-answers to "is this model up" is worse than one.
+Every number in the box is the collector's own. The plugin recomputes nothing: a verdict
+worked out locally would disagree with the monitor's web page, and two answers to "is this
+model up" is worse than one.
+
+### There is no percentage any more
+
+The plugin reports errors only: it sees no successful requests and no traffic volume, so a
+"percent available" has no denominator in principle. The number that used to be drawn on
+the badge was the share of buckets with no errors in them, and it had three bad
+properties: it moved with the window for the very same stream of events, it saturated — 47
+errors in a bucket and one error contributed the same — and it was blind to breadth, so
+one person's outage and a provider's looked identical.
+
+What is measured well is something else: how many distinct installs reported errors, how
+long ago the last one came, and how many there were. That is why the headline is now a
+state rather than a percentage. The only share left on screen is **«затронуто N%
+установок»** — distinct installs that reported errors in the window over distinct installs
+that reported anything over 30 days. Its denominator is real, and it means reach rather
+than availability; it is never called uptime anywhere.
 
 ### Where it is read from
 
 The host half mirrors the collector's answer onto its own loopback route,
-`GET /dsh-rustvy/uptime.json?range=24h|7d|30d`, and the panel reads the mirror rather
+`GET /dsh-rustvy/uptime.json?range=1h|24h|7d|30d`, and the panel reads the mirror rather
 than the collector: the request stays inside the machine, and the mirror holds the last
 good answer, so an unreachable collector shows a cached picture with an explicit note
 rather than an empty box. It refreshes every 30 seconds while the settings page is open
 — the monitor's own page waits the same — and stops asking the moment the page is closed.
 
-### The three statuses
+### The four states
 
-| Status | Word | Colour |
-|---|---|---|
-| `up` | Operational, UP | `#22c55e` |
-| `slow` | Degraded, SLOW | `#f59e0b` |
-| `down` | Down, DOWN | `#ef4444` |
+| State | The collector's rule | Word | Colour |
+|---|---|---|---|
+| `ok` | no errors in the window | Без ошибок | `#22c55e` |
+| `single` | errors, from one install | Локальный сбой | `#f59e0b` |
+| `issues` | errors, from two installs or more | Сбои | `#ef4444` |
+| `down` | three installs or more, last error within five minutes | Лежит | `#ef4444` |
 
-The words and the colours come from the monitor's page, so the plugin and the site do
-not tell different stories about the same model. That is all they contribute: every
-surface behind them is an ordinary `--dsw-alias-*` theme token, because the monitor's
-page has one dark theme and this one has two.
+The rule and its thresholds live in the collector, not here: the plugin takes the finished
+`status` and turns it into a word and a colour. `single` is amber while `issues` and
+`down` are red on purpose — one install reporting is most often that install's own
+network, key or region, and painting that red would cry wolf on every bad evening. The
+words and the colours come from the monitor's page, so the plugin and the site do not tell
+different stories about the same model; every surface behind them is still an ordinary
+`--dsw-alias-*` theme token, because the monitor's page has one dark theme and this one has
+two.
+
+A collector older than v2 answers `up | slow | down`. Those are translated as `up → ok`,
+`slow → issues`, `down → down`, and `single` simply never arrives from it: until the
+server is updated, a local fault is indistinguishable from a provider outage. An
+unrecognised word is taken as `ok` — a model nothing was reported about in the window is a
+model nobody complained about, not a fifth category the wire never mentioned.
 
 ### Windows and strips
 
-The window switch — 24 hours, 7 days, 30 days, a day by default — is the panel's own
-state rather than a setting: it is not written to `config.json`, so one glance at last
-month does not become a preference every other surface inherits. The strip under each
-model is up to 48 buckets per window whatever its length, so a bucket's width changes
-with the window: half an hour over 24 hours, three and a half over 7 days, fifteen over
-30. Bars are scaled by `max(1, …counts)`, which is what makes a single error visible.
+The window switch — 1 hour, 24 hours, 7 days, 30 days, a day by default — is the panel's
+own state rather than a setting: it is not written to `config.json`, so one glance at last
+month does not become a preference every other surface inherits. The answer carries as
+many buckets as the collector sent: 60 one-minute ones for an hour and 48 for every longer
+window, so a bucket's width changes with the window — a minute over an hour, half an hour
+over a day, three and a half over a week, fifteen over a month. The strip carries its
+width as a label («1 столбик = 30 мин»), because unlabelled a week of bars reads exactly
+like an hour of them. Bars are scaled by `max(1, …counts)`, which is what makes a single
+error visible.
+
+### The model row
+
+The state word, «ошибок N от M установок», «последняя X назад», the bucket strip with its
+width label, and «затронуто N% установок» when there is a denominator; underneath, the
+last error with its time, its code and the provider's own text.
+
+Some reports arrive with no usable `meta.id`, and those cannot be counted against anybody.
+Then «ошибок 3 от 1 установки» quietly promises a breadth that was never measured — and
+that is exactly the number a person acts on when deciding whether to trust a model. So a
+caveat goes next to it: «(все анонимные)» when every error was anonymous, «(2 из 3
+анонимных)» when some were. When none were, which is the common case, nothing is written.
+
+An answer from a collector older than v2 carries no `installs`, no `affectedPct` and no
+`minutesSinceLast`. The row then shows the error count without «от M установок», shows no
+share at all, and takes «последняя X назад» from `lastError`; the header drops its
+breadth clause. The panel comes out poorer but not wrong: neither «от 0 установок» nor
+«затронуто 0%» ever appears on it.
+
+The box's header: «моделей N · без ошибок N · локально N · сбои N · лежат N · ошибок за
+период N · затронуто M из K установок». There is no percentage in the header on any
+window, and that is not an omission: over 30 days the window and the reference period
+coincide, so numerator and denominator are the same set of installs, and «затронуто 100%
+установок» would read as a verdict while meaning only that the share was measured against
+itself. The collector answers such a window with `summary.affectedPct: null`, and the
+header shows the counts themselves — «затронуто 47 из 47 установок» — which stay honest
+numbers and say the same thing without a false precision. Each model's own share is real
+on every window including the month, because its denominator is the whole install base and
+its numerator one model's installs; «затронуто 4,3% установок» stays meaningful in a row
+where the same figure in the header would be a tautology.
+
+### A collector that does not know the hour
+
+The badges read the `1h` window, and a first-version collector does not have one and
+answers it with an error. The plugin is updated before the collector is deployed, so that
+interval is an ordinary state rather than an incident: the host half serves a `502`
+carrying no models, every badge disappears — in the picker and on the selected-model
+button alike — the vendor marks stay where they are, and the panel on a day keeps working
+exactly as it did. An absent badge is more honest here than any number: a window the
+collector cannot answer is a window in which it named no model. Switching the panel to an
+hour says so in words and names the window — «Коллектор не ответил за период «1h»: …» —
+because "the collector did not answer" and "the collector does not know this window" call
+for different actions. A transport failure takes the badges away in the same way: unlike
+the panel, which can hold a cached picture and label it with the moment it is from, a
+badge has no way to say "this is what we knew a while ago".
 
 ### An empty answer is a normal one
 
-The collector's aggregation is still being written, and today it answers `total: 0` with
-no errors and empty buckets on all three windows. The panel draws that as a finding
-rather than as a failure: «ошибок нет» is an answer, and it is written in words instead
-of forty-eight empty bars. When the aggregation starts working, the same rows will show
-real outages and the page will not need changing for it. That is a property of the
-collector, not of the plugin.
+The collector's aggregation is still being written, and it answers `total: 0` with no
+errors and empty buckets on every window. The panel draws that as a finding rather than as
+a failure: «ошибок нет» is an answer, and it is written in words instead of empty bars.
+When the aggregation starts working, the same rows will show real outages and the page will
+not need changing for it. That is a property of the collector, not of the plugin.
 
-### The dots in the model picker
+### The uptime badges in the model picker and on the selected-model button
 
-A row the collector named gets a dot in the model picker, coloured by status, with a
-tooltip like «Аптайм 61% · ошибок 5 · за 24 часа». The dot describes the last 24 hours
-and only those: the panel's window does not move it, or its tooltip would lie about the
-number it is explaining. A row the collector did not name gets no dot at all — the
-absence of one means "the collector said nothing about this model", not "it is fine".
-The dots are drawn by the same pass that draws the vendor marks, so the marks' master
-switch takes them too, while «Показывать аптайм моделей» takes only them.
+A row the collector named gets a state badge in the model picker — at the row's right
+edge, where the harness draws a pill of its own, and beside that pill rather than on top
+of it. There is no percentage on it: `ok` is a quiet green dot with no number, `single` an
+amber pill carrying the error count, `issues` and `down` a red pill carrying it. An error
+count and a colour read faster than 97,9%, which meant nothing.
+
+A row the collector did not name gets nothing at all — which is precisely why `ok` is a dot
+rather than an empty space: "the collector said nothing about this model" and "it is fine"
+have to look different. The tooltip carries the rest — «3 ошибки от 2 установок за
+последний час · последняя 4 мин назад», with the same caveat about anonymous reports — and
+for `ok` it says «ошибок не было за последний час».
+
+The same badge is drawn on the selected-model button too — between the model's name and
+its reasoning indicator when the build renders one, and right after the name when it does
+not. The button is the one place where the model changes *under* the badge, so there is
+one rule: when the selected model changes, the badge is either rewritten or removed, and
+the previous model's state never stays in the button. Its states, colours and window are
+exactly the picker's, and the **Иконка в кнопке выбранной модели** switch takes both the
+vendor mark and the uptime badge off that button — it is the user's word on whether this
+plugin writes into the button at all.
+
+The badge describes the last hour and only that: the panel's window does not move it, or
+its tooltip would lie about the number it is explaining. The badges are drawn by the same
+pass that draws the vendor marks, so the marks' master switch takes them too, while
+«Показывать аптайм моделей» takes only them.
+
+This is a rule about drawing, not a new meaning for a state: the badge and the panel render
+the same collector `status`, the badge saying it in colour and a count and the panel in a
+word, a count and a strip.
 
 ### Turning it off
 
@@ -796,8 +892,9 @@ With the **Показывать аптайм моделей** switch in **Settin
 with `uptimeView: false` in `<profile>\.dsh-rustvy\config.json`, or with the
 `DSH_RUSTVY_NO_UPTIME=1` environment variable, which hides the panel regardless of the
 setting. A view that is off
-reads nothing: neither the panel nor the dots appear, and no request goes to the mirror
-at all. The collector's answer shape, its fields and the mirror's contract are described
+reads nothing: neither the panel nor the picker's uptime badges appear, and no request
+goes to the mirror at all. The collector's answer shape, its fields and the mirror's
+contract are described
 in [`docs/uptime-view.md`](docs/uptime-view.md).
 
 ## Routes
@@ -819,7 +916,7 @@ loopback only, a loopback `Host`, a same-origin `Sec-Fetch-Site` and a matching
 | `/dsh-rustvy/revert-models` | POST | put the backed-up route profile back |
 | `/dsh-rustvy/config` | POST | write settings; never touches the network |
 | `/dsh-rustvy/errors` | GET, POST | loopback diagnostics for error collection, which the interface no longer surfaces: neither a button nor a status row on the settings page leads here. GET: the collection summary — the same `errorReport` block `/state` carries. POST `{ action: 'test' }` queues one synthetic event and flushes it immediately, `{ action: 'flush' }` sends what has accumulated; both answer with the fresh summary. A refusal is HTTP 200 with `{ ok: false, error }`, the way a disabled feature answers on `/apply-models`. The route keeps working: it is how delivery is checked by hand, when nobody wants to look at a screen for it |
-| `/dsh-rustvy/uptime.json` | GET | the mirror of the monitor's view: `?range=24h\|7d\|30d` (`24h` by default) and the collector's answer as it came — `summary`, `models` with their `status`, `uptime`, `errors`, `buckets`, `events` and `lastError`, `byCode`, `generatedAt`, `storage` and `monitorUrl`. When the collector is unreachable it serves the last good answer with `stale: true`, a `fetchedAt` and an `error`; with no cache at all, `502` and `{ ok: false, error }`. With the view switched off, `200` and `{ ok: false, error }`, the way every disabled feature answers |
+| `/dsh-rustvy/uptime.json` | GET | the mirror of the monitor's view: `?range=1h\|24h\|7d\|30d` (`24h` by default) and the collector's answer as it came — `summary`, `installs`, `models` with their `status`, `errors`, `installs`, `anonymous`, `firstAt`, `lastAt`, `minutesSinceLast`, `affectedPct`, `buckets`, `events` and `lastError`, `byCode`, `generatedAt`, `storage` and `monitorUrl`; the deprecated `uptime` and `summary.slow` come from an older collector and are not shown by the plugin. When the collector is unreachable it serves the last good answer with `stale: true`, a `fetchedAt` and an `error`; with no cache at all, `502` and `{ ok: false, error }`. With the view switched off, `200` and `{ ok: false, error }`, the way every disabled feature answers |
 | `/dsh-rustvy/keys` | GET, POST | GET: the whole ring — keys with a mask and a fingerprint, the default key, the hidden provider groups, the missing and stale routes, the substitution counters, the last refusal, both file paths, and whether `credentials` and `configEditor` are available. POST: one action on the ring (`add`, `set`, `rename`, `default`, `remove`, `repair`, `test`); a success answers with a fresh GET plus the action's own field, so one POST repaints everything. A refusal is `409` with `{ ok: false, error }`, an unknown action `400`. A key value is accepted in the body only |
 | `/dsh-rustvy/session-key` | GET, POST | GET with `?sessionId=`: which key this chat sends its requests with (`keyId`), whether the choice is its own (`picked`), and the whole `GET /keys` answer besides; `400` without an id. POST `{ sessionId, keyId }` records the choice and answers with the same payload; `keyId: null` returns the chat to the default key |
 
@@ -859,7 +956,9 @@ Each capability degrades on its own:
 | a key route lost to a hand edit of `cordis.patch.yml` or to a model-list revert | the key stays in the ring, its route is listed under `routes.missing`, that chat's requests go out on the profile's route with a visible reason, and **«Починить маршруты»** (`{ action: 'repair' }`) writes the ring's routes again |
 | the uptime collector | reports stay queued on disk and leave when the site answers, so an outage still reaches the monitor with its real timestamps; requests to the provider are unaffected either way, and the backlog and the last send error are served by the loopback routes `/dsh-rustvy/state` and `/dsh-rustvy/errors` — the settings page shows neither |
 | a host half older than error collection | `/state` arrives without the `errorReport` block and without the two new paths: the settings page draws the switch identically either way, because it draws no part of the collection summary, and the file paths appear only when the host names them |
-| the monitor's view at the collector | the mirror serves the last good answer with `stale: true`, and the panel shows that cached picture with the moment it is from; with no cache at all it is a `502`, and the panel names the reason instead of spinning. The picker's dots go with the data while the vendor marks stay: requests to the provider are unaffected either way |
+| the monitor's view at the collector | the mirror serves the last good answer with `stale: true`, and the panel shows that cached picture with the moment it is from; with no cache at all it is a `502`, and the panel names the reason instead of spinning. The picker's uptime badges go with the data while the vendor marks stay: requests to the provider are unaffected either way |
+| a collector older than v2, with no `1h` window | every badge disappears — in the picker and on the selected-model button — the vendor marks stay, and the panel on a day works as before, naming the window it could not read if it is switched to an hour. This is the state between the plugin updating and the collector being deployed, and an absent badge is more honest in it than a number |
+| a collector older than v2, with no breadth fields | the panel translates the old state words, shows the error count without «от M установок», shows no share at all and takes the recency from `lastError`; the header drops its breadth clause. Neither «от 0 установок» nor «затронуто 0%» ever appears on it |
 
 ## Layout
 
@@ -1014,20 +1113,60 @@ when it does not, because it is not prose but the only place the page reports a 
 read that failed. A host half older than the feature is checked too: without the
 `errorReport` block the page draws exactly what it draws with one, and does not throw.
 
-It draws the uptime box too, against two fixtures, because only the all-green one has
-ever come back from the live collector. Asserted: the summary and the per-model rows
-with their `up`, `slow` and `down` statuses; the window switch, which asks the mirror
-for `?range=7d`, keeps the window it was given and posts nothing to `/config`, since it
-is the panel's state rather than a setting; the all-green answer drawn as the words
-«ошибок нет» with no error styling; a populated one drawn as a `down` model with its
-error count, its last error and a strip of 48 buckets; a cached answer showing its
-`fetchedAt` and the warning with its reason; and an unreachable collector naming the
-reason and keeping the «Обновить» button instead of spinning forever. The picker's dots
-are checked separately: a row the collector named carries a dot of its status with a
-tooltip and keeps its vendor mark, a row it did not name carries none, a second pass
-draws no second dot, and a switched-off view takes the dots while leaving the marks. The
-uptime switch is checked the way every other one is — it posts its own field to
-`/config`, and off means the panel explains itself in words and makes no request to the
+It draws the uptime box too, against four fixtures: the all-green answer the collector
+gives most days; a populated one carrying all four states and both edge cases
+(`affectedPct: null`, and a window whose reports are all anonymous); the hour the badges
+take their numbers from — where the mirror answers any longer window with doubled counts,
+so a badge repainted from the wrong window is visible at once; and an answer from a
+collector older than v2, with its three old states, a percentage and not one breadth
+field. Asserted: a header that counts states instead of a percentage, and rows carrying
+the words «Лежит», «Сбои», «Локальный сбой» and «Без ошибок»; the window switch, which
+offers all four windows, defaults to `24h`, asks the mirror for `?range=1h` and posts
+nothing to `/config`, since it is the panel's state rather than a setting; the bucket
+width labelled — 48 half-hour bars over a day, 60 minute bars over an hour; «ошибок 5 от 3
+установок» and «затронуто 6,4% установок» as the collector's own numbers rather than a
+recount; a share with no denominator drawn as «—» and never as 0%; a last error three
+hours old reading as «3 ч назад» and never as «только что»; the anonymous caveat standing
+next to the number it qualifies; a cached answer showing its `fetchedAt` and the warning
+with its reason; and an unreachable collector naming the reason and keeping the «Обновить»
+button instead of spinning forever. The old answer comes out poorer but not wrong: its
+words are translated, its error count is shown without «от M установок», no share is shown
+at all, and neither «от 0 установок» nor «затронуто 0%» ever appears. A fifth fixture is a
+30-day window, where the header's share stops meaning anything: the header shows its
+counts («затронуто 47 из 47 установок») and no percentage, while one model's own share
+stays real on the same window («затронуто 6,4% установок»), and the strip says its bars
+are fifteen hours wide.
+
+The interval between the plugin updating and the collector being deployed is checked
+separately, with a fixture whose `range=1h` answers a `502` carrying no models while a day
+keeps working. What is asserted is the part that would otherwise stay an assumption — that
+the badge path neither throws nor hangs on a read that never lands: every badge goes,
+including the one on the selected-model button, no badge of the previous window is left on
+screen, the vendor marks stay, the panel names the window it could not read, and on a day
+it goes on drawing rows. A transport failure — a read that answers nothing at all — is
+checked the same way: the badges go rather than freeze, because a badge, unlike the panel,
+has no way to say what moment it is from.
+
+The picker's uptime badges are checked separately, against the hour fixture with one model
+in each state: `ok` is a quiet dot with no number, `single` an amber pill with its error
+count, `issues` and `down` red pills with theirs, and all four colours are the monitor's;
+the dot stays distinguishable from an empty space, so "the collector said nothing" and
+"there were no errors" do not look alike; the tooltip names the window («за последний
+час»), the error count, the install count and the recency; the badge sits inside the row
+ahead of the row's own trailing control and keeps the vendor mark; a second pass draws no
+second badge; a row that already carries a harness pill keeps both, ours as a sibling
+rather than a child; switching the panel to 30 days does not repaint badges whose tooltips
+say an hour; a switched-off view takes the badges and leaves the vendor marks; and an
+unload takes the badges with it. The badge on the selected-model button is checked
+separately: it carries the selected model's state and colour, stands between the name and
+the reasoning indicator, and on a button with no indicator right after the name; the
+button's own furniture — the indicator, «Default», the chevron, the stop button — and the
+vendor mark are left untouched; when the selected model changes the badge is rewritten, a
+quiet dot becoming a red pill, and on a model the collector did not name it disappears,
+so the previous model's state never lingers in the button; and switching off «Иконка в
+кнопке выбранной модели» takes the badge off that button while the picker rows keep
+theirs. The uptime switch is checked the way every other one is — it posts its own field
+to `/config`, and off means the panel explains itself in words and makes no request to the
 mirror at all.
 
 The mark-drawing half is **not** covered by an automated suite in this repository,

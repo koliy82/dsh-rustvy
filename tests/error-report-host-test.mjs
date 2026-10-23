@@ -52,6 +52,26 @@ function answerFor(body) {
   }
   if (answerMode === 'unavailable') return { status: 503, body: { ok: false, error: 'storage unavailable' } }
   if (answerMode === 'bad') return { status: 400, body: { ok: false, error: 'need a message or code field' } }
+  // The v2 contract accepts a report whose `meta` exceeded 8 KB and was dropped whole,
+  // and names the reason in `warnings` as a stable code — never prose, absent when
+  // there are none. Still a 200, still accepted.
+  if (answerMode === 'warned') {
+    return { status: 200, body: { ok: true, id: Date.now(), warnings: ['meta_too_large'] } }
+  }
+  // A code this half has never heard of. The contract says consumers ignore unknown
+  // codes, and "ignore" governs behaviour — the send must not fail, retry or drop —
+  // not logging, so the code is printed rather than treated as an error.
+  if (answerMode === 'warned-unknown') {
+    return { status: 200, body: { ok: true, id: Date.now(), warnings: ['some_future_code'] } }
+  }
+  // Elements that are not strings at all: the object form the contract considered and
+  // rejected, and a bare number. Printing them as they arrived is the rule, because
+  // reading a field off them would be coding for a shape nobody promised — and if a
+  // third-party collector named that field differently, extraction would silently
+  // yield nothing, which is the failure the field exists to prevent.
+  if (answerMode === 'warned-junk') {
+    return { status: 200, body: { ok: true, id: Date.now(), warnings: [{ code: 'meta_too_large', detail: 'meta was 9123 bytes' }, 42] } }
+  }
   const described = (typeof body?.message === 'string' && body.message !== '')
     || (typeof body?.code === 'string' && body.code !== '')
   // The accepted answer carries a server-side id this half never reads; a `send`
@@ -153,7 +173,7 @@ const MODEL = 'claude-opus-5-5'
  * that moves host or gains a hostname changes in exactly one place in the plugin and
  * one place in this test — which is what just happened.
  */
-const PUBLIC_COLLECTOR = 'http://185.75.189.247:8249/api/report'
+const PUBLIC_COLLECTOR = 'http://185.75.189.247:3789/api/report'
 
 /**
  * The aliases the collector accepts for a concept this plugin already names.
@@ -340,6 +360,11 @@ let stepCounter = 0
 /**
  * Open one attempt the way the harness does: an `agent/request` dispatch.
  *
+ * The payload is the shape the loop driver actually passes — `{ agent, turn, step,
+ * signal }`, with the agent injected by the scoped dispatch rather than by the call
+ * site — and `next()` resolves to the call configuration, which is what a listener
+ * is allowed to replace.
+ *
  * @param sessionId - the chat.
  * @param provider - the route the profile names for this request.
  * @param model - the model it names.
@@ -352,8 +377,36 @@ async function begin(sessionId, provider, model, turn = 1) {
     agent: { session: { id: sessionId } },
     turn,
     step: stepCounter,
+    signal: new AbortController().signal,
   }, async () => ({ provider, model }))
   return { sessionId, turn, step: stepCounter, resolved }
+}
+
+/**
+ * Dispatch one `agent/request-error` event, with any field overridable.
+ *
+ * The overrides are the point rather than a convenience: the harness's own retry
+ * plugin hedges with `payload?.code ?? payload?.failure?.code`, which is the harness
+ * saying it has not settled where the failure lives, and the agent scope is injected
+ * by the dispatcher rather than passed by the call site. A listener that assumes any
+ * one of those is the shape that silently reports nothing.
+ *
+ * @param attempt - the coordinates to fail under, as `begin()` returned them.
+ * @param failure - the failure document, `{ message, code }`.
+ * @param overrides - payload fields to replace or add.
+ * @returns a promise of the waterfall's answer, which must stay the harness's.
+ */
+function failEvent(attempt, failure, overrides = {}) {
+  return dispatch('agent/request-error', {
+    agent: { session: { id: attempt.sessionId } },
+    turn: attempt.turn,
+    step: attempt.step,
+    provider: attempt.resolved.provider,
+    failure,
+    retryPolicy: undefined,
+    signal: new AbortController().signal,
+    ...overrides,
+  }, async () => undefined)
 }
 
 /**
@@ -362,17 +415,10 @@ async function begin(sessionId, provider, model, turn = 1) {
  * @param attempt - the attempt handle.
  * @param failure - the harness failure document.
  * @param provider - the route to name, when it is not the one recorded.
- * @returns a promise of the waterfall's answer, which must stay the harness's.
+ * @returns a promise of the waterfall's answer.
  */
 function failInBand(attempt, failure, provider) {
-  return dispatch('agent/request-error', {
-    agent: { session: { id: attempt.sessionId } },
-    turn: attempt.turn,
-    step: attempt.step,
-    provider: provider ?? attempt.resolved.provider,
-    failure,
-    retryPolicy: undefined,
-  }, async () => undefined)
+  return failEvent(attempt, failure, provider === undefined ? {} : { provider })
 }
 
 /**
@@ -421,6 +467,17 @@ function succeed(attempt, source) {
  */
 async function summary() {
   return (await call('GET', '/dsh-rustvy/errors')).json
+}
+
+/**
+ * The total of one of the summary's count maps.
+ *
+ * @param counts - a kind-to-count object, or anything at all.
+ * @returns the sum, reading a missing or malformed map as zero.
+ */
+function sumOf(counts) {
+  if (typeof counts !== 'object' || counts === null) return 0
+  return Object.values(counts).reduce((sum, count) => sum + (Number.isFinite(count) ? count : 0), 0)
 }
 
 /**
@@ -574,6 +631,30 @@ check('a connect timeout is reported', timed.drained.reports.length === 1, JSON.
 check('a connect timeout is reported as one', timed.drained.reports[0]?.code === 'connect_timeout', String(timed.drained.reports[0]?.code))
 check('a connect timeout carries no status field', !('status' in (timed.drained.reports[0] ?? {})), JSON.stringify(timed.drained.reports[0]))
 
+// --- the watcher's own counters --------------------------------------------
+// Read here rather than later on purpose. The attempt sweep runs on every insert and
+// drops anything older than ten minutes, and every flush below moves the clock a
+// minute to keep the reporter's own allowance from being spent — so past about ten
+// phases a `tracked` delta stops meaning anything. This is the only point in the run
+// where the clock has barely moved and the count is exact.
+const trackedBefore = (await summary()).tracked
+check('the unattributed counter starts at zero', (await summary()).unattributed === 0, String((await summary()).unattributed))
+
+const trackedAttempt = await begin('sess-tracked', 'rustvy', MODEL)
+check('a recorded attempt is tracked', (await summary()).tracked === trackedBefore + 1, `${trackedBefore} → ${(await summary()).tracked}`)
+await tick()
+succeed(trackedAttempt)
+check('a completed step is released', (await summary()).tracked === trackedBefore, `${trackedBefore + 1} → ${(await summary()).tracked}`)
+
+const failingAttempt = await begin('sess-tracked-fail', 'rustvy', MODEL)
+await tick()
+await failInBand(failingAttempt, UPSTREAM_502)
+check('a reported failure keeps its attempt until the turn ends', (await summary()).tracked === trackedBefore + 1, String((await summary()).tracked))
+endTurn(failingAttempt, { kind: 'error', error: { message: IDLE_TIMEOUT, code: 'TIMEOUT' } })
+check('ending the turn releases the attempt', (await summary()).tracked === trackedBefore, `${trackedBefore + 1} → ${(await summary()).tracked}`)
+const trackedDrain = await drain()
+check('the turn end did not report that failure a second time', trackedDrain.reports.length === 1 && trackedDrain.reports[0]?.code === 'upstream_502', JSON.stringify(trackedDrain.reports))
+
 for (const [message, code, kind, status] of INFRA.slice(1)) {
   const { drained } = await reportOf({ message, code })
   check(`${kind} is reported`, drained.reports.length === 1, JSON.stringify(drained.reports))
@@ -653,6 +734,75 @@ check('a turn the user stopped is not reported', stoppedDrain.reports.length ===
 const settled = await begin('sess-settled', 'rustvy', MODEL)
 endTurn(settled, { kind: 'stop' })
 check('a turn that ended normally is not reported', (await drain()).reports.length === 0)
+
+// --- a failure this half cannot attribute -----------------------------------
+// The regression this whole section exists for: a real provider 502 on a real route
+// reached nobody, because the failure matched no recorded attempt and was dropped
+// without a word, while the summary read `failures: 1` and the only trace was a
+// stranger's harness log. Nothing here may be lost for want of a key.
+const beforeUnattributed = await summary()
+
+// The step the harness reports on the way back is not necessarily the step the
+// request went out on, and the turn usually is — so the turn is tried second.
+const mismatched = await begin('sess-mismatch', 'rustvy', MODEL)
+await tick()
+await failEvent(mismatched, UPSTREAM_502, { step: mismatched.step + 7 })
+const mismatchDrain = await drain()
+check('a failure whose step matches no attempt is still reported', mismatchDrain.reports.length === 1, JSON.stringify(mismatchDrain.reports))
+check('it keeps the model the attempt recorded', mismatchDrain.reports[0]?.model === MODEL, String(mismatchDrain.reports[0]?.model))
+check('it keeps the route the attempt recorded', mismatchDrain.reports[0]?.provider === 'rustvy', String(mismatchDrain.reports[0]?.provider))
+check('it keeps a real duration, not a zero one', Number.isInteger(mismatchDrain.reports[0]?.meta?.ms) && mismatchDrain.reports[0].meta.ms > 0, String(mismatchDrain.reports[0]?.meta?.ms))
+check('a turn-attributed failure is not counted as unattributed', (await summary()).unattributed === beforeUnattributed.unattributed, `${beforeUnattributed.unattributed} → ${(await summary()).unattributed}`)
+
+// A request this half never saw go out: the watcher missed `agent/request`, so there
+// is no attempt at all. The payload's own request context is what names the model —
+// read the way the harness's retry plugin reads it.
+await failEvent({ sessionId: 'sess-never-seen', turn: 9, step: 9, resolved: { provider: 'rustvy' } }, UPSTREAM_502, {
+  agent: { session: { id: 'sess-never-seen', requestContext: () => ({ model: MODEL }) } },
+})
+const neverSeen = await drain()
+check('a failure with no recorded attempt is still reported', neverSeen.reports.length === 1, JSON.stringify(neverSeen.reports))
+check('it takes the model from the payload own context', neverSeen.reports[0]?.model === MODEL, String(neverSeen.reports[0]?.model))
+check('it takes the route from the payload', neverSeen.reports[0]?.provider === 'rustvy', String(neverSeen.reports[0]?.provider))
+check('it reports a zero duration rather than a wrong one', neverSeen.reports[0]?.meta?.ms === 0, String(neverSeen.reports[0]?.meta?.ms))
+check('it is counted as unattributed', (await summary()).unattributed === beforeUnattributed.unattributed + 1, `${beforeUnattributed.unattributed} → ${(await summary()).unattributed}`)
+
+// No agent scope at all. The dispatcher injects it today, and nothing promises it
+// will: a strict read turns a numeric or absent id into a disabled failure path.
+const agentless = await begin('sess-agentless', 'rustvy', MODEL)
+await tick()
+await failEvent(agentless, UPSTREAM_503, { agent: undefined })
+const agentlessDrain = await drain()
+check('a failure with no agent scope is still reported', agentlessDrain.reports.length === 1, JSON.stringify(agentlessDrain.reports))
+check('it still names the route the payload carried', agentlessDrain.reports[0]?.provider === 'rustvy', String(agentlessDrain.reports[0]?.provider))
+check('it falls back to an unknown model', agentlessDrain.reports[0]?.model === 'unknown', String(agentlessDrain.reports[0]?.model))
+check('a second unattributed failure is counted too', (await summary()).unattributed === beforeUnattributed.unattributed + 2, String((await summary()).unattributed))
+
+const warnTexts = logs.filter(entry => entry[0] === 'warn' && String(entry[1]).includes('без совпавшей попытки')).map(entry => String(entry[1]))
+check('an unattributed failure is warned about, once', warnTexts.length === 1, `${warnTexts.length} warnings`)
+check('the warning names the coordinates it looked for', /sess-never-seen/u.test(warnTexts[0] ?? '') && warnTexts[0].includes('ход 9') && warnTexts[0].includes('шаг 9'), warnTexts[0] ?? '(none)')
+
+// The harness's own retry plugin reads `payload?.code ?? payload?.failure?.code`,
+// so a payload that puts the code at the top level must still classify: a `SERVER`
+// read as an `UNKNOWN` is a silent outage wearing a different label.
+const topLevel = await begin('sess-topcode', 'rustvy', MODEL)
+await tick()
+await failEvent(topLevel, { message: 'the model origin answered 502' }, { code: 'SERVER' })
+const topDrain = await drain()
+check('a code only at the top level still classifies', topDrain.reports.length === 1, JSON.stringify(topDrain.reports))
+check('it is read as the harness named it', topDrain.reports[0]?.meta?.harnessCode === 'SERVER', String(topDrain.reports[0]?.meta?.harnessCode))
+check('it is not read as UNKNOWN', topDrain.reports[0]?.meta?.harnessCode !== 'UNKNOWN', String(topDrain.reports[0]?.meta?.harnessCode))
+check('the status is still parsed out of the message', topDrain.reports[0]?.status === 502, String(topDrain.reports[0]?.status))
+
+// A failure whose code sits only in `failure` and whose message sits only at the top
+// level: the merge has to work in both directions.
+const splitShape = await begin('sess-split', 'rustvy', MODEL)
+await tick()
+await failEvent(splitShape, { code: 'TRANSPORT' }, { message: 'fetch failed: other side closed' })
+const splitDrain = await drain()
+check('a split payload still classifies', splitDrain.reports.length === 1, JSON.stringify(splitDrain.reports))
+check('the top-level message is used', String(splitDrain.reports[0]?.message ?? '').includes('other side closed'), String(splitDrain.reports[0]?.message))
+check('the nested code is used', splitDrain.reports[0]?.meta?.harnessCode === 'TRANSPORT', String(splitDrain.reports[0]?.meta?.harnessCode))
 
 // --- the success side ------------------------------------------------------
 // A success is an uptime sample, and it is what closes an outage — but it is not a
@@ -802,6 +952,31 @@ answerMode = 'auto'
 const afterBad = await reportOf(UPSTREAM_502, 'rustvy', 'sess-after-400')
 check('delivery works again after a refusal', afterBad.drained.reports.length === 1 && afterBad.answer.json?.lastError === null, JSON.stringify({ reports: afterBad.drained.reports.length, lastError: afterBad.answer.json?.lastError }))
 
+// --- an accepted report the collector warned about ---------------------------
+// The v2 contract answers 200 for a report whose `meta` exceeded 8 KB and was dropped
+// whole, with the reason in `warnings`. `send` reduces an answer to the facts the
+// reporter routes on, so without reading the warning the report would count as cleanly
+// sent and the loss of `meta.id` — the only field that answers "how many people saw
+// this" — would be silent, which is the one thing that clause exists to prevent.
+const beforeWarned = await summary()
+const warnedLines = () => logs.filter(entry => entry[0] === 'warn' && String(entry[1]).includes('предупреждением'))
+const warnsBefore = warnedLines().length
+answerMode = 'warned'
+const warned = await reportOf(UPSTREAM_502, 'rustvy', 'sess-warned')
+check('a warned report was still delivered', warned.drained.posts.length === 1 && warned.drained.posts[0]?.answer?.status === 200, JSON.stringify(warned.drained.posts[0]?.answer))
+check('a warned report still counts as sent', warned.answer.json?.sent === beforeWarned.sent + 1, `${beforeWarned.sent} → ${warned.answer.json?.sent}`)
+check('a warned report is neither dropped nor left queued', warned.answer.json?.dropped === beforeWarned.dropped && warned.answer.json?.queued === 0, JSON.stringify({ dropped: warned.answer.json?.dropped, queued: warned.answer.json?.queued }))
+check('the warning was said, once', warnedLines().length === warnsBefore + 1, `${warnsBefore} → ${warnedLines().length}`)
+check('the warning explains the code rather than printing it', String(warnedLines().at(-1)?.[1] ?? '').includes('8 КБ') && !String(warnedLines().at(-1)?.[1] ?? '').includes('meta_too_large'), String(warnedLines().at(-1)?.[1]))
+check('the warning names the report it was about', String(warnedLines().at(-1)?.[1] ?? '').includes('upstream_502'), String(warnedLines().at(-1)?.[1]))
+// Announced once per revision rather than per report: a client that consistently
+// oversizes `meta` would otherwise log on every flush, through a channel nobody
+// reading a chat can turn off.
+const warnedAgain = await reportOf(UPSTREAM_503, 'rustvy', 'sess-warned-2')
+check('a second warned report is delivered too', warnedAgain.drained.posts.length === 1 && warnedAgain.answer.json?.sent === warned.answer.json?.sent + 1, String(warnedAgain.answer.json?.sent))
+check('a second warned report is not announced again', warnedLines().length === warnsBefore + 1, `${warnsBefore + 1} → ${warnedLines().length}`)
+answerMode = 'auto'
+
 // --- the switch ------------------------------------------------------------
 const beforeSwitch = await summary()
 const switchedOff = await call('POST', '/dsh-rustvy/config', { collectErrors: false })
@@ -819,7 +994,62 @@ check('the self-test still answers with a summary when off', typeof offTest.json
 await call('POST', '/dsh-rustvy/config', { collectErrors: true })
 check('the switch turns back on', (await summary()).enabled === true)
 
-// --- the settings page's own two buttons -----------------------------------
+// --- every failure accounted for --------------------------------------------
+// One failure of each outcome, driven in sequence, and the identity that makes a
+// missed outage answerable: whatever the seam was handed is in exactly one bucket.
+// Before this, a failure that `classifyFailure` read as somebody's own problem was
+// dropped by design and moved no number at all, so "the gateway's error page said
+// «token»" and "the watcher is dead" looked identical from a browser.
+const bucketsBefore = await summary()
+
+const bucketReported = await begin('sess-bucket-1', 'rustvy', MODEL)
+await tick()
+await failInBand(bucketReported, UPSTREAM_502)
+// The same attempt again: the in-band seam already reported it, so this one is a
+// duplicate rather than a second outage.
+await failInBand(bucketReported, UPSTREAM_502)
+
+// A session this half never saw a request for.
+await failEvent({ sessionId: 'sess-bucket-none', turn: 3, step: 3, resolved: { provider: 'rustvy' } }, UPSTREAM_503)
+
+const bucketNonInfra = await begin('sess-bucket-2', 'rustvy', MODEL)
+await tick()
+await failInBand(bucketNonInfra, { message: 'the request was aborted', code: 'ABORTED' })
+
+const bucketForeign = await begin('sess-bucket-3', 'deepseek-official', MODEL)
+await tick()
+await failInBand(bucketForeign, UPSTREAM_502)
+
+await call('POST', '/dsh-rustvy/config', { collectErrors: false })
+const bucketOff = await begin('sess-bucket-4', 'rustvy', MODEL)
+await tick()
+await failInBand(bucketOff, UPSTREAM_502)
+await call('POST', '/dsh-rustvy/config', { collectErrors: true })
+
+const bucketsAfter = await summary()
+const moved = key => (bucketsAfter[key] ?? 0) - (bucketsBefore[key] ?? 0)
+check('six failures reached the seam', moved('seen') === 6, String(moved('seen')))
+check('one was reported against its attempt', moved('reported') === 1, String(moved('reported')))
+check('one was a duplicate of a reported attempt', moved('duplicates') === 1, String(moved('duplicates')))
+check('one was reported without an attempt', moved('unattributed') === 1, String(moved('unattributed')))
+check('one was dropped as somebody own problem', moved('ignoredNonInfra') === 1, String(moved('ignoredNonInfra')))
+check('one was dropped as a foreign route', moved('ignoredRoute') === 1, String(moved('ignoredRoute')))
+check('one was dropped because collection was off', moved('ignoredCollect') === 1, String(moved('ignoredCollect')))
+check('none fell through the buckets', moved('ignoredInternal') === 0, String(moved('ignoredInternal')))
+const bucketSum = moved('reported') + moved('unattributed') + moved('ignoredNonInfra') + moved('ignoredRoute') + moved('ignoredCollect') + moved('duplicates') + moved('ignoredInternal')
+check('every failure the seam saw is in exactly one bucket', moved('seen') === bucketSum, `seen ${moved('seen')} vs buckets ${bucketSum}`)
+check('the non-infra drop named the classification that dropped it', bucketsAfter.lastKind === 'aborted' && bucketsAfter.lastCode === 'ABORTED', JSON.stringify({ lastKind: bucketsAfter.lastKind, lastCode: bucketsAfter.lastCode }))
+check('the histogram counted the drop that moved the last value', moved('ignoredNonInfra') === sumOf(bucketsAfter.ignoredByKind) - sumOf(bucketsBefore.ignoredByKind), `${sumOf(bucketsBefore.ignoredByKind)} → ${sumOf(bucketsAfter.ignoredByKind)}`)
+check('the histogram names the kind that dropped it', (bucketsAfter.ignoredByKind?.aborted ?? 0) === (bucketsBefore.ignoredByKind?.aborted ?? 0) + 1, JSON.stringify(bucketsAfter.ignoredByKind))
+check('the histogram totals the non-infra drops', sumOf(bucketsAfter.ignoredByKind) === bucketsAfter.ignoredNonInfra, `${sumOf(bucketsAfter.ignoredByKind)} vs ${bucketsAfter.ignoredNonInfra}`)
+const bucketDrain = await drain()
+check('only the two reported failures went out', bucketDrain.reports.length === 2, JSON.stringify(bucketDrain.reports.map(one => one?.code)))
+check('the four dropped ones went nowhere', bucketDrain.reports.every(one => one?.code === 'upstream_502' || one?.code === 'upstream_503'), JSON.stringify(bucketDrain.reports.map(one => one?.code)))
+
+// --- the hand-run diagnostic ------------------------------------------------
+// The settings page no longer carries a button for this, so the route is a
+// diagnostic somebody runs by hand — which is exactly why it must not leave a mark
+// on a public dashboard.
 const beforeSelfTest = await summary()
 const tested = await call('POST', '/dsh-rustvy/errors', { action: 'test' })
 check('the self-test answers 200', tested.status === 200, `status ${tested.status}`)
@@ -828,7 +1058,14 @@ check('the self-test reports itself sent', tested.json?.sent === beforeSelfTest.
 check('the self-test leaves nothing queued', tested.json?.queued === 0, String(tested.json?.queued))
 const testPost = collected[collected.length - 1]
 check('the self-test delivered one flat report', typeof testPost?.body === 'object' && testPost.body !== null && testPost.body.events === undefined, JSON.stringify(testPost?.body ?? null).slice(0, 240))
-check('the self-test report is labelled', testPost?.body?.model === 'rustvy-selftest' && testPost?.body?.code === 'test', JSON.stringify(testPost?.body ?? null).slice(0, 240))
+// The collector seeds its model universe from its own config and then adds any model
+// id it sees in a report, so a self-test that named one invented a row on a public
+// dashboard and left it there for the length of its retention. It must name nothing
+// and land in the bucket every unidentified report already shares.
+check('the self-test invents no model', testPost?.body?.model === 'unknown', String(testPost?.body?.model))
+check('the self-test invents no route', testPost?.body?.provider === '', String(testPost?.body?.provider))
+check('the self-test is still identifiable by its code', testPost?.body?.code === 'test', String(testPost?.body?.code))
+check('the self-test still carries the harness code beside it', testPost?.body?.meta?.harnessCode === 'TEST', String(testPost?.body?.meta?.harnessCode))
 check('the self-test report carries the settings page sentence', testPost?.body?.message === 'проверочное событие со страницы настроек плагина', String(testPost?.body?.message))
 check('the self-test report is stamped now', Math.abs((testPost?.body?.ts ?? 0) - Date.now()) < 60_000, String(testPost?.body?.ts))
 
@@ -894,17 +1131,88 @@ check('the default is what the settings file would carry', defaultEndpoint?.conf
 check('collection defaults to on', defaultEndpoint?.collect === true, String(defaultEndpoint?.collect))
 rmSync(defaultProfile, { recursive: true, force: true })
 
+// --- the histogram is bounded -----------------------------------------------
+// A failure storm produces many kinds, and an unbounded map would be the one part of
+// this summary that could grow for the life of the process. Driven well past the cap
+// on purpose, with `http_NNN` because that is the open-ended family a real gateway
+// can emit — one kind per status it happens to answer with.
+const beforeHistogram = await summary()
+const kindsBefore = Object.keys(beforeHistogram.ignoredByKind ?? {}).length
+// 430-459 rather than 400-429: `./errors.js` calls 404 and 408 infrastructure by
+// design — a gateway with no route for the model it was asked to route, and a request
+// that never finished, are both facts about the service rather than about the caller
+// — so a range including them mixes reported failures into what is meant to be a run
+// of drops, and the arithmetic below would measure two things at once.
+for (let status = 430; status < 460; status += 1) {
+  const capped = await begin(`sess-cap-${status}`, 'rustvy', MODEL)
+  await failInBand(capped, { message: `the origin answered ${status}`, code: 'SERVER' })
+}
+const afterHistogram = await summary()
+const kinds = Object.keys(afterHistogram.ignoredByKind ?? {})
+check('the histogram grew while there was room', kinds.length > kindsBefore, `${kindsBefore} → ${kinds.length}`)
+check('the histogram stops at its cap plus the overflow bucket', kinds.length === 25, `${kinds.length} keys`)
+check('what did not fit is folded into one overflow bucket', Number.isInteger(afterHistogram.ignoredByKind?.other) && afterHistogram.ignoredByKind.other >= 1, String(afterHistogram.ignoredByKind?.other))
+check('every drop was still counted', afterHistogram.ignoredNonInfra === beforeHistogram.ignoredNonInfra + 30, `${beforeHistogram.ignoredNonInfra} → ${afterHistogram.ignoredNonInfra}`)
+check('the histogram totals the drops even past the cap', sumOf(afterHistogram.ignoredByKind) === afterHistogram.ignoredNonInfra, `${sumOf(afterHistogram.ignoredByKind)} vs ${afterHistogram.ignoredNonInfra}`)
+check('a rare kind survived the cap rather than being evicted', kinds.some(kind => /^http_4/u.test(kind)), JSON.stringify(kinds.slice(0, 6)))
+check('none of the capped failures reached the collector', (await drain()).reports.length === 0)
+
+// The same identity over the whole run rather than over one phase: every failure
+// this revision was handed, from the first shape check to the last, is in exactly
+// one bucket. Checked before the reload below, which resets them by design.
+const whole = await summary()
+const wholeSum = whole.reported + whole.unattributed + whole.ignoredNonInfra + whole.ignoredRoute + whole.ignoredCollect + whole.duplicates + whole.ignoredInternal
+check('every failure this revision saw is accounted for', whole.seen === wholeSum, `seen ${whole.seen} vs ${wholeSum}: ${JSON.stringify({ reported: whole.reported, unattributed: whole.unattributed, ignoredNonInfra: whole.ignoredNonInfra, ignoredRoute: whole.ignoredRoute, ignoredCollect: whole.ignoredCollect, duplicates: whole.duplicates, ignoredInternal: whole.ignoredInternal })}`)
+check('nothing fell through the buckets all run', whole.ignoredInternal === 0, String(whole.ignoredInternal))
+check('the histogram totals the non-infra drops all run', sumOf(whole.ignoredByKind) === whole.ignoredNonInfra, `${sumOf(whole.ignoredByKind)} vs ${whole.ignoredNonInfra}`)
+check('the drop counters are on the summary the page reads', ['seen', 'reported', 'ignoredNonInfra', 'ignoredRoute', 'ignoredCollect', 'duplicates', 'ignoredByKind', 'lastCode', 'lastKind'].every(key => key in whole), JSON.stringify(Object.keys(whole)))
+
 // --- a reload keeps the identity -------------------------------------------
 const installId = (await summary()).installId
 await handle.dispose()
 check('dispose released the route', route === null)
 check('dispose released every listener', listeners.size === 0, JSON.stringify([...listeners.keys()]))
 handle = await start(ctx, {})
+const reloaded = await summary()
+check('a reload starts the watcher counters over', reloaded.seen === 0 && reloaded.reported === 0 && reloaded.unattributed === 0 && reloaded.tracked === 0, JSON.stringify({ seen: reloaded.seen, reported: reloaded.reported, unattributed: reloaded.unattributed, tracked: reloaded.tracked }))
+check('a reload clears the last dropped classification', reloaded.lastCode === null && reloaded.lastKind === null, JSON.stringify({ lastCode: reloaded.lastCode, lastKind: reloaded.lastKind }))
+check('a reload clears the histogram', sumOf(reloaded.ignoredByKind) === 0 && Object.keys(reloaded.ignoredByKind ?? {}).length === 0, JSON.stringify(reloaded.ignoredByKind))
 check('a second mount reinstalls the watchers', (listeners.get('agent/request') ?? []).length === 2 && (listeners.get('agent/request-error') ?? []).length === 1 && (listeners.get('session/event') ?? []).length === 1)
 const remounted = await call('GET', '/dsh-rustvy/state')
 check('a second mount reuses the install id', remounted.json?.errorReport?.installId === installId, `${installId} → ${remounted.json?.errorReport?.installId}`)
 check('the identity on disk is unchanged', JSON.parse(readFileSync(join(STATE, 'install.json'), 'utf8'))?.id === installId)
 check('a second mount reads the queue back', Number.isInteger(remounted.json?.errorReport?.queued), String(remounted.json?.errorReport?.queued))
+
+// The announcement is once per *revision*, so a reload re-arms it — and this is also
+// where an unknown code gets exercised, since the known one was already announced by
+// the revision above.
+const warnsAfterReload = warnedLines().length
+answerMode = 'warned-unknown'
+const unknownWarning = await reportOf(UPSTREAM_502, 'rustvy', 'sess-warned-unknown')
+check('a warned report after a reload is announced again', warnedLines().length === warnsAfterReload + 1, `${warnsAfterReload} → ${warnedLines().length}`)
+check('an unknown code is passed through rather than dropped', String(warnedLines().at(-1)?.[1] ?? '').includes('some_future_code'), String(warnedLines().at(-1)?.[1]))
+check('an unknown code still counts as sent', unknownWarning.answer.json?.sent === reloaded.sent + 1, `${reloaded.sent} → ${unknownWarning.answer.json?.sent}`)
+answerMode = 'auto'
+await handle.dispose()
+
+// A third revision, for the case the contract is most specific about: elements that are
+// not strings at all. Printing them as they arrived is the rule; counting them instead
+// would throw away content the collector did send, and parsing them would mean coding
+// for a shape the contract considered and rejected.
+handle = await start(ctx, {})
+const beforeJunk = await summary()
+const warnsBeforeJunk = warnedLines().length
+answerMode = 'warned-junk'
+const junkWarning = await reportOf(UPSTREAM_502, 'rustvy', 'sess-warned-junk')
+check('a warning this half cannot read is still announced', warnedLines().length === warnsBeforeJunk + 1, `${warnsBeforeJunk} → ${warnedLines().length}`)
+const junkLine = String(warnedLines().at(-1)?.[1] ?? '')
+// The detail text could only reach the log by printing the object as it arrived: this
+// half never looks at a `detail` field, and never will.
+check('an unrecognized element is printed as it arrived', junkLine.includes('meta was 9123 bytes'), junkLine)
+check('it is printed as text rather than translated', junkLine.includes('{"code"'), junkLine)
+check('a non-string element is printed too', junkLine.includes('42'), junkLine)
+check('an unrecognized warning still counts as sent', junkWarning.answer.json?.sent === beforeJunk.sent + 1, `${beforeJunk.sent} → ${junkWarning.answer.json?.sent}`)
+answerMode = 'auto'
 await handle.dispose()
 
 collector.close()

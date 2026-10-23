@@ -21,6 +21,9 @@ process.env.DSH_PROFILE_DIR = PROFILE
 /** Every request the fake collector saw, in order. */
 const seen = []
 
+/** The exact payload the collector served for each range, for the mirror check. */
+const servedByRange = new Map()
+
 /** Which fixture the collector answers with. */
 let fixture = 'green'
 
@@ -53,44 +56,113 @@ const MODEL_IDS = [
  * unidentifiable, repair everything else — is only worth trusting if something
  * exercises it.
  */
-const ID_LESS = { name: 'no id', errors: 0, uptime: 100, status: 'up', buckets: [], events: [], lastError: null }
-
-/** The model that is down in the populated fixture, and the one that is slow. */
-const DOWN = 'gpt-6.1-sol'
-const SLOW = 'gemini-3.5-flash'
+const ID_LESS = { name: 'no id', errors: 0, installs: 0, status: 'ok', firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: null, uptime: 100, buckets: [], events: [], lastError: null }
 
 /**
- * One bucket strip, as the collector sends it: exactly 48 buckets whose width
- * changes meaning with the range.
+ * The install ids the populated fixture reports breadth from.
  *
- * @param width - the milliseconds one bucket covers.
- * @param counts - one count for every bucket, or a number to fill the strip with.
- * @returns the 48 buckets.
+ * Three distinct ones, because breadth is the signal the v2 contract is built on:
+ * one install reporting errors is probably that install's network, key or region,
+ * while three is the provider failing. Anonymous UUIDs, the same kind of value a
+ * real report carries in `meta.id`.
  */
-function strip(width, counts) {
+const INSTALL_A = 'd66d4114-3f21-4d0b-9c2a-7f1e8a5b6c01'
+const INSTALL_B = 'a91c07e2-5b64-4f18-8d3c-2e7f4a190b65'
+const INSTALL_C = '4f0a1c9e-88d2-4b71-a6e5-0c3d92f71e48'
+
+/**
+ * The coverage denominator: distinct installs that sent anything over 30 days.
+ *
+ * Chosen rather than observed, like the model census — but it is what makes
+ * `affectedPct` a share of people rather than a share of requests, so it has to be
+ * non-zero for the fixture to exercise the division at all.
+ */
+const REFERENCE_INSTALLS = 47
+
+/**
+ * A share of the coverage denominator, as the contract defines `affectedPct`.
+ *
+ * @param installs - how many distinct installs were affected.
+ * @returns the percentage to one decimal, or `null` when there is no denominator.
+ */
+function pct(installs) {
+  if (REFERENCE_INSTALLS === 0) return null
+  return Math.round((installs / REFERENCE_INSTALLS) * 1000) / 10
+}
+
+/** The model that is down in the populated fixture, and the ones with narrower trouble. */
+const DOWN = 'gpt-6.1-sol'
+const ISSUES = 'gemini-3.5-flash'
+const SINGLE = 'grok-5'
+
+/**
+ * The windows the contract defines, with the bucket count and width for each.
+ *
+ * The count differs by design — an hour is 60 one-minute buckets and every longer
+ * window is 48 — which is exactly why a strip must be scaled by the length that
+ * arrived rather than by an expected 48, and why this table exists instead of a
+ * constant. Read from the contract rather than from what today's collector answers,
+ * so a range this suite has not seen yet gets a sane shape instead of a wrong one.
+ */
+const WINDOWS = Object.freeze({
+  '1h': { buckets: 60, width: 60_000 },
+  '24h': { buckets: 48, width: 1_800_000 },
+  '7d': { buckets: 48, width: 12_600_000 },
+  '30d': { buckets: 48, width: 54_000_000 },
+})
+
+/**
+ * The bucket geometry for one range.
+ *
+ * @param range - the window asked for.
+ * @returns `{ buckets, width }`, falling back to the day's shape for an unknown range.
+ */
+function windowOf(range) {
+  return WINDOWS[range] ?? WINDOWS[DEFAULT_RANGE]
+}
+
+/**
+ * One bucket strip, as the collector sends it.
+ *
+ * @param range - the window the strip covers.
+ * @param counts - one count for every bucket, or a number to fill the strip with.
+ * @returns the buckets for that range.
+ */
+function strip(range, counts) {
+  const { buckets, width } = windowOf(range)
   const now = Date.now()
-  return Array.from({ length: 48 }, (_, index) => ({
-    from: now - (48 - index) * width,
+  return Array.from({ length: buckets }, (_, index) => ({
+    from: now - (buckets - index) * width,
     count: typeof counts === 'number' ? counts : (counts[index] ?? 0),
   }))
 }
 
 /**
- * One model row, all green unless overridden.
+ * One model row, all quiet unless overridden.
+ *
+ * Carries the contract's v2 fields — `installs`, `firstAt`, `lastAt`,
+ * `minutesSinceLast`, `affectedPct` — and keeps the legacy `uptime`, because the
+ * collector sends both and a mirror that quietly lost the new ones would hand the
+ * panel a row it cannot draw breadth or recency from.
  *
  * @param id - the model id.
- * @param overrides - the fields that differ from a healthy row.
- * @param width - the bucket width for this range.
+ * @param overrides - the fields that differ from a quiet row.
+ * @param range - the window the row describes.
  * @returns the row.
  */
-function row(id, overrides, width) {
+function row(id, overrides, range) {
   return {
     id,
     name: id,
     errors: 0,
+    installs: 0,
+    status: 'ok',
+    firstAt: null,
+    lastAt: null,
+    minutesSinceLast: null,
+    affectedPct: null,
     uptime: 100,
-    status: 'up',
-    buckets: strip(width, 0),
+    buckets: strip(range, 0),
     events: [],
     lastError: null,
     ...overrides,
@@ -98,22 +170,27 @@ function row(id, overrides, width) {
 }
 
 /**
- * The collector's answer.
+ * The collector's answer, in the v2 shape.
  *
- * Two shapes, because production only ever answers one of them: the aggregation
- * currently ignores every report it accepts, so `total` is 0 and every model is
- * green. The populated shape is known only from the monitor page's own JavaScript,
- * and it is the one worth testing — a panel that has only ever rendered an
- * all-green answer has never had to draw an event, a `lastError`, or a bucket with
- * anything in it.
+ * Two variants, because the deployed collector only ever produces the quiet one: its
+ * aggregation ignores every report it accepts, so `total` is 0 and every model is
+ * green. The populated variant is the one worth testing — a panel that has only ever
+ * rendered a quiet answer has never had to draw an event, a `lastError`, a bucket
+ * with anything in it, or a breadth count.
+ *
+ * The numbers are internally consistent with the contract's status rule rather than
+ * arbitrary: `down` needs three installs and a last error inside five minutes,
+ * `issues` needs two or more installs, `single` exactly one. A fixture that claimed
+ * `down` with one install would pass through the mirror fine and prove nothing about
+ * the shape a real collector emits.
  *
  * @param mode - `'green'` or `'populated'`.
  * @param range - the window asked for.
  * @returns the payload.
  */
 function viewFixture(mode, range) {
-  const width = range === '24h' ? 1_800_000 : range === '7d' ? 12_600_000 : 54_000_000
   const at = Date.now()
+  const { buckets } = windowOf(range)
   if (mode === 'green') {
     return {
       generatedAt: at,
@@ -121,39 +198,96 @@ function viewFixture(mode, range) {
       storage: 'mongo',
       healthy: true,
       total: 0,
-      summary: { totalModels: MODEL_IDS.length, operational: MODEL_IDS.length, slow: 0, down: 0, uptime: 100, totalErrors: 0 },
+      installs: { window: 0, reference: REFERENCE_INSTALLS },
+      summary: {
+        totalModels: MODEL_IDS.length,
+        operational: MODEL_IDS.length,
+        single: 0,
+        issues: 0,
+        down: 0,
+        slow: 0,
+        uptime: 100,
+        totalErrors: 0,
+        installsAffected: 0,
+        affectedPct: 0,
+      },
       byCode: [],
-      models: [...MODEL_IDS.map(id => row(id, {}, width)), ID_LESS],
+      models: [...MODEL_IDS.map(id => row(id, {}, range)), ID_LESS],
     }
   }
   return {
     generatedAt: at,
     range,
     storage: 'mongo',
+    // `healthy` is "no errors in this window", not storage health, so a populated
+    // answer is the case where the collector worked and has something to show.
     healthy: false,
-    total: 37,
-    summary: { totalModels: MODEL_IDS.length, operational: 10, slow: 1, down: 1, uptime: 97, totalErrors: 37 },
+    total: 39,
+    installs: { window: 3, reference: REFERENCE_INSTALLS },
+    summary: {
+      totalModels: MODEL_IDS.length,
+      operational: MODEL_IDS.length - 3,
+      single: 1,
+      issues: 1,
+      down: 1,
+      slow: 1,
+      uptime: 97,
+      totalErrors: 39,
+      installsAffected: 3,
+      affectedPct: pct(3),
+    },
     byCode: [
       { code: 'upstream_502', count: 22 },
       { code: 'connect_timeout', count: 9 },
       { code: 'upstream_503', count: 6 },
+      { code: 'dns', count: 2 },
     ],
     models: MODEL_IDS.map(id => {
       if (id === DOWN) {
         return row(id, {
           errors: 31,
-          uptime: 74,
+          installs: 3,
           status: 'down',
-          buckets: strip(width, 1),
+          firstAt: at - 3 * 60 * 60 * 1000,
+          lastAt: at - 4 * 60 * 1000,
+          minutesSinceLast: 4,
+          affectedPct: pct(3),
+          uptime: 74,
+          buckets: strip(range, 1),
           events: [
-            { t: at - 900_000, code: 'upstream_502', status: 502, message: 'upstream_502: the gateway could not reach the model origin', plugin: 'dsh-rustvy' },
-            { t: at - 600_000, code: 'connect_timeout', message: 'Connect Timeout Error (attempted address: rustvy.xyz:443, timeout: 10000ms)', plugin: 'dsh-rustvy' },
+            { t: at - 900_000, code: 'upstream_502', status: 502, message: 'upstream_502: the gateway could not reach the model origin', plugin: 'dsh-rustvy', id: INSTALL_A },
+            { t: at - 600_000, code: 'connect_timeout', message: 'Connect Timeout Error (attempted address: rustvy.xyz:443, timeout: 10000ms)', plugin: 'dsh-rustvy', id: INSTALL_B },
           ],
-          lastError: { t: at - 60_000, code: 'upstream_503', message: 'upstream_503: the model origin is unavailable' },
-        }, width)
+          lastError: { t: at - 4 * 60 * 1000, code: 'upstream_503', message: 'upstream_503: the model origin is unavailable', status: 503, plugin: 'dsh-rustvy', id: INSTALL_C },
+        }, range)
       }
-      if (id === SLOW) return row(id, { errors: 6, uptime: 99, status: 'slow' }, width)
-      return row(id, {}, width)
+      if (id === ISSUES) {
+        return row(id, {
+          errors: 6,
+          installs: 2,
+          status: 'issues',
+          firstAt: at - 40 * 60 * 1000,
+          lastAt: at - 12 * 60 * 1000,
+          minutesSinceLast: 12,
+          affectedPct: pct(2),
+          uptime: 99,
+          buckets: strip(range, [0, 0, 1, 0, 2, 0, 0, 3]),
+        }, range)
+      }
+      if (id === SINGLE) {
+        return row(id, {
+          errors: 2,
+          installs: 1,
+          status: 'single',
+          firstAt: at - 20 * 60 * 1000,
+          lastAt: at - 20 * 60 * 1000,
+          minutesSinceLast: 20,
+          affectedPct: pct(1),
+          uptime: 99,
+          buckets: strip(range, [0, 0, 2]),
+        }, range)
+      }
+      return row(id, {}, range)
     }),
   }
 }
@@ -183,13 +317,20 @@ const collector = createServer((request, response) => {
     return
   }
   const range = url.searchParams.get('range')
-  if (range !== '24h' && range !== '7d' && range !== '30d') {
+  if (!isUptimeRange(range)) {
+    // The real collector's own sentence, with the whitelist interpolated rather than
+    // spelled out, so it tracks whatever lib/uptime.js accepts.
     response.writeHead(400, { 'content-type': 'application/json' })
-    response.end('{"error":"range must be one of: 24h, 7d, 30d"}')
+    response.end(JSON.stringify({ error: `range must be one of: ${UPTIME_RANGES.join(', ')}` }))
     return
   }
   response.writeHead(200, { 'content-type': 'application/json' })
-  response.end(JSON.stringify(viewFixture(fixture, range)))
+  // Recorded per range rather than regenerated for the comparison: the fixture stamps
+  // every bucket with `Date.now()`, so a second call produces a different document and
+  // a mirror check against it would fail on timestamps instead of on shape.
+  const payload = viewFixture(fixture, range)
+  servedByRange.set(range, payload)
+  response.end(JSON.stringify(payload))
 })
 await new Promise(resolve => collector.listen(0, '127.0.0.1', resolve))
 
@@ -241,7 +382,35 @@ function advance(ms) {
 }
 
 const { start, build } = await import('../lib/host.js')
-const { UPTIME_RANGES, bucketStats } = await import('../lib/uptime.js')
+// `statusOf`, `uptimeOf` and `normalizeUptimeView` are used as the oracle for what
+// this half must deliver, rather than the suite restating their rules: the status
+// vocabulary and the bucket geometry both move with the contract, and a test that
+// hard-codes `up`/`slow`/`down` or a 48-bucket strip would break the moment they do
+// — which is exactly what contract v2 does. Asserting against their own functions
+// keeps this suite honest about the one thing that is this half's job: that the
+// normalized view reaches the browser untouched.
+const { UPTIME_RANGES, DEFAULT_RANGE, isUptimeRange, normalizeUptimeView, bucketStats, statusOf, uptimeOf } = await import('../lib/uptime.js')
+
+/**
+ * Two windows other than the default, taken from the whitelist rather than named.
+ *
+ * So the suite exercises whatever the contract defines: three windows today, four
+ * once `1h` lands, and the hour's 60 one-minute buckets start being covered by these
+ * very assertions with no edit here. A range named literally would silently stop
+ * testing the interesting one.
+ */
+const OTHER_RANGES = UPTIME_RANGES.filter(range => range !== DEFAULT_RANGE)
+const RANGE_B = OTHER_RANGES[0]
+const RANGE_C = OTHER_RANGES[1] ?? OTHER_RANGES[0]
+
+/**
+ * A range that is never in the whitelist, under any version of the contract.
+ *
+ * Deliberately not `1h`: that is a valid window under contract v2, and a test that
+ * asserted its rejection would break the moment lib/uptime.js caught up — which is
+ * the failure this file is being rewritten to avoid.
+ */
+const BAD_RANGE = '15m'
 
 const credentials = {
   async resolve() { return undefined },
@@ -334,9 +503,21 @@ function call(method, path, body) {
 }
 
 const results = []
+/**
+ * Record one assertion.
+ *
+ * A failure's detail is truncated hard, because several of these assertions stringify
+ * a whole view — a populated one is tens of kilobytes of buckets — and a failure that
+ * floods the log with JSON hides the line a reader actually needs.
+ *
+ * @param label - what is being claimed.
+ * @param ok - whether it held.
+ * @param detail - shown beside a failure.
+ */
 function check(label, ok, detail) {
-  results.push({ label, ok: ok === true, detail })
-  console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${detail === undefined ? '' : `  — ${detail}`}`)
+  const shown = detail === undefined ? '' : `  — ${String(detail).slice(0, 400)}`
+  results.push({ label, ok: ok === true, detail: shown })
+  console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${shown}`)
 }
 
 /**
@@ -368,10 +549,10 @@ const MONITOR = `http://127.0.0.1:${collector.address().port}/`
 // --- derivation ------------------------------------------------------------
 const first = await view()
 check('the panel answers 200', first.answer.status === 200, `status ${first.answer.status}`)
-check('it asked the collector for the derived view path', first.upstream.length === 1 && first.upstream[0].url === '/api/view?range=24h', JSON.stringify(first.upstream))
+check('it asked the collector for the derived view path', first.upstream.length === 1 && first.upstream[0].url === `/api/view?range=${DEFAULT_RANGE}`, JSON.stringify(first.upstream))
 check('it asked with GET', first.upstream[0]?.method === 'GET', String(first.upstream[0]?.method))
 check('the answer is a view', first.answer.json?.ok === true, first.answer.text.slice(0, 200))
-check('the answer names its range', first.answer.json?.range === '24h', String(first.answer.json?.range))
+check('the answer names its range', first.answer.json?.range === DEFAULT_RANGE, String(first.answer.json?.range))
 check('the answer is not stale', first.answer.json?.stale === false, String(first.answer.json?.stale))
 check('the answer carries no host-side error', first.answer.json?.error === undefined, String(first.answer.json?.error))
 check('the answer links the monitor page', first.answer.json?.monitorUrl === MONITOR, String(first.answer.json?.monitorUrl))
@@ -389,19 +570,32 @@ check('every model arrives', (first.answer.json?.models ?? []).length === MODEL_
 check('a model the collector sent with no id never reaches the panel', (first.answer.json?.models ?? []).every(model => typeof model?.id === 'string' && model.id !== ''), JSON.stringify((first.answer.json?.models ?? []).map(model => model?.id)))
 check('the models keep the order the collector sent them in', (first.answer.json?.models ?? []).map(model => model.id).join(',') === MODEL_IDS.join(','), JSON.stringify((first.answer.json?.models ?? []).map(model => model?.id)))
 check('every model id survives', MODEL_IDS.every(id => modelOf(first.answer, id) !== undefined), JSON.stringify((first.answer.json?.models ?? []).map(model => model?.id)))
-check('every model is up', (first.answer.json?.models ?? []).every(model => model.status === 'up'), JSON.stringify([...new Set((first.answer.json?.models ?? []).map(model => model.status))]))
+check('every model is in the quiet state', (first.answer.json?.models ?? []).every(model => model.status === statusOf({ status: 'ok' })), JSON.stringify([...new Set((first.answer.json?.models ?? []).map(model => model.status))]))
 check('no model carries an event', (first.answer.json?.models ?? []).every(model => Array.isArray(model.events) && model.events.length === 0))
 check('no model carries a last error', (first.answer.json?.models ?? []).every(model => model.lastError === null))
 // `buckets` is not padded to a fixed length by the normalizer, so the count is
-// asserted through `bucketStats` — the helper a client scales a strip with — rather
-// than against a number this test's own fixture happens to send.
+// asserted through `bucketStats` — the helper a client scales a strip with — against
+// the geometry the contract gives this range rather than against a hard-coded 48. An
+// hour is 60 one-minute buckets and every longer window is 48.
 const greenStrip = modelOf(first.answer, MODEL_IDS[0])?.buckets
 const greenStats = bucketStats(greenStrip)
-check('every model keeps the bucket strip it was sent', (first.answer.json?.models ?? []).every(model => bucketStats(model.buckets).count === 48), String(greenStats.count))
+check('every model keeps the bucket strip it was sent', (first.answer.json?.models ?? []).every(model => bucketStats(model.buckets).count === windowOf(DEFAULT_RANGE).buckets), String(greenStats.count))
 check('every bucket is a from and a count', (greenStrip ?? []).every(bucket => Number.isInteger(bucket.from) && Number.isInteger(bucket.count) && Object.keys(bucket).length === 2), JSON.stringify(greenStrip?.[0]))
 check('an all-green strip sums to no errors', greenStats.errors === 0, String(greenStats.errors))
 check('an all-green strip still scales', greenStats.max === 1, String(greenStats.max))
 check('a strip keeps its outer stamps', Number.isInteger(greenStats.first) && Number.isInteger(greenStats.last) && greenStats.last > greenStats.first, `${greenStats.first} → ${greenStats.last}`)
+
+// --- the mirror is faithful --------------------------------------------------
+// The assertion this suite exists for, and the reason it needs no update when the
+// contract's vocabulary or field list moves: the answer must be exactly what the
+// normalizer produced from what the collector sent, plus the three fields this half
+// adds. Anything the normalizer carries — today's nine model fields, or v2's
+// `installs`, `firstAt`, `lastAt`, `minutesSinceLast` and `affectedPct` once
+// lib/uptime.js grows them — is covered by this one comparison, and anything this
+// half added, dropped, renamed or reordered breaks it.
+const greenFixture = servedByRange.get(DEFAULT_RANGE)
+const { fetchedAt: _greenAt, stale: _greenStale, monitorUrl: _greenMonitor, ...greenMirrored } = first.answer.json ?? {}
+check('the quiet answer is the normalized fixture and nothing else', JSON.stringify(greenMirrored) === JSON.stringify(normalizeUptimeView(greenFixture)), JSON.stringify({ answer: Object.keys(greenMirrored), normalized: Object.keys(normalizeUptimeView(greenFixture) ?? {}) }))
 
 // --- the cache -------------------------------------------------------------
 const cached = await view()
@@ -411,24 +605,34 @@ check('a cached read is not marked stale', cached.answer.json?.stale === false, 
 
 // --- the populated answer, on a range of its own ---------------------------
 fixture = 'populated'
-const week = await view('7d')
-check('a second range is fetched separately', week.upstream.length === 1 && week.upstream[0].url === '/api/view?range=7d', JSON.stringify(week.upstream))
-check('a second range answers for itself', week.answer.json?.range === '7d', String(week.answer.json?.range))
-check('a populated window counts its errors', week.answer.json?.total === 37, String(week.answer.json?.total))
-check('a populated window lists its codes', (week.answer.json?.byCode ?? []).length === 3 && week.answer.json.byCode[0].code === 'upstream_502', JSON.stringify(week.answer.json?.byCode))
+const week = await view(RANGE_B)
+check('a second range is fetched separately', week.upstream.length === 1 && week.upstream[0].url === `/api/view?range=${RANGE_B}`, JSON.stringify(week.upstream))
+check('a second range answers for itself', week.answer.json?.range === RANGE_B, String(week.answer.json?.range))
+check('a populated window counts its errors', week.answer.json?.total === 39, String(week.answer.json?.total))
+check('a populated window lists its codes', (week.answer.json?.byCode ?? []).length === 4 && week.answer.json.byCode[0].code === 'upstream_502', JSON.stringify(week.answer.json?.byCode))
 check('a populated window reports itself unhealthy', week.answer.json?.healthy === false, String(week.answer.json?.healthy))
-check('the summary counts the down model', week.answer.json?.summary?.down === 1 && week.answer.json?.summary?.slow === 1 && week.answer.json?.summary?.operational === 10, JSON.stringify(week.answer.json?.summary))
-check('the summary carries the error total', week.answer.json?.summary?.totalErrors === 37, String(week.answer.json?.summary?.totalErrors))
+check('the summary counts the down model', week.answer.json?.summary?.down === 1 && week.answer.json?.summary?.operational === MODEL_IDS.length - 3, JSON.stringify(week.answer.json?.summary))
+check('the summary carries the error total', week.answer.json?.summary?.totalErrors === 39, String(week.answer.json?.summary?.totalErrors))
 check('every model still arrives in a populated window', (week.answer.json?.models ?? []).length === MODEL_IDS.length, String((week.answer.json?.models ?? []).length))
 
+const populatedFixture = servedByRange.get(RANGE_B)
+const { fetchedAt: _weekAt, stale: _weekStale, monitorUrl: _weekMonitor, ...weekMirrored } = week.answer.json ?? {}
+check('the populated answer is the normalized fixture and nothing else', JSON.stringify(weekMirrored) === JSON.stringify(normalizeUptimeView(populatedFixture)), JSON.stringify({ answer: Object.keys(weekMirrored), normalized: Object.keys(normalizeUptimeView(populatedFixture) ?? {}) }))
+
+// Statuses and percentages are asserted through `statusOf` and `uptimeOf` rather than
+// against literals, because the vocabulary moves between contract versions — v1 says
+// `up`/`slow`/`down`, v2 says `ok`/`single`/`issues`/`down` — and the mapping is
+// lib/uptime.js's business. What is this half's business is that the value their
+// function produces is the value the browser receives.
 const down = modelOf(week.answer, DOWN)
-check('the down model is marked down', down?.status === 'down', JSON.stringify(down && { id: down.id, status: down.status }))
+check('the down model is marked down', down?.status === statusOf({ status: 'down' }), JSON.stringify(down && { id: down.id, status: down.status }))
+check('the down model is not in the quiet state', down?.status !== statusOf({ status: 'ok' }), String(down?.status))
 check('the down model keeps its error count', down?.errors === 31, String(down?.errors))
-check('the down model keeps its uptime', down?.uptime === 74, String(down?.uptime))
+check('the down model keeps its uptime', down?.uptime === uptimeOf({ uptime: 74 }), String(down?.uptime))
 check('the down model keeps its name', down?.name === DOWN, String(down?.name))
 const downStrip = bucketStats(down?.buckets)
-check('the down model keeps its bucket strip', downStrip.count === 48, String(downStrip.count))
-check('the down model buckets carry its errors', downStrip.errors === 48 && downStrip.max === 1, JSON.stringify(downStrip))
+check('the down model keeps its bucket strip', downStrip.count === windowOf(RANGE_B).buckets, String(downStrip.count))
+check('the down model buckets carry its errors', downStrip.errors === downStrip.count && downStrip.max === 1, JSON.stringify(downStrip))
 check('the down model keeps both events', (down?.events ?? []).length === 2, JSON.stringify(down?.events))
 check('an event keeps its stamp and code', Number.isInteger(down?.events?.[0]?.t) && down.events[0].code === 'upstream_502', JSON.stringify(down?.events?.[0]))
 check('an event keeps its HTTP status', down?.events?.[0]?.status === 502, String(down?.events?.[0]?.status))
@@ -439,25 +643,30 @@ check('a connect timeout event keeps its own message', down?.events?.[1]?.code =
 check('the down model keeps its last error', down?.lastError?.code === 'upstream_503' && Number.isInteger(down.lastError.t), JSON.stringify(down?.lastError))
 check('the last error keeps its message', down?.lastError?.message === 'upstream_503: the model origin is unavailable', String(down?.lastError?.message))
 
-const slow = modelOf(week.answer, SLOW)
-check('the slow model is marked slow', slow?.status === 'slow', String(slow?.status))
-check('the slow model keeps its uptime', slow?.uptime === 99, String(slow?.uptime))
-check('a healthy model beside a down one is untouched', modelOf(week.answer, MODEL_IDS[0])?.status === 'up' && modelOf(week.answer, MODEL_IDS[0]).events.length === 0, JSON.stringify(modelOf(week.answer, MODEL_IDS[0]) && { status: modelOf(week.answer, MODEL_IDS[0]).status }))
+// The narrower states the v2 rule distinguishes: two installs is the provider failing
+// for several people, one is probably that person's own network. Both are worth
+// mirroring faithfully because they are what tells a reader whether to wait it out.
+const issues = modelOf(week.answer, ISSUES)
+check('the multi-install model is not in the quiet state', issues?.status === statusOf({ status: 'issues' }) && issues.status !== statusOf({ status: 'ok' }), String(issues?.status))
+check('the multi-install model keeps its uptime', issues?.uptime === uptimeOf({ uptime: 99 }), String(issues?.uptime))
+const single = modelOf(week.answer, SINGLE)
+check('the single-install model is not in the quiet state', single?.status === statusOf({ status: 'single' }) && single.status !== statusOf({ status: 'ok' }), String(single?.status))
+check('a quiet model beside a down one is untouched', modelOf(week.answer, MODEL_IDS[0])?.status === statusOf({ status: 'ok' }) && modelOf(week.answer, MODEL_IDS[0]).events.length === 0, JSON.stringify(modelOf(week.answer, MODEL_IDS[0]) && { status: modelOf(week.answer, MODEL_IDS[0]).status }))
 
-// Ranges are cached apart: the week above must not have disturbed the day, and
-// neither may a month read disturb either.
-const weekAgain = await view('7d')
+// Ranges are cached apart: the second window above must not have disturbed the
+// default one, and neither may a third read disturb either.
+const weekAgain = await view(RANGE_B)
 check('a cached range costs no upstream request', weekAgain.upstream.length === 0, JSON.stringify(weekAgain.upstream))
-check('a cached range answers the same view', weekAgain.answer.json?.fetchedAt === week.answer.json?.fetchedAt && weekAgain.answer.json?.total === 37, String(weekAgain.answer.json?.total))
-const month = await view('30d')
-check('a third range is fetched separately', month.upstream.length === 1 && month.upstream[0].url === '/api/view?range=30d', JSON.stringify(month.upstream))
-check('a third range answers for itself', month.answer.json?.range === '30d', String(month.answer.json?.range))
-const dayAgain = await view('24h')
-check('the first range is still cached beside the others', dayAgain.upstream.length === 0 && dayAgain.answer.json?.range === '24h', JSON.stringify(dayAgain.upstream))
+check('a cached range answers the same view', weekAgain.answer.json?.fetchedAt === week.answer.json?.fetchedAt && weekAgain.answer.json?.total === 39, String(weekAgain.answer.json?.total))
+const month = await view(RANGE_C)
+check('a third range is fetched separately', month.upstream.length === 1 && month.upstream[0].url === `/api/view?range=${RANGE_C}`, JSON.stringify(month.upstream))
+check('a third range answers for itself', month.answer.json?.range === RANGE_C, String(month.answer.json?.range))
+const dayAgain = await view(DEFAULT_RANGE)
+check('the first range is still cached beside the others', dayAgain.upstream.length === 0 && dayAgain.answer.json?.range === DEFAULT_RANGE, JSON.stringify(dayAgain.upstream))
 check('the cached day is still the all-green one', dayAgain.answer.json?.total === 0, String(dayAgain.answer.json?.total))
 
 // --- refusing a range locally ----------------------------------------------
-const badRange = await view('1h')
+const badRange = await view(BAD_RANGE)
 check('an unknown range is refused 400', badRange.answer.status === 400, `status ${badRange.answer.status}`)
 check('an unknown range is refused with an explanation', badRange.answer.json?.ok === false && typeof badRange.answer.json?.error === 'string', JSON.stringify(badRange.answer.json))
 check('the refusal quotes the whitelist', UPTIME_RANGES.every(range => String(badRange.answer.json?.error ?? '').includes(range)), String(badRange.answer.json?.error))
@@ -469,7 +678,7 @@ check('an over-long range is not echoed whole', String(longRange.answer.json?.er
 check('an over-long range never reaches the collector', longRange.upstream.length === 0, JSON.stringify(longRange.upstream))
 
 const noRange = await view(undefined)
-check('no range at all defaults to a day', noRange.answer.json?.range === '24h', String(noRange.answer.json?.range))
+check('no range at all defaults to a day', noRange.answer.json?.range === DEFAULT_RANGE, String(noRange.answer.json?.range))
 check('the default costs no upstream request while the cache is warm', noRange.upstream.length === 0, JSON.stringify(noRange.upstream))
 
 // --- the route's own manners ------------------------------------------------
@@ -496,7 +705,7 @@ check('a non-loopback peer is refused', await (async () => {
 // the only reason this test moves a clock.
 advance(61_000)
 collectorUp = false
-const gone = await view('24h')
+const gone = await view(DEFAULT_RANGE)
 check('a collector that is gone still answers 200', gone.answer.status === 200, `status ${gone.answer.status}`)
 check('it answers the view it had', gone.answer.json?.ok === true && (gone.answer.json?.models ?? []).length === MODEL_IDS.length, JSON.stringify(gone.answer.json?.summary))
 check('it says the view is stale', gone.answer.json?.stale === true, String(gone.answer.json?.stale))
@@ -509,7 +718,7 @@ check('a gone collector was still asked', gone.upstream.length === 1, String(gon
 collectorUp = true
 collectorStatus = 500
 advance(61_000)
-const refusing = await view('24h')
+const refusing = await view(DEFAULT_RANGE)
 check('a collector that answers 500 degrades the same way', refusing.answer.status === 200 && refusing.answer.json?.stale === true, `status ${refusing.answer.status}`)
 check('a 500 is named in the reason', String(refusing.answer.json?.error ?? '').includes('500'), String(refusing.answer.json?.error))
 collectorStatus = 0
@@ -519,47 +728,92 @@ collectorStatus = 0
 // again and the disk never gets read — which is the whole thing under test here.
 const persisted = readFileSync(join(STATE, 'uptime.json'), 'utf8')
 const persistedParsed = JSON.parse(persisted)
-check('the view was persisted', existsSync(join(STATE, 'uptime.json')) && typeof persistedParsed?.view === 'object', JSON.stringify(Object.keys(persistedParsed ?? {})))
-check('the file holds the range fetched last', persistedParsed?.range === '30d', String(persistedParsed?.range))
-check('the persisted view is the normalized one', persistedParsed?.view?.ok === true && Array.isArray(persistedParsed?.view?.models), JSON.stringify(Object.keys(persistedParsed?.view ?? {})))
-check('the persisted document names its own stamp', Number.isInteger(persistedParsed?.fetchedAt), String(persistedParsed?.fetchedAt))
-check('the persisted view carries no secret', !persisted.includes('RUSTVY_API_KEY'))
+check('the views were persisted', existsSync(join(STATE, 'uptime.json')) && typeof persistedParsed?.views === 'object', JSON.stringify(Object.keys(persistedParsed ?? {})))
+check('the persisted document is versioned', persistedParsed?.version === 2, String(persistedParsed?.version))
+// The point of a per-range map rather than a single most-recent slot: the client reads
+// the hour window for badges and the day window for the panel as a matter of routine,
+// so one slot left one of the two blank on a cold mount during an outage — which is
+// exactly when somebody opens the panel to ask whether their provider is down.
+const fetchedRanges = [DEFAULT_RANGE, RANGE_B, RANGE_C].filter((range, index, all) => all.indexOf(range) === index)
+check('every range fetched is on disk, not only the last', fetchedRanges.every(range => persistedParsed?.views?.[range]?.view?.ok === true), JSON.stringify(Object.keys(persistedParsed?.views ?? {})))
+check('each range kept its own stamp', new Set(fetchedRanges.map(range => persistedParsed?.views?.[range]?.fetchedAt)).size === fetchedRanges.length, JSON.stringify(fetchedRanges.map(range => persistedParsed?.views?.[range]?.fetchedAt)))
+check('the persisted views are the normalized ones', fetchedRanges.every(range => Array.isArray(persistedParsed?.views?.[range]?.view?.models)), JSON.stringify(Object.keys(persistedParsed?.views?.[DEFAULT_RANGE]?.view ?? {})))
+check('the persisted document carries no secret', !persisted.includes('RUSTVY_API_KEY'))
 
 collectorUp = false
 await handle.dispose()
 check('dispose released the route', route === null)
 check('dispose released every listener', listeners.size === 0, JSON.stringify([...listeners.keys()]))
 handle = await start(ctx, {})
-const cold = await view('30d')
+const cold = await view(RANGE_C)
 check('a cold mount still answers 200', cold.answer.status === 200, `status ${cold.answer.status}`)
 check('a cold mount reads the view from disk', cold.answer.json?.ok === true && (cold.answer.json?.models ?? []).length === MODEL_IDS.length, JSON.stringify(cold.answer.json?.summary))
 check('a cold mount says the view is stale', cold.answer.json?.stale === true, String(cold.answer.json?.stale))
-check('a cold mount kept the disk stamp', cold.answer.json?.fetchedAt === persistedParsed?.fetchedAt, `${persistedParsed?.fetchedAt} → ${cold.answer.json?.fetchedAt}`)
+check('a cold mount kept the disk stamp', cold.answer.json?.fetchedAt === persistedParsed?.views?.[RANGE_C]?.fetchedAt, `${persistedParsed?.views?.[RANGE_C]?.fetchedAt} → ${cold.answer.json?.fetchedAt}`)
 check('a cold mount asked the collector before falling back', cold.upstream.length === 1, String(cold.upstream.length))
+const coldDay = await view(DEFAULT_RANGE)
+check('a cold mount answers a second range from disk too', coldDay.answer.status === 200 && coldDay.answer.json?.stale === true, `status ${coldDay.answer.status}`)
+check('the second range kept its own stamp, not the first one', coldDay.answer.json?.fetchedAt === persistedParsed?.views?.[DEFAULT_RANGE]?.fetchedAt && coldDay.answer.json?.fetchedAt !== cold.answer.json?.fetchedAt, `${cold.answer.json?.fetchedAt} vs ${coldDay.answer.json?.fetchedAt}`)
+check('the two ranges answered different windows', cold.answer.json?.range === RANGE_C && coldDay.answer.json?.range === DEFAULT_RANGE, `${cold.answer.json?.range} / ${coldDay.answer.json?.range}`)
 
-// The disk holds only the range it was written for, so another range has nothing to
-// fall back to and must be refused rather than mislabelled: a thirty-day picture
-// wearing a twenty-four-hour label is worse than no picture at all.
-const coldOther = await view('24h')
+// A range that was never fetched must still be refused rather than answered from
+// another range's entry: a thirty-day picture wearing a twenty-four-hour label is
+// worse than no picture at all, and that property is the reason the map is keyed by
+// range. Pruned from the file to stand in for a profile that only ever opened one
+// window, because this run has by now fetched every range the whitelist defines.
+const neverFetched = fetchedRanges.find(range => range !== RANGE_C)
+writeFileSync(join(STATE, 'uptime.json'), `${JSON.stringify({
+  version: persistedParsed.version,
+  views: { [RANGE_C]: persistedParsed.views[RANGE_C] },
+}, null, 2)}\n`)
+await handle.dispose()
+handle = await start(ctx, {})
+const coldOther = await view(neverFetched)
 check('a cold mount with nothing on disk for that range is refused 502', coldOther.answer.status === 502, `status ${coldOther.answer.status}`)
 check('the refusal explains itself', coldOther.answer.json?.ok === false && typeof coldOther.answer.json?.error === 'string', JSON.stringify(coldOther.answer.json))
 check('a 502 carries no half-view', coldOther.answer.json?.models === undefined, JSON.stringify(Object.keys(coldOther.answer.json ?? {})))
 check('a 502 does not claim to be a stale view', coldOther.answer.json?.stale === undefined, String(coldOther.answer.json?.stale))
+check('a 502 does not borrow another range payload', coldOther.answer.json?.range === undefined, String(coldOther.answer.json?.range))
+check('the cached range still answers beside the refused one', (await view(RANGE_C)).answer.json?.stale === true, String((await view(RANGE_C)).answer.json?.stale))
 collectorUp = true
 
 // A collector that comes back clears the staleness — and a stale answer must not
 // have been remembered as a good one, so this really is a fresh fetch.
-const healed = await view('30d')
-check('a collector that came back is asked again', healed.upstream.length === 1 && healed.upstream[0].url === '/api/view?range=30d', JSON.stringify(healed.upstream))
+const healed = await view(RANGE_C)
+check('a collector that came back is asked again', healed.upstream.length === 1 && healed.upstream[0].url === `/api/view?range=${RANGE_C}`, JSON.stringify(healed.upstream))
 check('a fresh view is not stale', healed.answer.json?.stale === false, String(healed.answer.json?.stale))
 check('a fresh view carries no host-side error', healed.answer.json?.error === undefined, String(healed.answer.json?.error))
-check('a fresh view has a newer stamp', healed.answer.json?.fetchedAt > persistedParsed.fetchedAt, `${persistedParsed.fetchedAt} → ${healed.answer.json?.fetchedAt}`)
+check('a fresh view has a newer stamp', healed.answer.json?.fetchedAt > persistedParsed.views[RANGE_C].fetchedAt, `${persistedParsed.views[RANGE_C].fetchedAt} → ${healed.answer.json?.fetchedAt}`)
+
+// --- a profile that upgrades keeps the fallback it had ------------------------
+// The single most-recent-range document this replaced is still readable, and that
+// matters most in the one moment the fallback exists for: a cold mount during a
+// collector outage. Losing the last known view to a format change at exactly that
+// moment would be the worst possible time to discover the change had happened.
+const { fetchedAt: _healedAt, stale: _healedStale, monitorUrl: _healedMonitor, ...healedView } = healed.answer.json
+const legacy = { range: DEFAULT_RANGE, fetchedAt: healed.answer.json.fetchedAt, view: healedView }
+writeFileSync(join(STATE, 'uptime.json'), `${JSON.stringify(legacy, null, 2)}\n`)
+collectorUp = false
+await handle.dispose()
+handle = await start(ctx, {})
+const migrated = await view(DEFAULT_RANGE)
+check('a legacy single-range file is still read', migrated.answer.json?.ok === true && migrated.answer.json?.stale === true, `status ${migrated.answer.status}`)
+check('the legacy stamp survived the migration', migrated.answer.json?.fetchedAt === legacy.fetchedAt, `${legacy.fetchedAt} → ${migrated.answer.json?.fetchedAt}`)
+check('the legacy view survived whole', (migrated.answer.json?.models ?? []).length === MODEL_IDS.length, String((migrated.answer.json?.models ?? []).length))
+check('a range the legacy file did not hold is still refused', (await view(RANGE_C)).answer.status === 502, String((await view(RANGE_C)).answer.status))
+// Migration is a read, not a rewrite: the file is left as it was until a fetch
+// succeeds and the new shape is written anyway, so nothing is rewritten on a
+// collector that is down.
+collectorUp = true
+await view(DEFAULT_RANGE)
+const rewritten = JSON.parse(readFileSync(join(STATE, 'uptime.json'), 'utf8'))
+check('a legacy file becomes the new shape once a fetch succeeds', rewritten?.version === 2 && typeof rewritten?.views === 'object', JSON.stringify(Object.keys(rewritten ?? {})))
 
 // --- the switch --------------------------------------------------------------
 const switched = await call('POST', '/dsh-rustvy/config', { uptimeView: false })
 check('the switch is written', switched.status === 200 && switched.json?.config?.uptimeView === false, JSON.stringify(switched.json?.config))
 check('the switch did not disturb error collection', switched.json?.config?.collectErrors === false && switched.json?.config?.apiKeys === true, JSON.stringify(switched.json?.config))
-const off = await view('24h')
+const off = await view(DEFAULT_RANGE)
 check('with the panel off the route still answers 200', off.answer.status === 200, `status ${off.answer.status}`)
 check('with the panel off the answer says so', off.answer.json?.ok === false, JSON.stringify(off.answer.json).slice(0, 200))
 check('with the panel off the sentence is the settings one', off.answer.json?.error === 'аптайм выключен настройкой плагина', String(off.answer.json?.error))
@@ -578,10 +832,10 @@ check('the switch turns back on', (await call('GET', '/dsh-rustvy/catalog.json')
 const realEndpoint = process.env.DSH_RUSTVY_UPTIME_ENDPOINT
 advance(61_000)
 process.env.DSH_RUSTVY_UPTIME_ENDPOINT = 'not a url at all'
-const brokenEnv = await view('24h')
+const brokenEnv = await view(DEFAULT_RANGE)
 check('an unparseable environment override is refused', brokenEnv.answer.json?.ok === true, JSON.stringify(brokenEnv.answer.json).slice(0, 200))
 check('a refused override keeps the panel working', brokenEnv.answer.json?.monitorUrl === MONITOR && brokenEnv.answer.json?.stale === false, String(brokenEnv.answer.json?.monitorUrl))
-check('a refused override still reaches the address in force', brokenEnv.upstream.length === 1 && brokenEnv.upstream[0].url === '/api/view?range=24h', JSON.stringify(brokenEnv.upstream))
+check('a refused override still reaches the address in force', brokenEnv.upstream.length === 1 && brokenEnv.upstream[0].url === `/api/view?range=${DEFAULT_RANGE}`, JSON.stringify(brokenEnv.upstream))
 process.env.DSH_RUSTVY_UPTIME_ENDPOINT = realEndpoint
 
 // `/config` answers with the catalog payload, whose `config` block echoes only the
@@ -590,7 +844,7 @@ process.env.DSH_RUSTVY_UPTIME_ENDPOINT = realEndpoint
 const endpointInForce = async () => (await call('GET', '/dsh-rustvy/state')).json?.config?.uptimeEndpoint
 const brokenPatch = await call('POST', '/dsh-rustvy/config', { uptimeEndpoint: 'not a url' })
 check('an unparseable settings patch is refused too', (await endpointInForce()) === realEndpoint, String(await endpointInForce()))
-check('a refused patch leaves the panel working', (await view('24h')).answer.json?.ok === true)
+check('a refused patch leaves the panel working', (await view(DEFAULT_RANGE)).answer.json?.ok === true)
 const goodPatch = await call('POST', '/dsh-rustvy/config', { uptimeEndpoint: `${MONITOR}api/report` })
 check('a well-formed endpoint is accepted', (await endpointInForce()) === `${MONITOR}api/report`, String(await endpointInForce()))
 check('an accepted endpoint repoints the panel', goodPatch.status === 200 && goodPatch.json?.ok === true, `status ${goodPatch.status}`)

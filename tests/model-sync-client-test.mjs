@@ -68,7 +68,17 @@ function stubElement(tag) {
     children: [],
     parentNode: null,
     attributes: {},
-    style: { setProperty() {}, removeProperty() {} },
+    /**
+     * `setProperty` really records, because the uptime badge's colour reaches the
+     * stylesheet as a custom property: a stub that swallowed it would let an assertion
+     * about the badge's tier pass while the badge itself was painted in whatever the
+     * fallback colour is.
+     */
+    style: {
+      properties: {},
+      setProperty(name, value) { this.properties[String(name)] = String(value) },
+      removeProperty(name) { delete this.properties[String(name)] },
+    },
     /**
      * `dataset` really writes `data-*` attributes, the way a browser reflects it.
      * A stub that kept it in a separate object would let the code under test
@@ -105,6 +115,16 @@ function stubElement(tag) {
     get firstChild() { return this.children[0] ?? null },
     get nextElementSibling() {
       const held = this.parentNode?.children ?? []
+      return held[held.indexOf(this) + 1] ?? null
+    },
+    /**
+     * Real, because the trigger badge's fallback anchor is "right after the name node"
+     * and the decorator reads that through `nextSibling`. A stub without it would answer
+     * `undefined` and quietly append the badge at the end of the trigger, which is the
+     * one position the assertion is meant to rule out.
+     */
+    get nextSibling() {
+      const held = this.parentNode?.childNodes ?? []
       return held[held.indexOf(this) + 1] ?? null
     },
     contains(other) { return other === this || descendants(this).includes(other) },
@@ -255,7 +275,7 @@ const STATE = {
   // invented one.
   errorReport: {
     enabled: true,
-    endpoint: 'http://185.75.189.247:8249/api/report',
+    endpoint: 'http://185.75.189.247:3789/api/report',
     installId: 'a3f0c81b7d4e4f2a9c6b5d8e1f0a2b3c',
     queued: 2,
     sent: 5,
@@ -358,69 +378,205 @@ function mutateKeys(body) {
 }
 
 /* ------------------------- uptime-view fixtures -------------------------- */
-// Two answers, because only one of them has ever come back from the live collector:
-// its aggregation is still being written, so `total: 0` with every model green is what
-// the server really says today, and that has to render as a finding rather than as a
-// panel that failed to load. The populated one is built from the monitor page's own
-// JavaScript — `events`, `byCode` and `lastError` have never been proven by an answer,
-// which is exactly why a test has to hold their shape.
+// Contract v2, plus the shape a collector older than v2 still answers with. The plugin
+// may be pointed at the currently deployed server for a while, so both have to render —
+// and the older one has to render poorer rather than wrong: no install counts it never
+// measured, no share it has no denominator for.
+//
+// The all-green answer is still the one the live server gives most days, and it has to
+// read as a finding rather than as a panel that failed to load.
 
-/** `count` buckets of an even window, with non-zero counts at the given indexes. */
-function bucketStrip(count, hits = {}) {
-  return Array.from({ length: count }, (_, index) => ({ from: 1792530932644 + index * 1800000, count: hits[index] ?? 0 }))
+/**
+ * `count` buckets of an even window, with non-zero counts at the given indexes.
+ *
+ * @param count - how many buckets; 60 for an hour, 48 for every longer window.
+ * @param hits - `{ index: count }` for the buckets that hold errors.
+ * @param stepMs - one bucket's width; a minute for an hour, half an hour otherwise.
+ */
+function bucketStrip(count, hits = {}, stepMs = 1_800_000) {
+  return Array.from({ length: count }, (_, index) => ({ from: 1792530932644 + index * stepMs, count: hits[index] ?? 0 }))
 }
 
 const UPTIME_GREEN = {
   ok: true, range: '24h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
   stale: false, healthy: true, storage: 'mongo', total: 0,
-  summary: { totalModels: 12, operational: 12, slow: 0, down: 0, uptime: 100, totalErrors: 0 },
+  installs: { window: 0, reference: 47, anonymous: 0 },
+  summary: {
+    totalModels: 12, operational: 12, single: 0, issues: 0, down: 0, slow: 0,
+    uptime: 100, totalErrors: 0, installsAffected: 0, affectedPct: 0,
+  },
   byCode: [],
   models: [
     {
-      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, uptime: 100, status: 'up',
+      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
+      firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
       buckets: bucketStrip(48), events: [], lastError: null,
     },
     {
-      id: 'gpt-5', name: 'GPT-5', errors: 0, uptime: 100, status: 'up',
+      id: 'gpt-5', name: 'GPT-5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
+      firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
       buckets: bucketStrip(48), events: [], lastError: null,
     },
   ],
-  monitorUrl: 'http://185.75.189.247:8249/',
+  monitorUrl: 'http://185.75.189.247:3789/',
 }
 
+// Every state the v2 rule can produce, plus the two edge cases the rendering has to get
+// right: a model whose share has no denominator (`affectedPct: null`, which must read as
+// «—» and never as 0%), and one whose errors are all anonymous, so that «от 1 установки»
+// is not allowed to stand unqualified.
 const UPTIME_POPULATED = {
   ok: true, range: '24h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
-  stale: false, healthy: false, storage: 'mongo', total: 7,
-  summary: { totalModels: 12, operational: 10, slow: 1, down: 1, uptime: 92, totalErrors: 7 },
-  byCode: [{ code: 'upstream_502', count: 5 }, { code: 'connect_timeout', count: 2 }],
+  stale: false, healthy: false, storage: 'mongo', total: 10,
+  installs: { window: 7, reference: 47, anonymous: 3 },
+  summary: {
+    totalModels: 12, operational: 9, single: 1, issues: 1, down: 1, slow: 1,
+    uptime: 88, totalErrors: 10, installsAffected: 7, affectedPct: 14.9,
+  },
+  byCode: [{ code: 'upstream_502', count: 7 }, { code: 'connect_timeout', count: 3 }],
   models: [
     {
-      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 5, uptime: 61, status: 'down',
+      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 5, installs: 3, anonymous: 0, status: 'down',
+      firstAt: 1792600000000, lastAt: 1792616000000, minutesSinceLast: 4, affectedPct: 6.4,
       buckets: bucketStrip(48, { 3: 1, 17: 2, 44: 2 }),
-      events: [{ t: 1792600000000, code: 'upstream_502', status: 502, message: 'upstream connect error', plugin: 'dsh-rustvy' }],
+      events: [{ t: 1792616000000, code: 'upstream_502', status: 502, message: 'upstream connect error', plugin: 'dsh-rustvy', id: 'd66d4114-0000' }],
       lastError: {
         t: 1792616000000, code: 'upstream_502', status: 502,
-        message: 'upstream connect error or disconnect/reset before headers', plugin: 'dsh-rustvy',
+        message: 'upstream connect error or disconnect/reset before headers', plugin: 'dsh-rustvy', id: 'd66d4114-0000',
       },
     },
     {
-      id: 'glm-5.3', name: 'GLM 5.3', errors: 2, uptime: 97, status: 'slow',
-      buckets: bucketStrip(48, { 9: 1, 31: 1 }),
-      events: [{ t: 1792606000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT', plugin: 'dsh-rustvy' }],
-      lastError: { t: 1792613000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT 185.75.189.247:443' },
+      // A last error three hours old, on the ladder rather than on a clock: it must read
+      // as hours, never as «только что», whatever window the panel is looking at.
+      id: 'glm-5.3', name: 'GLM 5.3', errors: 3, installs: 2, anonymous: 1, status: 'issues',
+      firstAt: 1792595000000, lastAt: 1792606532644, minutesSinceLast: 180, affectedPct: 4.3,
+      buckets: bucketStrip(48, { 9: 1, 31: 2 }),
+      events: [{ t: 1792606532644, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT', plugin: 'dsh-rustvy', id: 'd66d4114-0001' }],
+      lastError: { t: 1792606532644, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT 185.75.189.247:443', id: 'd66d4114-0001' },
+    },
+    {
+      // One install, and every one of its errors anonymous: the breadth figure is not a
+      // measurement here, and the row has to say so rather than imply "one person".
+      id: 'kimi-k3', name: 'KIMI K3', errors: 2, installs: 1, anonymous: 2, status: 'single',
+      firstAt: 1792609000000, lastAt: 1792612000000, minutesSinceLast: 70, affectedPct: null,
+      buckets: bucketStrip(48, { 20: 2 }),
+      events: [], lastError: { t: 1792612000000, code: 'upstream_503', status: 503, message: 'service unavailable' },
+    },
+    {
+      id: 'gpt-5', name: 'GPT-5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
+      firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
+      buckets: bucketStrip(48), events: [], lastError: null,
+    },
+  ],
+  monitorUrl: 'http://185.75.189.247:3789/',
+}
+
+// The badge fixture: an hour's window, 60 one-minute buckets, and one model in each of
+// the four states, so the shape and colour of every badge is pinned by a real answer
+// rather than by a unit test of a helper. One id the vendor rules recognise rides along,
+// so a badge can be checked on a row that also carries a mark.
+const UPTIME_BADGES = {
+  ok: true, range: '1h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
+  stale: false, healthy: false, storage: 'mongo', total: 6,
+  installs: { window: 5, reference: 47, anonymous: 2 },
+  summary: {
+    totalModels: 5, operational: 2, single: 1, issues: 1, down: 1, slow: 1,
+    uptime: 80, totalErrors: 6, installsAffected: 5, affectedPct: 10.6,
+  },
+  byCode: [{ code: 'upstream_502', count: 6 }],
+  models: [
+    {
+      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
+      firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
+      buckets: bucketStrip(60, {}, 60_000), events: [], lastError: null,
+    },
+    {
+      id: 'gpt-5', name: 'GPT-5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
+      firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
+      buckets: bucketStrip(60, {}, 60_000), events: [], lastError: null,
+    },
+    {
+      id: 'kimi-k3', name: 'KIMI K3', errors: 1, installs: 1, anonymous: 1, status: 'single',
+      firstAt: 1792616000000, lastAt: 1792616900000, minutesSinceLast: 7, affectedPct: 2.1,
+      buckets: bucketStrip(60, { 12: 1 }, 60_000), events: [], lastError: null,
+    },
+    {
+      id: 'glm-5.3', name: 'GLM 5.3', errors: 3, installs: 2, anonymous: 1, status: 'issues',
+      firstAt: 1792615000000, lastAt: 1792616940000, minutesSinceLast: 6, affectedPct: 4.3,
+      buckets: bucketStrip(60, { 20: 1, 41: 2 }, 60_000), events: [], lastError: null,
+    },
+    {
+      id: 'qwen3.7-plus', name: 'QWEN 3.7 PLUS', errors: 2, installs: 3, anonymous: 0, status: 'down',
+      firstAt: 1792616500000, lastAt: 1792617300000, minutesSinceLast: 1, affectedPct: 6.4,
+      buckets: bucketStrip(60, { 55: 2 }, 60_000), events: [], lastError: null,
+    },
+  ],
+  monitorUrl: 'http://185.75.189.247:3789/',
+}
+
+// The same window seen from a month away, with every count doubled. Nothing asserts on
+// the panel in this mode; it exists so that a badge repainted from a longer window is
+// visibly wrong rather than silently identical to the hour it claims to describe.
+const UPTIME_BADGES_WIDE = {
+  ...UPTIME_BADGES,
+  range: '30d',
+  models: UPTIME_BADGES.models.map(model => ({
+    ...model,
+    errors: model.errors * 2,
+    anonymous: model.anonymous * 2,
+    buckets: bucketStrip(48),
+  })),
+}
+
+// A collector older than v2: the three old states, a percentage instead of a state rule,
+// and none of the breadth fields. Everything here has to render, and nothing here may be
+// invented — no «от 0 установок», no «затронуто 0%».
+const UPTIME_LEGACY = {
+  ok: true, range: '24h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
+  stale: false, healthy: false, storage: 'mongo', total: 4,
+  summary: { totalModels: 3, operational: 1, slow: 1, down: 1, uptime: 79, totalErrors: 4 },
+  byCode: [{ code: 'upstream_502', count: 4 }],
+  models: [
+    {
+      id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 3, uptime: 61, status: 'down',
+      buckets: bucketStrip(48, { 3: 1, 17: 2 }), events: [],
+      lastError: { t: 1792616000000, code: 'upstream_502', status: 502, message: 'upstream connect error' },
+    },
+    {
+      id: 'glm-5.3', name: 'GLM 5.3', errors: 1, uptime: 97, status: 'slow',
+      buckets: bucketStrip(48, { 9: 1 }), events: [],
+      lastError: { t: 1792613000000, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT' },
     },
     {
       id: 'gpt-5', name: 'GPT-5', errors: 0, uptime: 100, status: 'up',
       buckets: bucketStrip(48), events: [], lastError: null,
     },
   ],
-  monitorUrl: 'http://185.75.189.247:8249/',
+  monitorUrl: 'http://185.75.189.247:3789/',
+}
+
+// A month window, where the summary's share stops meaning anything: the window and the
+// 30-day reference period are the same set of installs, so numerator and denominator
+// coincide and the collector answers `affectedPct: null` rather than a 100% that reads as
+// a verdict. Per-model shares stay real on this range — their denominator is the global
+// install base and their numerator is one model's installs — which makes `30d` the one
+// window where the header and a row genuinely disagree about whether a percentage means
+// something.
+const UPTIME_MONTH = {
+  ...UPTIME_POPULATED,
+  range: '30d',
+  summary: { ...UPTIME_POPULATED.summary, affectedPct: null },
+  installs: { window: 47, reference: 47, anonymous: 3 },
+  models: UPTIME_POPULATED.models.map(model => ({ ...model, buckets: bucketStrip(48, {}, 900_000) })),
 }
 
 /**
- * `'green'` for the answer the live server gives today, `'populated'` for one carrying
- * failures, `'stale'` for a cached payload behind an unreachable collector, `'refused'`
- * for the host's own `ok: false`, and `'offline'` for a `502` with no cache at all.
+ * `'green'` for an all-clear window, `'populated'` for one carrying every state and both
+ * edge cases, `'badges'` for the hour the picker reads — which answers doubled counts on
+ * any longer window, so a badge taken from the wrong one is visible — `'month'` for a
+ * 30-day window whose summary share is null, `'legacy'` for a collector older than v2,
+ * `'stale'` for a cached payload behind an unreachable collector, `'refused'` for the
+ * host's own `ok: false`, and `'offline'` for a `502` with no cache at all.
  */
 let UPTIME_MODE = 'green'
 
@@ -492,6 +648,27 @@ globalThis.fetch = async (url, init = {}) => {
       return { ok: false, status: 502, json: async () => ({ ok: false, error: 'коллектор недоступен, а кешированного ответа нет' }) }
     }
     if (UPTIME_MODE === 'refused') return json({ ok: false, error: 'аптайм выключен настройкой плагина' })
+    if (UPTIME_MODE === 'legacy') return json({ ...structuredClone(UPTIME_LEGACY), range: asked })
+    if (UPTIME_MODE === 'month') return json({ ...structuredClone(UPTIME_MONTH), range: asked })
+    // The interval between the plugin updating and the collector being deployed: a v1
+    // server has no `1h`, answers it with a 400, and the host turns that into a 502
+    // carrying no models — while every longer window keeps working. This is the state
+    // every user is in for that interval, so it is a mode of its own rather than a note.
+    if (UPTIME_MODE === 'v1-server') {
+      if (asked === '1h') {
+        return { ok: false, status: 502, json: async () => ({ ok: false, error: 'приёмник аптайма ответил 400' }) }
+      }
+      return json({ ...structuredClone(UPTIME_POPULATED), range: asked })
+    }
+    // A transport failure rather than an answer at all.
+    if (UPTIME_MODE === 'network' && asked === '1h') throw new Error('Failed to fetch')
+    if (UPTIME_MODE === 'badges') {
+      // The hour the badges read, and a month of it with every count doubled for any
+      // longer window: a badge repainted from the wrong window then shows a number
+      // nobody can mistake for the hour its tooltip claims.
+      const base = asked === '1h' ? UPTIME_BADGES : UPTIME_BADGES_WIDE
+      return json({ ...structuredClone(base), range: asked })
+    }
     const base = UPTIME_MODE === 'populated' || UPTIME_MODE === 'stale' ? UPTIME_POPULATED : UPTIME_GREEN
     return json(UPTIME_MODE === 'stale'
       ? { ...structuredClone(base), range: asked, stale: true, fetchedAt: 1792600000000, error: 'коллектор не ответил за 10 секунд' }
@@ -1184,10 +1361,11 @@ check('and looks the same with the summary put back',
   && !allText(tree).includes('a3f0c81b7d4e4f2a9c6b5d8e'))
 
 /* ------------------------------ the uptime view ---------------------------- */
-// The other half of the same story: the error box above is what this install
-// reported, this one is what the collector made of everybody's reports. Every number
-// asserted here is the collector's own, because a panel that recomputed uptime locally
-// could disagree with the monitor's web page about the same model.
+// The other half of the same story: the error box above is what this install reported,
+// this one is what the collector made of everybody's reports. Every number asserted here
+// is the collector's own, because a panel that recomputed availability locally could
+// disagree with the monitor's web page about the same model — and there is no honest
+// availability to recompute in the first place, since only errors are ever reported.
 
 /** The model rows the uptime box drew, in document order. */
 function uptimeRows(node) {
@@ -1201,37 +1379,44 @@ function uptimeRow(node, name) {
 
 /** The range switch: the one dropdown whose value is a window rather than a mode. */
 function rangeSwitch(node) {
-  return collect(node, 'select').find(item => ['24h', '7d', '30d'].includes(item.props.value))
+  return collect(node, 'select').find(item => ['1h', '24h', '7d', '30d'].includes(item.props.value))
+}
+
+/** The bars one row's strip drew. */
+function bars(row) {
+  return collect(row, 'span').filter(item => item.props.title !== undefined)
 }
 
 UPTIME_MODE = 'green'
 tree = await view()
 text = allText(tree)
 check('the page names the uptime box', text.includes('Аптайм моделей'))
-check('the summary is the collector own arithmetic, not a recount',
-  text.includes('операционно 12 из 12') && text.includes('деградируют 0') && text.includes('лежат 0')
-  && text.includes('аптайм 100%') && text.includes('ошибок за период 0'))
+check('the header counts states rather than presenting a percentage as availability',
+  text.includes('моделей 12') && text.includes('без ошибок 12') && text.includes('локально 0')
+  && text.includes('сбои 0') && text.includes('лежат 0') && text.includes('ошибок за период 0')
+  && !text.includes('аптайм 100%'))
+check('and names the breadth the collector measured', text.includes('затронуто 0 из 47 установок'))
 check('an all-green window is a finding, drawn in words',
   uptimeRows(tree).length === 2 && text.includes('ошибок нет'), String(uptimeRows(tree).length))
 check('and carries no error styling',
-  uptimeRows(tree).every(row => row.props['data-dmi-status'] === 'up') && !text.includes('последняя ошибка'))
-check('the range switch defaults to a day and offers the three windows',
+  uptimeRows(tree).every(row => row.props['data-dmi-state'] === 'ok') && !text.includes('последняя ошибка'))
+check('the range switch defaults to a day and offers all four windows',
   rangeSwitch(tree)?.props.value === '24h'
-  && collect(rangeSwitch(tree), 'option').map(option => option.props.value).join(',') === '24h,7d,30d',
+  && collect(rangeSwitch(tree), 'option').map(option => option.props.value).join(',') === '1h,24h,7d,30d',
   String(rangeSwitch(tree)?.props.value))
 check('the footer names the moment and the store',
   text.includes(`обновлено ${new Date(1792617332644).toLocaleString()}`) && text.includes('хранилище mongo'))
 check('the monitor itself is a real outbound link',
-  collect(tree, 'a').some(item => item.props.href === 'http://185.75.189.247:8249/' && item.props.target === '_blank'))
+  collect(tree, 'a').some(item => item.props.href === 'http://185.75.189.247:3789/' && item.props.target === '_blank'))
 
 requests.length = 0
-rangeSwitch(tree).props.onChange({ target: { value: '7d' } })
+rangeSwitch(tree).props.onChange({ target: { value: '1h' } })
 await settle()
 tree = await view()
 check('the range switch asks the mirror for that window',
-  requests.some(item => item.path.includes('/uptime.json') && item.path.includes('range=7d')),
+  requests.some(item => item.path.includes('/uptime.json') && item.path.includes('range=1h')),
   JSON.stringify(requests.map(item => item.path).filter(item => item.includes('uptime'))))
-check('and the box keeps the window it was switched to', rangeSwitch(tree)?.props.value === '7d')
+check('and the box keeps the window it was switched to', rangeSwitch(tree)?.props.value === '1h')
 check('the window is UI state, not a setting: nothing was posted to /config',
   !requests.some(item => item.path.endsWith('/config')),
   JSON.stringify(requests.map(item => item.path)))
@@ -1242,25 +1427,105 @@ await settle()
 tree = await view()
 text = allText(tree)
 const downRow = uptimeRow(tree, 'OPUS 5.5')
-const slowRow = uptimeRow(tree, 'GLM 5.3')
+const issuesRow = uptimeRow(tree, 'GLM 5.3')
+const singleRow = uptimeRow(tree, 'KIMI K3')
 check('a model that is down is drawn as down',
-  downRow?.props['data-dmi-status'] === 'down' && allText(downRow).includes('Down'))
-check('its error count and uptime are the collector numbers',
-  allText(downRow).includes('ошибок 5') && allText(downRow).includes('61%'))
+  downRow?.props['data-dmi-state'] === 'down' && allText(downRow).includes('Лежит'))
+check('its breadth is the collector own count, not an inference',
+  allText(downRow).includes('ошибок 5 от 3 установок') && allText(downRow).includes('затронуто 6,4% установок'),
+  allText(downRow))
+check('a provider failing several people is drawn as issues',
+  issuesRow?.props['data-dmi-state'] === 'issues' && allText(issuesRow).includes('Сбои'))
+check('and a last error three hours old reads as hours, never as just now',
+  allText(issuesRow).includes('последняя 3 ч назад') && !allText(issuesRow).includes('только что'),
+  allText(issuesRow))
+check('a partly anonymous window qualifies the count it is attached to',
+  allText(issuesRow).includes('ошибок 3 от 2 установок (1 из 3 анонимных)'), allText(issuesRow))
+check('one install whose reports are all anonymous does not read as one person',
+  singleRow?.props['data-dmi-state'] === 'single' && allText(singleRow).includes('Локальный сбой')
+  && allText(singleRow).includes('ошибок 2 от 1 установки (все анонимные)'), allText(singleRow))
+check('a share with no denominator is a dash, never a zero',
+  allText(singleRow).includes('затронуто — установок') && !allText(singleRow).includes('затронуто 0%'),
+  allText(singleRow))
 check('its last error is quoted with a time, a code and the provider own text',
   allText(downRow).includes('последняя ошибка') && allText(downRow).includes('upstream_502')
   && allText(downRow).includes('upstream connect error or disconnect/reset before headers'))
-check('and its age in the monitor own words', allText(downRow).includes('назад'))
-check('a degraded model is drawn as degraded',
-  slowRow?.props['data-dmi-status'] === 'slow' && allText(slowRow).includes('Degraded'))
 check('a model with errors gets bars rather than the empty word',
-  collect(downRow, 'span').filter(item => item.props.title !== undefined).length === 48
-  && !allText(downRow).includes('ошибок нет'),
-  String(collect(downRow, 'span').filter(item => item.props.title !== undefined).length))
+  bars(downRow).length === 48 && !allText(downRow).includes('ошибок нет'), String(bars(downRow).length))
+check('and the strip says how wide one bar is',
+  allText(downRow).includes('1 столбик = 30 мин'), allText(downRow))
 check('a clean model in the same window still says so',
   allText(uptimeRow(tree, 'GPT-5')).includes('ошибок нет'))
-check('the summary counts what the collector counted',
-  text.includes('операционно 10 из 12') && text.includes('лежат 1') && text.includes('ошибок за период 7'))
+check('and claims no breadth nobody measured',
+  !allText(uptimeRow(tree, 'GPT-5')).includes('от 0 установок'), allText(uptimeRow(tree, 'GPT-5')))
+check('the header counts what the collector counted',
+  text.includes('моделей 12') && text.includes('без ошибок 9') && text.includes('локально 1')
+  && text.includes('сбои 1') && text.includes('лежат 1') && text.includes('ошибок за период 10')
+  && text.includes('затронуто 7 из 47 установок'))
+
+// A collector older than v2: three states instead of four, a percentage this half must
+// not present as availability, and none of the breadth fields. The panel has to come out
+// poorer, not wrong.
+UPTIME_MODE = 'legacy'
+tree = await view()
+text = allText(tree)
+const legacyDown = uptimeRow(tree, 'OPUS 5.5')
+check('a legacy answer still renders every model it names',
+  uptimeRows(tree).length === 3, String(uptimeRows(tree).length))
+check('and translates its old words onto the current ones',
+  legacyDown?.props['data-dmi-state'] === 'down' && allText(legacyDown).includes('Лежит')
+  && allText(uptimeRow(tree, 'GLM 5.3')).includes('Сбои')
+  && allText(uptimeRow(tree, 'GPT-5')).includes('Без ошибок'))
+check('it shows the error count without an install count it was never given',
+  allText(legacyDown).includes('ошибок 3') && !allText(legacyDown).includes('от ')
+  && !text.includes('от 0 установок'), allText(legacyDown))
+check('no share it has no denominator for', !text.includes('затронуто'))
+check('and no percentage offered as availability', !text.includes('61%') && !text.includes('97%'))
+check('its header drops the breadth clause rather than filling it with dashes',
+  text.includes('ошибок за период 4') && text.includes('моделей 3'))
+check('recency still comes from the last error the old answer does carry',
+  allText(legacyDown).includes('последняя') && allText(legacyDown).includes('назад'))
+
+// An hour is sixty one-minute buckets, and the strip has to say so: unlabelled, sixty
+// thin bars read exactly like forty-eight half-hour ones.
+UPTIME_MODE = 'badges'
+rangeSwitch(tree).props.onChange({ target: { value: '1h' } })
+await settle()
+tree = await view()
+const hourRow = uptimeRow(tree, 'GLM 5.3')
+check('an hour is drawn as sixty minute-wide bars, and says so',
+  bars(hourRow).length === 60 && allText(hourRow).includes('1 столбик = 1 мин'),
+  `${bars(hourRow).length} bars`)
+
+// A month window is where the two shares part company. The summary's is null — window and
+// reference period are the same set of installs, so a percentage would be the set measured
+// against itself — while every model's is still real. The header has to keep its counts
+// and never turn them into a share; a row has to keep its share.
+UPTIME_MODE = 'month'
+rangeSwitch(tree).props.onChange({ target: { value: '30d' } })
+await settle()
+tree = await view()
+text = allText(tree)
+const monthRow = uptimeRow(tree, 'OPUS 5.5')
+check('a month window keeps the header counts and never turns them into a share',
+  text.includes('затронуто 47 из 47 установок') && !text.includes('затронуто 100%')
+  && !text.includes('затронуто — из'), text.slice(text.indexOf('моделей 12'), text.indexOf('моделей 12') + 120))
+check('and puts no dash where a count belongs',
+  !text.includes('затронуто — из — установок'))
+check('a month strip says how wide its bars are too',
+  allText(monthRow).includes('1 столбик = 15 ч'), allText(monthRow))
+check('while a model own share stays a real percentage on the same range',
+  allText(monthRow).includes('затронуто 6,4% установок'), allText(monthRow))
+check('and a model with no denominator still says so rather than claiming zero',
+  allText(uptimeRow(tree, 'KIMI K3')).includes('затронуто — установок')
+  && !allText(uptimeRow(tree, 'KIMI K3')).includes('затронуто 0%'),
+  allText(uptimeRow(tree, 'KIMI K3')))
+// Back to a day, so the badge block's own switch to a month is a real change of window
+// rather than a no-op that would leave its request assertion passing on nothing.
+UPTIME_MODE = 'populated'
+rangeSwitch(tree).props.onChange({ target: { value: '24h' } })
+await settle()
+tree = await view()
 
 UPTIME_MODE = 'stale'
 tree = await view()
@@ -1268,7 +1533,7 @@ text = allText(tree)
 check('a stale answer says it is cached, and from when',
   text.includes('показано кешированное от') && text.includes(new Date(1792600000000).toLocaleString())
   && text.includes('коллектор не ответил за 10 секунд'))
-check('and still draws the models it holds', uptimeRows(tree).length === 3, String(uptimeRows(tree).length))
+check('and still draws the models it holds', uptimeRows(tree).length === 4, String(uptimeRows(tree).length))
 
 UPTIME_MODE = 'offline'
 tree = await view()
@@ -1297,7 +1562,7 @@ check('the uptime switch posts its own config field',
 tree = await view()
 text = allText(tree)
 check('a switched-off view explains itself instead of drawing numbers',
-  text.includes('Аптайм выключен настройкой') && !text.includes('операционно'))
+  text.includes('Аптайм выключен настройкой') && !text.includes('без ошибок'))
 requests.length = 0
 tree = await view()
 check('and costs no read at all',
@@ -1310,7 +1575,7 @@ await settle()
 check('turning the view back on posts the same field',
   requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).uptimeView === true))
 tree = await view()
-check('and the panel comes back with it', uptimeRows(tree).length === 3, String(uptimeRows(tree).length))
+check('and the panel comes back with it', uptimeRows(tree).length === 4, String(uptimeRows(tree).length))
 
 // --- the order of the page ---------------------------------------------------
 // Everything above finds its section by caption, which survives a move without a word
@@ -1515,50 +1780,350 @@ await pass()
 check('a second pass leaves the hidden groups alone', hiddenOf(menu).length === 3, String(hiddenOf(menu).length))
 check('and still hides nothing it should not', hiddenOf(plainMenu).length === 0)
 
-// --- the uptime dots --------------------------------------------------------
-// The dots ride the same pass as the marks, so they are checked where the marks are:
-// a row the collector named carries one, a row it did not name carries none, and
-// neither the vendor mark nor the clone-group hiding notices the difference.
-const uptimeMenu = buildPickerMenu([{ label: 'rustvy', models: ['claude-opus-5-5', 'mistral-large-3'] }])
+// --- the uptime badges ------------------------------------------------------
+// The picker's own rendering of the same answer, taken from the hour rather than the
+// day: a colour, and a count when there is anything to count. No percentage — errors are
+// the only thing ever reported, so a percentage of availability has no denominator, and
+// 97,9% was bucket occupancy that nobody could act on.
+UPTIME_MODE = 'badges'
+// One render of the settings panel is what puts the hour's view into the picker's map:
+// the decorator only absorbs the range its badges claim to describe.
+tree = await view()
+const uptimeMenu = buildPickerMenu([
+  { label: 'rustvy', models: ['claude-opus-5-5', 'kimi-k3', 'glm-5.3', 'qwen3.7-plus', 'mistral-large-3'] },
+])
 await pass()
 const rowNamed = model => uptimeMenu.querySelectorAll('[role="menuitemradio"]').find(row => row.attributes.title === model)
-const dotOf = row => row.querySelectorAll('.dmi-uptime-dot')[0]
+const badgeOf = row => row.querySelectorAll('.dmi-uptime-badge')[0]
+const badgeNamed = model => badgeOf(rowNamed(model))
+const stateOfRow = model => badgeNamed(model)?.attributes['data-dmi-state']
+const shapeOfRow = model => badgeNamed(model)?.attributes['data-dmi-shape']
+const colourOfRow = model => badgeNamed(model)?.style.properties['--dmi-badge-color']
+const titleOfRow = model => String(badgeNamed(model)?.title ?? '')
+// The one row here the vendor rules recognise, so mark and badge can be checked together.
 const knownRow = rowNamed('claude-opus-5-5')
 const unknownRow = rowNamed('mistral-large-3')
-check('a model the collector named carries a status dot',
-  dotOf(knownRow) !== undefined && dotOf(knownRow).attributes['data-dmi-status'] === 'down',
-  String(dotOf(knownRow)?.attributes['data-dmi-status']))
-check('the dot explains itself on hover',
-  String(dotOf(knownRow)?.title ?? '').includes('Аптайм 61%')
-  && String(dotOf(knownRow)?.title ?? '').includes('ошибок 5')
-  && String(dotOf(knownRow)?.title ?? '').includes('за 24 часа'),
-  String(dotOf(knownRow)?.title))
-check('a model the collector did not name carries none', dotOf(unknownRow) === undefined,
-  String(unknownRow.querySelectorAll('.dmi-uptime-dot').length))
-check('the dot leaves the vendor mark alone', knownRow.querySelectorAll('.dmi-mark').length === 1,
+check('a model with no errors gets a quiet dot and no number',
+  stateOfRow('claude-opus-5-5') === 'ok' && shapeOfRow('claude-opus-5-5') === 'dot'
+  && badgeOf(knownRow)?.textContent === '' && colourOfRow('claude-opus-5-5') === '#22c55e',
+  `${String(stateOfRow('claude-opus-5-5'))} ${String(shapeOfRow('claude-opus-5-5'))} "${String(badgeOf(knownRow)?.textContent)}"`)
+check('one install own bad evening is amber, and carries its count',
+  stateOfRow('kimi-k3') === 'single' && shapeOfRow('kimi-k3') === 'pill'
+  && badgeNamed('kimi-k3')?.textContent === '1' && colourOfRow('kimi-k3') === '#f59e0b',
+  `${String(stateOfRow('kimi-k3'))} "${String(badgeNamed('kimi-k3')?.textContent)}" ${String(colourOfRow('kimi-k3'))}`)
+check('a provider failing several people is red, and so is one lying down',
+  stateOfRow('glm-5.3') === 'issues' && badgeNamed('glm-5.3')?.textContent === '3'
+  && colourOfRow('glm-5.3') === '#ef4444'
+  && stateOfRow('qwen3.7-plus') === 'down' && badgeNamed('qwen3.7-plus')?.textContent === '2'
+  && colourOfRow('qwen3.7-plus') === '#ef4444',
+  ['glm-5.3', 'qwen3.7-plus'].map(model => `${stateOfRow(model)}:"${badgeNamed(model)?.textContent}":${colourOfRow(model)}`).join(' '))
+check('a dot is not an empty space: "no errors" and "not named" stay different',
+  badgeOf(knownRow) !== undefined && badgeOf(unknownRow) === undefined,
+  String(unknownRow.querySelectorAll('.dmi-uptime-badge').length))
+check('the badge reads from the hour, and its tooltip says so',
+  titleOfRow('glm-5.3').includes('3 ошибки от 2 установок')
+  && titleOfRow('glm-5.3').includes('за последний час') && titleOfRow('glm-5.3').includes('последняя 6 мин назад'),
+  titleOfRow('glm-5.3'))
+check('and a quiet one says there was nothing to report',
+  titleOfRow('claude-opus-5-5') === 'ошибок не было за последний час', titleOfRow('claude-opus-5-5'))
+check('an anonymous share is not left standing as breadth',
+  titleOfRow('kimi-k3').includes('(все анонимные)') && titleOfRow('glm-5.3').includes('(1 из 3 анонимных)'),
+  `${titleOfRow('kimi-k3')} | ${titleOfRow('glm-5.3')}`)
+check('the badge leaves the vendor mark alone', knownRow.querySelectorAll('.dmi-mark').length === 1,
   String(knownRow.querySelectorAll('.dmi-mark').length))
+// Every row this stub builds ends in the host's own `_check`, so this is also the case
+// the badge meets in the real picker: it makes room for the trailing control rather
+// than landing after it or in front of the model's name.
+check('and sits inside the row, before its trailing control',
+  knownRow.children.indexOf(badgeOf(knownRow)) < knownRow.children.indexOf(knownRow.querySelector('.ms_check')),
+  knownRow.children.map(child => child.className).join('|'))
 await pass()
-check('a second pass draws no second dot', knownRow.querySelectorAll('.dmi-uptime-dot').length === 1,
-  String(knownRow.querySelectorAll('.dmi-uptime-dot').length))
+check('a second pass draws no second badge', knownRow.querySelectorAll('.dmi-uptime-badge').length === 1,
+  String(knownRow.querySelectorAll('.dmi-uptime-badge').length))
 
-// A view that is switched off takes its dots with it on the next pass, rather than
-// leaving a claim about a model in a menu the user can still open. Fired through the
-// same event the settings page fires, because that is how a change reaches the
-// decorator in the application.
+// The panel and the badges read different windows on purpose: a day is room enough for
+// the whole picture, an hour is what "is it broken now" means. Switching the panel to a
+// month must not repaint a badge whose tooltip says «за последний час» — and the mirror
+// answers the longer window with doubled counts here, so a repaint would be visible
+// rather than silently identical.
+requests.length = 0
+rangeSwitch(tree).props.onChange({ target: { value: '30d' } })
+await settle()
+// A render, because the stub runs effects on the render that follows a state change —
+// which is what React does too, and what makes the request appear.
+tree = await view()
+check('the panel asked for a month of it',
+  requests.some(item => item.path.includes('/uptime.json') && item.path.includes('range=30d')),
+  JSON.stringify(requests.map(item => item.path).filter(item => item.includes('uptime'))))
+await pass()
+check('and the badges still show the hour, not the month',
+  badgeNamed('glm-5.3')?.textContent === '3' && stateOfRow('glm-5.3') === 'issues'
+  && titleOfRow('glm-5.3').includes('за последний час'),
+  `${String(badgeNamed('glm-5.3')?.textContent)} ${titleOfRow('glm-5.3')}`)
+
+// The harness draws a pill of its own on some rows — the «1017» context count on the
+// DeepSeek rows. Ours has to coexist with it: both survive, ours is not nested inside
+// it, and a repaint still adds nothing.
+const pillRow = rowNamed('glm-5.3')
+const foreignPill = documentStub.createElement('span')
+foreignPill.setAttribute('class', 'ms_badge')
+foreignPill.textContent = '1017'
+pillRow.appendChild(foreignPill)
+await pass()
+check('a row already carrying the harness pill keeps both',
+  pillRow.querySelectorAll('.ms_badge').length === 1
+  && pillRow.querySelectorAll('.dmi-uptime-badge').length === 1,
+  pillRow.children.map(child => child.className).join('|'))
+check('ours is a sibling of that pill, not a child of it',
+  badgeOf(pillRow).parentNode === pillRow && !foreignPill.contains(badgeOf(pillRow)))
+check('and stands to the left of the pill it made room for',
+  pillRow.children.indexOf(badgeOf(pillRow)) < pillRow.children.indexOf(foreignPill),
+  pillRow.children.map(child => child.className).join('|'))
+await pass()
+check('a third pass still adds no second badge', pillRow.querySelectorAll('.dmi-uptime-badge').length === 1,
+  String(pillRow.querySelectorAll('.dmi-uptime-badge').length))
+
+// A view that is switched off takes its badges with it on the next pass, rather than
+// leaving a claim nobody is reading any more on a menu the user can still open. Fired
+// through the same event the settings page fires, because that is how a change reaches
+// the decorator in the application.
 const reloadDecorator = async () => {
   window.dispatchEvent({ type: 'dsh-rustvy:changed', detail: {} })
   await settle()
 }
 STATE.config.uptimeView = false
 await reloadDecorator()
-check('a switched-off view leaves no dot in any menu',
-  documentStub.querySelectorAll('.dmi-uptime-dot').length === 0,
-  String(documentStub.querySelectorAll('.dmi-uptime-dot').length))
+check('a switched-off view leaves no badge in any menu',
+  documentStub.querySelectorAll('.dmi-uptime-badge').length === 0,
+  String(documentStub.querySelectorAll('.dmi-uptime-badge').length))
 check('and leaves every vendor mark where it was',
   knownRow.querySelectorAll('.dmi-mark').length === 1 && menu.querySelectorAll('.dmi-mark').length > 0)
 STATE.config.uptimeView = true
 await reloadDecorator()
-check('the dots come back with the view', dotOf(rowNamed('claude-opus-5-5')) !== undefined)
+check('the badges come back with the view', badgeOf(rowNamed('claude-opus-5-5')) !== undefined)
+
+// --- a collector that cannot answer the hour --------------------------------
+// The state every user is in between the plugin updating and the Go collector being
+// deployed: `range=1h` does not exist in v1, the server answers a 400, the host turns it
+// into a 502 with no models, and the badges' window is exactly the one that fails. Per
+// §5 that is already the correct rendering — a window the collector cannot answer is a
+// window in which it named no model, and a model it did not name gets nothing — but it
+// has to be *seen* to be believed, because the failures worth ruling out are a badge path
+// that throws, one that hangs on a pending read, and one that leaves the previous
+// window's numbers on screen.
+UPTIME_MODE = 'v1-server'
+tree = await view()
+rangeSwitch(tree).props.onChange({ target: { value: '1h' } })
+await settle()
+tree = await view()
+text = allText(tree)
+check('the panel names the window it could not read, not just the failure',
+  text.includes('Коллектор не ответил за период «1h»') && text.includes('приёмник аптайма ответил 400'),
+  text.slice(text.indexOf('Коллектор не ответил'), text.indexOf('Коллектор не ответил') + 90))
+// The failed read clears the picker's map; the next decoration pass is what takes the
+// badges off the document, which is why a pass is fired before asserting on the DOM.
+await pass()
+check('every badge goes with the answer that named no model',
+  documentStub.querySelectorAll('.dmi-uptime-badge').length === 0,
+  String(documentStub.querySelectorAll('.dmi-uptime-badge').length))
+check('and no badge of the previous window is left behind on any row',
+  uptimeMenu.querySelectorAll('.dmi-uptime-badge').length === 0
+  && menu.querySelectorAll('.dmi-uptime-badge').length === 0)
+check('the vendor marks are untouched by it',
+  knownRow.querySelectorAll('.dmi-mark').length === 1 && menu.querySelectorAll('.dmi-mark').length > 0)
+check('the failing hour draws no rows at all, rather than empty ones',
+  uptimeRows(tree).length === 0, String(uptimeRows(tree).length))
+rangeSwitch(tree).props.onChange({ target: { value: '24h' } })
+await settle()
+tree = await view()
+check('which is the whole point: the day keeps working while the hour does not',
+  uptimeRows(tree).length === 4 && allText(tree).includes('ошибок 5 от 3 установок'),
+  String(uptimeRows(tree).length))
+
+// A transport failure is the same situation with no answer at all, and it has to clear
+// the badges too: unlike the panel, which can hold a cached picture and label it with the
+// moment it is from, a badge has no way to say "this is what we knew a while ago".
+UPTIME_MODE = 'badges'
+tree = await view()
+rangeSwitch(tree).props.onChange({ target: { value: '1h' } })
+await settle()
+tree = await view()
+await pass()
+check('the badges are back once the hour can be read again',
+  documentStub.querySelectorAll('.dmi-uptime-badge').length > 0
+  && badgeNamed('glm-5.3')?.textContent === '3',
+  String(documentStub.querySelectorAll('.dmi-uptime-badge').length))
+UPTIME_MODE = 'network'
+tree = await view()
+await pass()
+check('and a fetch that fails outright takes them with it rather than freezing them',
+  documentStub.querySelectorAll('.dmi-uptime-badge').length === 0
+  && knownRow.querySelectorAll('.dmi-mark').length === 1,
+  String(documentStub.querySelectorAll('.dmi-uptime-badge').length))
+UPTIME_MODE = 'badges'
+tree = await view()
+rangeSwitch(tree).props.onChange({ target: { value: '24h' } })
+await settle()
+tree = await view()
+await pass()
+
+// --- the selected-model trigger ---------------------------------------------
+// The same badge on the composer's model button, between the model's name and its
+// reasoning indicator. The trigger is the one surface where the model changes *under*
+// the badge, so it is checked for what no row can be: a switch rewrites the number or
+// drops it, and never leaves yesterday's model in today's button.
+/**
+ * The composer's selected-model trigger, in the shape the host renders it: a seat
+ * carrying `data-slot="conversation.input.model"`, a button whose label span names the
+ * model, then that button's own furniture — the reasoning indicator when this build
+ * draws one, the «Default» tag and the chevron — with the stop button beside the
+ * trigger, outside it.
+ *
+ * @param label - the model name the trigger shows.
+ * @param options - `{ reasoning: false }` for a build that draws no indicator.
+ * @returns the seat, the button, its label span and the stop button.
+ */
+function buildTrigger(label, options = {}) {
+  const seat = documentStub.createElement('div')
+  seat.setAttribute('data-slot', 'conversation.input.model')
+  const button = documentStub.createElement('button')
+  button.setAttribute('class', 'ms_trigger')
+  const text = documentStub.createElement('span')
+  text.setAttribute('class', 'ms_triggerLabel')
+  text.textContent = label
+  button.appendChild(text)
+  if (options.reasoning !== false) {
+    const reasoning = documentStub.createElement('span')
+    reasoning.setAttribute('class', 'ms_reasoning')
+    reasoning.textContent = 'высокие рассуждения'
+    button.appendChild(reasoning)
+  }
+  const tag = documentStub.createElement('span')
+  tag.setAttribute('class', 'ms_defaultTag')
+  tag.textContent = 'Default'
+  button.appendChild(tag)
+  const chevron = documentStub.createElement('span')
+  chevron.setAttribute('class', 'ms_chevron')
+  button.appendChild(chevron)
+  seat.appendChild(button)
+  const stop = documentStub.createElement('button')
+  stop.setAttribute('class', 'ms_stop')
+  seat.appendChild(stop)
+  documentStub.body.appendChild(seat)
+  return { seat, button, text, stop }
+}
+
+const trigger = buildTrigger('claude-opus-5-5')
+await pass()
+const triggerBadge = () => trigger.button.querySelector('.dmi-uptime-badge')
+const triggerOrder = () => trigger.button.children.map(child => child.className).join('|')
+check('the selected model carries a badge of its own state on its trigger',
+  triggerBadge()?.attributes['data-dmi-state'] === 'ok'
+  && triggerBadge()?.attributes['data-dmi-shape'] === 'dot'
+  && triggerBadge()?.textContent === ''
+  && triggerBadge().attributes['data-dmi-surface'] === 'trigger',
+  `${String(triggerBadge()?.attributes['data-dmi-state'])} "${String(triggerBadge()?.textContent)}"`)
+check('coloured by the same rule as a row badge',
+  triggerBadge().style.properties['--dmi-badge-color'] === '#22c55e',
+  String(triggerBadge()?.style.properties['--dmi-badge-color']))
+check('and placed between the model name and the reasoning indicator',
+  trigger.button.children.indexOf(triggerBadge()) === trigger.button.children.indexOf(trigger.text) + 1
+  && trigger.button.children.indexOf(trigger.button.querySelector('.ms_reasoning'))
+    === trigger.button.children.indexOf(triggerBadge()) + 1,
+  triggerOrder())
+check('the trigger own furniture is untouched by it',
+  trigger.button.querySelectorAll('.ms_reasoning').length === 1
+  && trigger.button.querySelectorAll('.ms_defaultTag').length === 1
+  && trigger.button.querySelectorAll('.ms_chevron').length === 1
+  && trigger.stop.parentNode === trigger.seat,
+  triggerOrder())
+check('and the vendor mark still leads the button',
+  trigger.button.querySelectorAll('.dmi-mark').length === 1
+  && trigger.button.children[0].classList.contains('dmi-mark'),
+  triggerOrder())
+
+// A build that draws no reasoning indicator — a model without reasoning, or an older
+// bundle — still gets a badge, anchored to the name rather than to a child position.
+const plainTrigger = buildTrigger('glm-5.3', { reasoning: false })
+await pass()
+check('a trigger with no reasoning indicator still draws one',
+  plainTrigger.button.querySelector('.dmi-uptime-badge')?.textContent === '3'
+  && plainTrigger.button.querySelector('.dmi-uptime-badge')?.attributes['data-dmi-state'] === 'issues',
+  String(plainTrigger.button.querySelector('.dmi-uptime-badge')?.textContent))
+check('anchored right after the model name',
+  plainTrigger.button.children.indexOf(plainTrigger.button.querySelector('.dmi-uptime-badge'))
+  === plainTrigger.button.children.indexOf(plainTrigger.text) + 1,
+  plainTrigger.button.children.map(child => child.className).join('|'))
+
+// The failure mode this surface adds: the model changes under the badge, and here it
+// changes shape too — a quiet dot for a healthy model becomes a red count for a broken
+// one, which is the version of "stale" a colour alone could hide.
+trigger.text.textContent = 'qwen3.7-plus'
+await pass()
+check('switching the selected model rewrites the badge rather than keeping it',
+  triggerBadge()?.textContent === '2' && triggerBadge().attributes['data-dmi-state'] === 'down'
+  && triggerBadge().attributes['data-dmi-shape'] === 'pill',
+  `${String(triggerBadge()?.textContent)} ${String(triggerBadge()?.attributes['data-dmi-state'])}`)
+check('and the badge stays between the name and the reasoning',
+  trigger.button.children.indexOf(triggerBadge()) === trigger.button.children.indexOf(trigger.text) + 1,
+  triggerOrder())
+trigger.text.textContent = 'mistral-large-3'
+await pass()
+check('a model the collector did not name leaves no stale badge behind',
+  trigger.button.querySelector('.dmi-uptime-badge') === null, triggerOrder())
+trigger.text.textContent = 'claude-opus-5-5'
+await pass()
+check('and the badge returns with a model it does name',
+  triggerBadge()?.attributes['data-dmi-state'] === 'ok' && triggerBadge()?.textContent === '',
+  String(triggerBadge()?.attributes['data-dmi-state']))
+await pass()
+check('a second pass draws no second badge on the trigger',
+  trigger.button.querySelectorAll('.dmi-uptime-badge').length === 1, triggerOrder())
+
+// «Иконка в кнопке выбранной модели» is the user's word on whether this half writes into
+// the trigger at all, so a trigger they asked to leave alone gets no badge either —
+// while the rows, which that switch says nothing about, keep theirs.
+STATE.config.markTrigger = false
+await reloadDecorator()
+check('a trigger the user asked to leave unmarked gets no badge',
+  documentStub.querySelectorAll('.dmi-uptime-badge[data-dmi-surface="trigger"]').length === 0
+  && documentStub.querySelectorAll('.dmi-uptime-badge[data-dmi-surface="row"]').length > 0,
+  String(documentStub.querySelectorAll('.dmi-uptime-badge[data-dmi-surface="row"]').length))
+STATE.config.markTrigger = true
+await reloadDecorator()
+check('and the trigger badge comes back with the switch',
+  triggerBadge()?.attributes['data-dmi-state'] === 'ok' && triggerBadge()?.textContent === '',
+  String(triggerBadge()?.attributes['data-dmi-state']))
+
+STATE.config.uptimeView = false
+await reloadDecorator()
+check('a switched-off view takes the trigger badge too',
+  trigger.button.querySelector('.dmi-uptime-badge') === null
+  && documentStub.querySelectorAll('.dmi-uptime-badge').length === 0)
+STATE.config.uptimeView = true
+await reloadDecorator()
+check('and gives it back with the view',
+  triggerBadge()?.attributes['data-dmi-state'] === 'ok' && triggerBadge()?.textContent === '',
+  String(triggerBadge()?.attributes['data-dmi-state']))
+
+// The same hour the v1 collector cannot answer, on the surface where a stale number would
+// be worst: the button names the model the user is about to send to.
+UPTIME_MODE = 'v1-server'
+tree = await view()
+rangeSwitch(tree).props.onChange({ target: { value: '1h' } })
+await settle()
+tree = await view()
+await pass()
+check('a trigger badge goes too, and its vendor mark stays',
+  trigger.button.querySelector('.dmi-uptime-badge') === null
+  && trigger.button.querySelectorAll('.dmi-mark').length === 1
+  && trigger.button.querySelectorAll('.ms_reasoning').length === 1,
+  triggerOrder())
+UPTIME_MODE = 'badges'
+rangeSwitch(tree).props.onChange({ target: { value: '24h' } })
+await settle()
+tree = await view()
+await pass()
 
 // --- the interaction throttle ---------------------------------------------
 // Every pointerdown and focusin in the whole application reaches this half, and
@@ -1618,11 +2183,11 @@ check('the next interaction is throttled by the answer that POST brought home',
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)
 check('unload took the marks with it', menu.querySelectorAll('.dmi-mark').length === 0)
-// The dots are this half's writing in the host's menu exactly like the marks are, and
-// a dot left behind would keep claiming an uptime nobody is asking about any more.
-check('unload took the uptime dots with it',
-  documentStub.querySelectorAll('.dmi-uptime-dot').length === 0,
-  String(documentStub.querySelectorAll('.dmi-uptime-dot').length))
+// The badges are this half's writing in the host's menu exactly like the marks are, and
+// a badge left behind would keep quoting a percentage nobody is reading any more.
+check('unload took the uptime badges with it',
+  documentStub.querySelectorAll('.dmi-uptime-badge').length === 0,
+  String(documentStub.querySelectorAll('.dmi-uptime-badge').length))
 // The groups this half hid are its doing, so an unload has to give them back:
 // leaving the class behind would hide a whole provider with nothing able to
 // restore it, since the stylesheet that reads the class goes too.
