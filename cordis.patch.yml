@@ -19,8 +19,10 @@
 # (`lib/index.js`, the package main) is read once per process. That entry is a
 # stable bootstrap whose whole job is to import the implementation through a
 # cache-busting `?rev=` query and import it again whenever the files on disk
-# change — so `lib/host.js`, `lib/models.js` and `lib/net.js` still reload live
-# with no restart, and only an edit to the bootstrap itself needs one.
+# change — so `lib/host.js` and the modules it re-imports the same way
+# (`lib/models.js`, `lib/keys.js`, `lib/net.js`, `lib/errors.js`, `lib/uptime.js`)
+# still reload live with no restart, and only an edit to the bootstrap itself
+# needs one.
 - insert:
     - id: dsh-rustvy
       name: dsh-rustvy

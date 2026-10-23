@@ -88,6 +88,15 @@ const entry = {
 }
 const edits = []
 const logs = []
+/**
+ * Every listener per event, in registration order.
+ *
+ * An array rather than one slot per event: the host half now installs two
+ * `agent/request` listeners — the error watcher and the key ring's swap — and a
+ * bus that kept only the last one registered would let this file pass while
+ * proving nothing about the two composing, which is the property the swap's
+ * reported route depends on.
+ */
 const listeners = new Map()
 
 const ctx = {
@@ -109,9 +118,11 @@ const ctx = {
     },
   },
   on: (event, listener) => {
-    listeners.set(event, listener)
+    listeners.set(event, [...(listeners.get(event) ?? []), listener])
     return () => {
-      if (listeners.get(event) === listener) listeners.delete(event)
+      const left = (listeners.get(event) ?? []).filter(held => held !== listener)
+      if (left.length === 0) listeners.delete(event)
+      else listeners.set(event, left)
     }
   },
 }
@@ -154,17 +165,31 @@ function check(label, ok, detail) {
   console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${detail === undefined ? '' : `  — ${detail}`}`)
 }
 
-/** Run one `agent/request` dispatch through the listener this half installed. */
+/**
+ * Run one `agent/request` dispatch through every listener this half installed.
+ *
+ * Composed the way Cordis composes a waterfall — outermost first, each `next()`
+ * calling the next listener and the last one calling the base — so what comes back
+ * is what the outermost listener returned. In the host half that is the error
+ * watcher handing on the route the key ring has just renamed, which is the route
+ * worth reporting.
+ */
 async function request(sessionId, proposed) {
-  const listener = listeners.get('agent/request')
-  if (typeof listener !== 'function') throw new Error('no agent/request listener was installed')
-  return listener({ agent: { session: { id: sessionId } }, turn: 1, step: 1 }, async () => proposed)
+  const chain = listeners.get('agent/request') ?? []
+  if (chain.length === 0) throw new Error('no agent/request listener was installed')
+  const payload = { agent: { session: { id: sessionId } }, turn: 1, step: 1 }
+  const step = index => (index < chain.length
+    ? chain[index](payload, () => step(index + 1))
+    : Promise.resolve(proposed))
+  return step(0)
 }
 
 const providers = () => liveConfig.providers
 
 // --- mount -----------------------------------------------------------------
-check('the swap listener is installed', typeof listeners.get('agent/request') === 'function')
+check('the swap listener is installed', (listeners.get('agent/request') ?? []).length > 0)
+check('the error watcher shares the event with the swap', (listeners.get('agent/request') ?? []).length >= 2,
+  `${(listeners.get('agent/request') ?? []).length} listeners`)
 const state = await call('GET', '/dsh-rustvy/state')
 check(`/state answers 200 for build ${build}`, state.status === 200 && state.json?.build === build, String(state.json?.build))
 check('/state reports the ring', state.json?.apiKeys?.count === 1, JSON.stringify(state.json?.apiKeys))
