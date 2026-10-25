@@ -1284,6 +1284,24 @@ check('the features the prose described are still on the page',
   && findButton(tree, 'Обновить каталог и иконки') !== undefined
   && findButton(tree, 'Записать список моделей') !== undefined)
 
+// The two buttons of that check sit on the brand fill, and the brand accent is
+// monochrome: near-black in the light palette, near-white in the dark one. A literal
+// white label was therefore white on white in the dark theme, and both buttons read as
+// blank rectangles. What has to hold is that the label comes from the token that
+// inverts with the fill — asserted over every primary button of the page, so the third
+// one («Починить маршруты», drawn only over a route the host lost) cannot drift alone.
+const BRAND_FILL = 'var(--dsw-alias-brand-primary)'
+const ON_BRAND = /^var\(--dsw-alias-label-primary-foreground,\s*var\(--dsw-alias-bg-base\)\)$/u
+const primaryButtons = collect(tree, 'button')
+  .filter(item => item.props.style?.background === BRAND_FILL)
+check('the primary buttons of this page are painted on the brand fill',
+  primaryButtons.some(item => allText(item).includes('Обновить каталог и иконки'))
+  && primaryButtons.some(item => allText(item).includes('Записать список моделей')),
+  primaryButtons.map(item => allText(item)).join(' | '))
+check('and their label inverts with that fill instead of being a literal white',
+  primaryButtons.length > 0 && primaryButtons.every(item => ON_BRAND.test(String(item.props.style.color))),
+  primaryButtons.map(item => `${allText(item)} → ${String(item.props.style.color)}`).join(' | '))
+
 // The one line that shared the closing block and survived it, because it is not prose:
 // it is the only place this page reports a catalog read that failed.
 STATE.error = 'connect ETIMEDOUT https://rustvy.xyz'

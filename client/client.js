@@ -147,6 +147,18 @@ window.__ModuleLoader__.load({
       borderStrong: 'var(--dsw-alias-border-l2)',
       surface: 'var(--dsw-alias-bg-layer-2)',
       brand: 'var(--dsw-alias-brand-primary)',
+      /**
+       * Text that sits on `brand`, and the reason it is a token and not a literal.
+       *
+       * The brand accent is monochrome and flips with the palette — near-black
+       * (`neutral-bluish-1000`) in light, near-white (`neutral-bluish-50`) in dark — so
+       * the hardcoded `#fff` that used to stand here was white on white in the dark
+       * theme, and both primary buttons on this page read as blank rectangles.
+       * `label-primary-foreground` is the palette's own pairing for a brand fill: white
+       * in light, near-black in dark. `bg-base` is the fallback for a third-party theme
+       * that does not carry it — the same inversion, and a token plugins are promised.
+       */
+      onBrand: 'var(--dsw-alias-label-primary-foreground, var(--dsw-alias-bg-base))',
       ok: 'var(--dsw-alias-state-success-primary)',
       bad: 'var(--dsw-alias-state-error-primary)',
       warn: 'var(--dsw-alias-state-warn-primary)',
@@ -1728,7 +1740,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           cursor: props.disabled === true ? 'default' : 'pointer',
           opacity: props.disabled === true ? 0.55 : 1,
           borderRadius: small ? '5px' : '6px',
-          color: primary ? '#fff' : C.label,
+          color: primary ? C.onBrand : C.label,
           background: primary ? C.brand : 'transparent',
           border: primary ? '1px solid transparent' : `1px solid ${C.borderStrong}`,
         },
