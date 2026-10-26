@@ -264,9 +264,16 @@ const ctx = {
       entry.options.config = liveConfig
     },
   },
-  on: (event, listener) => {
+  on: (event, listener, options) => {
     const list = listeners.get(event) ?? []
-    list.push(listener)
+    // Cordis: a boolean third argument is shorthand for `{ prepend }`, and `register()`
+    // unshifts a prepended listener, so array order is execution order and prepend buys
+    // outermost. Emulated faithfully because position in this array is the whole subject
+    // of the veto test below, and a harness that ignored it could not fail that test no
+    // matter what the plugin did.
+    const prepend = typeof options === 'object' && options !== null ? options.prepend === true : options === true
+    if (prepend) list.unshift(listener)
+    else list.push(listener)
     listeners.set(event, list)
     return () => {
       const current = listeners.get(event)
@@ -277,6 +284,23 @@ const ctx = {
     }
   },
 }
+
+/**
+ * A stand-in for the harness's own `dsh-llm-retry` plugin.
+ *
+ * Registered before the plugin mounts, exactly as a harness built-in is loaded before
+ * user plugins, so it sits *inside* the error watcher only if the watcher prepends.
+ * Armed, it behaves the way `backoff()` does: it returns `{ kind: 'retry' }` and never
+ * calls `next()`, which in a Cordis waterfall vetoes every listener inward of it.
+ */
+let retryVetoArmed = false
+const vetoSaw = []
+const vetoListener = (payload, next) => {
+  vetoSaw.push(payload?.provider ?? '')
+  if (retryVetoArmed) return Promise.resolve({ kind: 'retry' })
+  return next()
+}
+const disposeVeto = ctx.on('agent/request-error', vetoListener)
 
 let route = null
 ctx.webServer = { register: registered => { route = registered; return () => { route = null } } }
@@ -530,7 +554,12 @@ const UPSTREAM_503 = { message: 'upstream_503: the model origin is unavailable',
 
 // --- mount -----------------------------------------------------------------
 check('the request watcher is installed beside the key ring', (listeners.get('agent/request') ?? []).length === 2, String((listeners.get('agent/request') ?? []).length))
-check('the failure watcher is installed', (listeners.get('agent/request-error') ?? []).length === 1)
+// Two listeners on the waterfall now: the retry stand-in, registered before the plugin
+// mounted the way a harness built-in is, and the plugin's own. The count alone would
+// pass with the plugin innermost — which is the broken case — so the position is what
+// is asserted: `prepend` must have put ours outward of the veto.
+check('the failure watcher is installed', (listeners.get('agent/request-error') ?? []).length === 2, String((listeners.get('agent/request-error') ?? []).length))
+check('it is installed outside the retry plugin', (listeners.get('agent/request-error') ?? [])[0] !== vetoListener, String((listeners.get('agent/request-error') ?? []).indexOf(vetoListener)))
 check('the session watcher is installed', (listeners.get('session/event') ?? []).length === 1)
 
 const state = await call('GET', '/dsh-rustvy/state')
@@ -563,6 +592,19 @@ const INFRA = [
   ['upstream_503: the model origin is unavailable', 'PI_AI_ERROR', 'upstream_503', 503],
   ['upstream_400: the gateway rejected the request it relayed', 'PI_AI_ERROR', 'upstream_400', 400],
   ['upstream_404: the gateway has no route for that model', 'PI_AI_ERROR', 'upstream_404', 404],
+  // A 5xx leading its own clause: the shape a live 502 storm actually arrived in.
+  // The keyword-first pattern missed it, so the status parsed as 0 and the kind
+  // collapsed into `server`/`unknown` — the dashboard was right that something
+  // broke and wrong about what.
+  ['502 status code (no body)', 'SERVER', 'http_502', 502],
+  ['503 (no body)', 'SERVER', 'http_503', 503],
+  // The observed gateway-auth string. An outer 502 outranks auth-flavoured body
+  // prose, because 502 here is Rustvy's own gateway failing to authenticate to
+  // its upstream — an outage shared by every user, not somebody's key.
+  ['502: {"message":"Provider authentication failed","type":"upstream_error","code":null}', 'PI_AI_ERROR', 'http_502', 502],
+  // The gateway's `upstream_503` outranks an ABORTED code: the upstream verdict
+  // is the strongest evidence in the chain and is checked first.
+  ['The operation was aborted: upstream 503', 'ABORTED', 'upstream_503', 503],
 ]
 for (const [message, code, kind, status] of INFRA) {
   const classified = classifyFailure({ message, code })
@@ -583,19 +625,96 @@ const idle = classifyFailure({ message: IDLE_TIMEOUT, code: 'TIMEOUT' })
 check('an idle stream watchdog is infrastructure', idle.infra === true, JSON.stringify(idle))
 check('an idle stream watchdog is a timeout, not a connect timeout', idle.kind === 'timeout', String(idle.kind))
 
+// Each row names the kind it must be classified as, so the table pins both halves
+// of the verdict: that it is not infrastructure, and what it is instead. The kind
+// column is what catches a classifier that demotes a failure without ever saying
+// what it demoted it to.
 const NOT_INFRA = [
-  ['upstream_401: the gateway relayed an authentication refusal', 'AUTH'],
-  ['upstream_429: the gateway relayed a rate limit', 'RATE_LIMIT'],
-  ['You exceeded your current quota, please check your plan and billing details', 'QUOTA'],
-  ['the api key stored under RUSTVY_API_KEY is invalid', 'AUTH'],
-  ['rate limit reached, retry after 30 seconds', 'RATE_LIMIT'],
-  ['the request was aborted', 'ABORTED'],
-  ["this model's maximum context length is 1000000 tokens", 'CONTEXT_WINDOW_EXCEEDED'],
-  ['no credential is stored under RUSTVY_API_KEY', 'MISSING_CREDENTIAL'],
+  ['upstream_401: the gateway relayed an authentication refusal', 'AUTH', 'upstream_401'],
+  ['upstream_429: the gateway relayed a rate limit', 'RATE_LIMIT', 'upstream_429'],
+  ['You exceeded your current quota, please check your plan and billing details', 'QUOTA', 'quota'],
+  ['the api key stored under RUSTVY_API_KEY is invalid', 'AUTH', 'auth'],
+  ['rate limit reached, retry after 30 seconds', 'RATE_LIMIT', 'rate_limit'],
+  ['the request was aborted', 'ABORTED', 'aborted'],
+  ["this model's maximum context length is 1000000 tokens", 'CONTEXT_WINDOW_EXCEEDED', 'context'],
+  ['no credential is stored under RUSTVY_API_KEY', 'MISSING_CREDENTIAL', 'auth'],
+  // The ordering ladder: the harness's own code outranks an outer 5xx, so a
+  // failure the harness calls AUTH, RATE_LIMIT, QUOTA or ABORTED stays the
+  // user's problem even when the quoted body carries one. The status still
+  // parses — these assert `kind`, not `status: 0` — but it does not publish.
+  ['502: {"message":"Provider authentication failed","type":"upstream_error","code":null}', 'AUTH', 'auth'],
+  ['503 service unavailable while rate limited', 'RATE_LIMIT', 'rate_limit'],
+  ['502: insufficient quota', 'QUOTA', 'quota'],
+  ['aborted after 502 status code', 'ABORTED', 'aborted'],
+  // Non-5xx statuses keep their account verdicts: an unknown model is the
+  // sender's problem whatever the status answered, and so is a rate limit.
+  ['404: model gpt-6.1-sol does not exist', 'SERVER', 'model'],
+  ['429: rate limit exceeded', 'SERVER', 'rate_limit'],
+  ['401 Unauthorized', 'SERVER', 'auth'],
+  ['invalid api key provided', 'SERVER', 'auth'],
 ]
-for (const [message, code] of NOT_INFRA) {
+for (const [message, code, kind] of NOT_INFRA) {
   const classified = classifyFailure({ message, code })
   check(`classifyFailure does not call ${code} infrastructure`, classified.infra !== true, JSON.stringify(classified))
+  check(`classifyFailure names ${code} as ${kind}`, classified.kind === kind, `${classified.kind}, want ${kind}`)
+}
+
+// Status extraction is asserted separately because it is a different field: which
+// HTTP status the message names, including 0 for the ones that name none. The
+// adversarial rows are all numbers inside the status range that mean something
+// else — a port, a duration, a size, a count, a limit, a line number — and each
+// is a real false positive that a wider pattern would have caught.
+const STATUS_PARSING = [
+  ['502 status code (no body)', 502],
+  ['503 (no body)', 503],
+  ['500 status code', 500],
+  ['404 status code (no body)', 404],
+  ['502:', 502],
+  ['502: upstream connect error', 502],
+  ['upstream connect error: 503 (no body)', 503],
+  ['pi-ai: 502 status code', 502],
+  ['HTTP 502', 502],
+  ['got 502', 502],
+  ['status: 503', 503],
+  ['502 Bad Gateway', 502],
+  ['429 Too Many Requests', 429],
+  ['the collector answered 503', 503],
+  ['Connect Timeout Error (attempted address: rustvy.xyz:443, timeout: 10000ms)', 0],
+  ['pi-ai stream idle timeout after 300000ms', 0],
+  ['Request timed out after 429 ms', 0],
+  ['Request timed out.', 0],
+  ['payload is 512 bytes', 0],
+  ['connect to port 443 failed', 0],
+  ['max retries 500', 0],
+  ['retry limit 503', 0],
+  ['line 502 col 3', 0],
+  ['2025-10-26 502 errors', 0],
+  ['there were 503 errors today', 0],
+  ['v1.404 released', 0],
+  ['attempt 3 of 500 failed', 0],
+  ['the queue holds 502 records', 0],
+  ['error at line 502 (see log)', 0],
+  ['retry (500 attempts) exhausted', 0],
+  ['see note (502)', 0],
+  ['the batch of 443 (approx) failed', 0],
+]
+for (const [message, status] of STATUS_PARSING) {
+  const classified = classifyFailure({ message, code: 'SERVER' })
+  check(`status ${status} read from ${JSON.stringify(message.slice(0, 40))}`, classified.status === status, String(classified.status))
+}
+
+// Input shapes, not classification cases: a caller forwarding `String(error)`
+// previously produced an empty message, which classified as `unknown` — and
+// `unknown` is infra-capable, so the report was sent carrying nothing the
+// dashboard could describe. A record with no information is worse than none.
+const bare = classifyFailure('502 status code (no body)')
+check('a bare string is classified, not discarded', bare.kind === 'http_502' && bare.status === 502, JSON.stringify(bare))
+const asError = classifyFailure(new Error('502 status code (no body)'))
+check('an Error instance is classified through its message', asError.kind === 'http_502' && asError.status === 502, JSON.stringify(asError))
+for (const junk of [undefined, null, 42, true, [], new Map(), Symbol('probe'), () => {}]) {
+  const classified = classifyFailure(junk)
+  const shaped = typeof classified.infra === 'boolean' && typeof classified.kind === 'string' && Number.isInteger(classified.status)
+  check(`classifyFailure survives ${String(junk).slice(0, 20)}`, shaped, JSON.stringify(classified).slice(0, 120))
 }
 
 // --- the shape of one report -----------------------------------------------
@@ -1156,6 +1275,145 @@ check('every drop was still counted', afterHistogram.ignoredNonInfra === beforeH
 check('the histogram totals the drops even past the cap', sumOf(afterHistogram.ignoredByKind) === afterHistogram.ignoredNonInfra, `${sumOf(afterHistogram.ignoredByKind)} vs ${afterHistogram.ignoredNonInfra}`)
 check('a rare kind survived the cap rather than being evicted', kinds.some(kind => /^http_4/u.test(kind)), JSON.stringify(kinds.slice(0, 6)))
 check('none of the capped failures reached the collector', (await drain()).reports.length === 0)
+
+// --- an outer listener that vetoes the chain ---------------------------------
+// The regression a second machine hit: a harness built-in (`dsh-llm-retry`) loads
+// before user plugins, so it is outermost on the `agent/request-error` waterfall, and
+// its `backoff()` returns `{ kind: 'retry' }` without calling `next()` — which vetoes
+// every listener inward of it, this plugin's included. Every retryable upstream
+// failure was therefore settled before it could be seen, and a machine with real
+// outages reported none of them. Arming the stand-in proves the report still goes out,
+// which is only possible if the watcher prepended itself outside the veto.
+retryVetoArmed = true
+vetoSaw.length = 0
+const vetoAttempt = await begin('sess-veto', 'rustvy', MODEL)
+const vetoed = await failInBand(vetoAttempt, UPSTREAM_502)
+const vetoDrain = await drain()
+check('a vetoing retry plugin no longer hides the report', vetoDrain.reports.length === 1, JSON.stringify({ reports: vetoDrain.reports.length, vetoSaw }))
+check('the report that survived the veto is attributed', vetoDrain.reports[0]?.model === MODEL && vetoDrain.reports[0]?.provider === 'rustvy' && vetoDrain.reports[0]?.code === 'upstream_502', JSON.stringify(vetoDrain.reports[0]))
+check('the vetoing listener still ran, so recovery is untouched', vetoSaw.length === 1, JSON.stringify(vetoSaw))
+check('the loop still receives the retry decision', vetoed?.kind === 'retry', JSON.stringify(vetoed))
+retryVetoArmed = false
+
+// --- the unvetoable seam: llm/retry session events ---------------------------
+// `backoff()` appends `llm/retry` to the durable session log before it decides
+// anything, and a session log is not a waterfall — so this reaches us even if every
+// waterfall listener outward of us is vetoed. It carries no model field, which is what
+// the attribution assertions below are about.
+const retryAttempt = await begin('sess-llm-retry', 'rustvy', MODEL)
+emit('session/event', { id: 'sess-llm-retry' }, {
+  type: 'llm/retry',
+  data: {
+    retryId: 'retry-series-1', turn: 1, step: 1, provider: 'rustvy', mode: 'normal',
+    policyKey: 'rustvy/default', retry: 1, maxRetries: 3, delayMs: 500,
+    failure: UPSTREAM_503,
+  },
+})
+await tick()
+const retryDrain = await drain()
+check('an llm/retry session event produces a report', retryDrain.reports.length === 1, JSON.stringify(retryDrain.reports))
+check('its model comes from the recorded attempt', retryDrain.reports[0]?.model === MODEL, String(retryDrain.reports[0]?.model))
+check('its route comes from the event', retryDrain.reports[0]?.provider === 'rustvy', String(retryDrain.reports[0]?.provider))
+check('its kind is classified from the event failure', retryDrain.reports[0]?.code === 'upstream_503', String(retryDrain.reports[0]?.code))
+emit('session/event', { id: 'sess-llm-retry' }, { type: 'llm/retry-started', data: { retryId: 'retry-series-1', turn: 1, step: 1, retry: 2 } })
+await tick()
+check('llm/retry-started alone reports nothing', (await drain()).reports.length === 0)
+
+// The fold key errors-core depends on: the reporter folds repeats by `model|kind`, so
+// if the two seams resolved either differently one outage would become two reports.
+// Asserted as a property of the two outputs rather than left to shared code.
+const agreeInBand = await begin('sess-agree-band', 'rustvy', MODEL)
+await failInBand(agreeInBand, UPSTREAM_503)
+await tick()
+const agreeBand = await drain()
+const agreeRetry = await begin('sess-agree-retry', 'rustvy', MODEL)
+emit('session/event', { id: 'sess-agree-retry' }, {
+  type: 'llm/retry',
+  data: { retryId: 'r-2', turn: 1, step: 1, provider: 'rustvy', mode: 'always', policyKey: 'k', retry: 1, delayMs: 0, failure: UPSTREAM_503 },
+})
+await tick()
+const agreeSession = await drain()
+check('both seams agree on the fold key', agreeBand.reports[0]?.model === agreeSession.reports[0]?.model
+  && agreeBand.reports[0]?.provider === agreeSession.reports[0]?.provider
+  && agreeBand.reports[0]?.code === agreeSession.reports[0]?.code,
+JSON.stringify({ band: agreeBand.reports[0], session: agreeSession.reports[0] }))
+
+// `always` mode is the double-sight case: downstream settles first, so the in-band seam
+// reports and then `llm/retry` describes the same fault. One attempt, one report.
+const dupAttempt = await begin('sess-dup', 'rustvy', MODEL)
+await failInBand(dupAttempt, UPSTREAM_502)
+await tick()
+await drain()
+const beforeDup = await summary()
+emit('session/event', { id: 'sess-dup' }, {
+  type: 'llm/retry',
+  data: { retryId: 'r-3', turn: 1, step: 1, provider: 'rustvy', mode: 'always', policyKey: 'k', retry: 1, delayMs: 0, failure: UPSTREAM_502 },
+})
+await tick()
+const dupDrain = await drain()
+check('a fault seen on both seams is reported once', dupDrain.reports.length === 0, JSON.stringify(dupDrain.reports))
+check('the second sight counts as a duplicate', (await summary()).duplicates === beforeDup.duplicates + 1, `${beforeDup.duplicates} → ${(await summary()).duplicates}`)
+
+// --- turn/end with no recorded attempt ---------------------------------------
+// The case the user hit first: an idle-stream watchdog throws out of the step, so it
+// never reaches `agent/request-error`, and if `agent/request` was vetoed there is no
+// attempt to attribute it to either. The route and the model come from the session's
+// own folds — `request/context` and `request/header` — which exist independently of any
+// listener of ours.
+const orphanSession = {
+  id: 'sess-orphan',
+  requestContext: () => ({ provider: 'rustvy', model: MODEL }),
+  requestHeader: () => ({ config: { provider: 'rustvy', model: MODEL } }),
+}
+const beforeOrphan = await summary()
+emit('session/event', orphanSession, {
+  type: 'turn/end',
+  data: { turn: 3, reason: { kind: 'error', error: { message: 'pi-ai stream idle timeout after 300000ms', code: 'TIMEOUT' } } },
+})
+await tick()
+const orphanDrain = await drain()
+check('a turn/end with no attempt is still reported', orphanDrain.reports.length === 1, JSON.stringify(orphanDrain.reports))
+check('its route came from the session fold', orphanDrain.reports[0]?.provider === 'rustvy', String(orphanDrain.reports[0]?.provider))
+check('its model came from the session fold', orphanDrain.reports[0]?.model === MODEL, String(orphanDrain.reports[0]?.model))
+check('an orphan turn is counted as unattributed', (await summary()).unattributed === beforeOrphan.unattributed + 1, `${beforeOrphan.unattributed} → ${(await summary()).unattributed}`)
+
+// Ownership still applies to a reconstructed route, or the session fold would become a
+// way to publish the built-in DeepSeek account's failures as ours.
+const beforeForeign = await summary()
+emit('session/event', {
+  id: 'sess-orphan-foreign',
+  requestContext: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+}, { type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: UPSTREAM_502 } } })
+await tick()
+check('an orphan turn on a foreign route is still not reported', (await drain()).reports.length === 0)
+check('it is counted as a foreign route', (await summary()).ignoredRoute === beforeForeign.ignoredRoute + 1, `${beforeForeign.ignoredRoute} → ${(await summary()).ignoredRoute}`)
+
+// And a turn the user stopped is still not an outage, attempt or no attempt.
+emit('session/event', orphanSession, { type: 'turn/end', data: { turn: 4, reason: { kind: 'aborted' } } })
+await tick()
+check('an aborted orphan turn reports nothing', (await drain()).reports.length === 0)
+
+// A fault already reported in band must not be reported again by the turn that ends
+// because of it. The coordinate map is what stands in for an attempt's `reported` flag
+// when there is no attempt.
+const coordSession = { id: 'sess-coord', requestContext: () => ({ provider: 'rustvy', model: MODEL }) }
+const beforeCoord = await summary()
+await dispatch('agent/request-error', {
+  agent: { session: coordSession }, turn: 9, step: 1, provider: 'rustvy', failure: UPSTREAM_502,
+  retryPolicy: undefined, signal: new AbortController().signal,
+}, async () => undefined)
+const coordBand = await drain()
+emit('session/event', coordSession, { type: 'turn/end', data: { turn: 9, reason: { kind: 'error', error: UPSTREAM_502 } } })
+await tick()
+const coordTurn = await drain()
+check('the in-band seam reported the unattributed fault', coordBand.reports.length === 1, JSON.stringify(coordBand.reports))
+check('turn/end does not report the same fault again', coordTurn.reports.length === 0, JSON.stringify(coordTurn.reports))
+check('the repeat is counted as a duplicate', (await summary()).duplicates === beforeCoord.duplicates + 1, `${beforeCoord.duplicates} → ${(await summary()).duplicates}`)
+
+// The stand-in is this file's listener, not the plugin's, so it is ours to remove: the
+// reload assertions below check that `dispose()` released *every* listener, and a
+// fixture that left one behind would make the plugin look like it leaked.
+disposeVeto()
 
 // The same identity over the whole run rather than over one phase: every failure
 // this revision was handed, from the first shape check to the last, is in exactly

@@ -16,7 +16,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { dirname, join, resolve, relative, isAbsolute, extname } from 'node:path'
+import { dirname, join, resolve, relative, isAbsolute, extname, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -435,6 +435,82 @@ if (existsSync(join(ROOT, 'PUBLISHING.md'))) {
   check('the publishing guide names the catalog repository',
     read('PUBLISHING.md').includes('awesome-dsh-plugin'),
     'the market reads that list, so the guide has to name it')
+}
+
+/* --------------------------- character-set corruption ---------------------- */
+
+// Mixed-alphabet corruption reached this project three times: an ideograph in
+// Russian prose, an ideograph in a Russian comment, and two words whose halves were
+// in different alphabets — written the same day, in files whose author was already
+// looking for exactly that. None of the three is visible by reading: a word with one
+// Latin and one Cyrillic half reads as a word, and the editor renders it cleanly. A
+// CJK scan sees two of the three and none of the glued ones.
+//
+// The expected script set is a function of the file's declared language rather than
+// one global allowlist, because exempting `locale/` would have removed coverage
+// from `ru.json` — the most plausible place in the package for a glued token or a
+// stray ideograph. Naming the language turns the exemption into an assertion, and
+// catches a case no single list can: Cyrillic smuggled into `en.json`.
+try {
+  const charset = await import(`file://${join(ROOT, 'scripts/charset-check.mjs').replace(/\\/g, '/')}`)
+
+  // The self-test is the point of this section. A check that only ever passes cannot
+  // be told apart from a check that never ran, which is how a blocking bug shipped on
+  // a fully green suite and how four escaping assertions survived without executing
+  // once. Each corruption class is asserted on a throwaway file outside the
+  // repository, so the scanner is proven able to go red before its silence is
+  // accepted as news.
+  const probe = charset.selfTest()
+  if (probe.unavailable !== undefined) {
+    check('the character-set self-test could create its throwaway files', false, probe.unavailable)
+  } else {
+    check('a mixed-alphabet token is caught', probe.mixedToken.length > 0, charset.describe(probe.mixedToken, undefined, 1))
+    check('an ideograph where none is allowed is caught', probe.ideographNotAllowed.length > 0, charset.describe(probe.ideographNotAllowed, undefined, 1))
+    check('Cyrillic inside en.json is caught', probe.cyrillicInEnglishLocale.length > 0, charset.describe(probe.cyrillicInEnglishLocale, undefined, 1))
+    check('an unrecognised locale language fails rather than being skipped',
+      probe.unknownLocaleLanguage.length > 0, charset.describe(probe.unknownLocaleLanguage, undefined, 1))
+    check('a clean document is not flagged', probe.cleanDocument.length === 0, charset.describe(probe.cleanDocument, undefined, 1))
+    check('the Chinese locale passes with Chinese text', probe.chineseLocale.length === 0, charset.describe(probe.chineseLocale, undefined, 1))
+    check('the Russian locale passes with Russian text', probe.russianLocale.length === 0, charset.describe(probe.russianLocale, undefined, 1))
+  }
+
+  // The scanner has to pass its own scan. Its fixtures are built from codepoints
+  // rather than typed, so a literal ideograph or a glued word inside the module is a
+  // real defect and not test data — and without this assertion the module could drift
+  // into carrying the very corruption it hunts, invisible to a gate that only looks
+  // at what ships.
+  const selfScan = charset.scanFile(join(ROOT, 'scripts/charset-check.mjs'))
+  check('the character-set scanner passes its own scan', selfScan.length === 0, charset.describe(selfScan, ROOT))
+
+  // The real tree. Naming the two files that must be in the set is what keeps the
+  // three zero-finding checks below from passing vacuously: an empty file list, or a
+  // path that resolves nowhere, also produces zero findings.
+  const shipped = charset.shippedTextFiles(ROOT, manifest.files).map(file => file.split(sep).join('/'))
+  check('the character-set scan reaches the shipped text files',
+    shipped.length >= 15 && shipped.some(file => file.endsWith('locale/zh.json')) && shipped.some(file => file.endsWith('lib/errors.js')),
+    `${shipped.length} files`)
+  const shippedFindings = shipped.map(file => charset.scanFile(file)).flat()
+  const shippedOf = kind => shippedFindings.filter(one => one.kind === kind)
+  check('no shipped file holds a mixed-alphabet token', shippedOf('mixed-alphabet').length === 0,
+    charset.describe(shippedOf('mixed-alphabet'), ROOT))
+  check('no shipped file holds an unexpected character', shippedOf('unexpected-character').length === 0,
+    charset.describe(shippedOf('unexpected-character'), ROOT))
+  check('every shipped locale names a language this gate has a rule for', shippedOf('unknown-locale-language').length === 0,
+    charset.describe(shippedOf('unknown-locale-language'), ROOT))
+
+  // Documents do not ship, but people read them, and that is where the corruption
+  // first appeared — so they are scanned by the same rules in the same run.
+  const docs = charset.docFiles(ROOT).map(file => file.split(sep).join('/'))
+  check('the character-set scan reaches docs/*.md', docs.length >= 3, `${docs.length} files`)
+  const docsFindings = docs.map(file => charset.scanFile(file)).flat()
+  check('no document holds a mixed-alphabet token',
+    docsFindings.filter(one => one.kind === 'mixed-alphabet').length === 0,
+    charset.describe(docsFindings.filter(one => one.kind === 'mixed-alphabet'), ROOT))
+  check('no document holds an unexpected character',
+    docsFindings.filter(one => one.kind === 'unexpected-character').length === 0,
+    charset.describe(docsFindings.filter(one => one.kind === 'unexpected-character'), ROOT))
+} catch (error) {
+  check('the character-set scanner imports', false, error.message)
 }
 
 const failed = results.filter(ok => !ok).length
