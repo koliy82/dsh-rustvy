@@ -2198,6 +2198,232 @@ await interact()
 check('the next interaction is throttled by the answer that POST brought home',
   sessionReads() === 0, String(sessionReads()))
 
+// --- the route bootstrap line ------------------------------------------------
+// What the mount-time route creation did, on the page. The complaint this answers is a
+// silent no-op: on a clean install the plugin created nothing, said nothing, and the model
+// list held only the built-in DeepSeek with no key. Visibility is half the fix, so every
+// cell of the `state` × `keySet` matrix is asserted — including the cells that must stay
+// silent, because an assertion that a line does *not* render is the only thing standing
+// between this page and a line that renders for everybody and therefore trains nobody to
+// read it.
+const bootstrapLinesOf = node => collect(node, 'div').filter(item => item.props.className === 'dmi-bootstrap-line')
+
+/**
+ * Render the page against one `routeBootstrap` value.
+ *
+ * @param routeBootstrap - the object, `null`, or `undefined` for "the key is absent".
+ * @returns one `{ tone, text }` per line the page drew.
+ */
+async function bootstrapOf(routeBootstrap) {
+  if (routeBootstrap === undefined) delete STATE.routeBootstrap
+  else STATE.routeBootstrap = routeBootstrap
+  const rendered = await view()
+  return bootstrapLinesOf(rendered).map(item => ({ tone: item.props['data-dmi-tone'], text: allText(item) }))
+}
+
+const textsOf = lines => lines.map(line => line.text)
+const joinedOf = lines => textsOf(lines).join(' | ')
+
+// host-wiring's captured clean-install answer, verbatim: no credentials service mounted and
+// `RUSTVY_API_KEY` unset, so `keySet` is null and the default model was switched. Captured
+// before §9, so it carries no `source` key at all — which is itself a case the page has to
+// survive, since absence and null mean different things everywhere else in this contract.
+const CLEAN_INSTALL = {
+  provider: { state: 'created', models: 3, reason: null, error: null, keySet: null },
+  defaultModel: { state: 'switched', from: 'deepseek-official', to: 'rustvy', model: 'ahmia-v7-pro', reason: null },
+}
+
+let lines = await bootstrapOf(undefined)
+check('a host half without the field draws nothing and does not throw', lines.length === 0, String(lines.length))
+lines = await bootstrapOf(null)
+check('an explicit null draws nothing either', lines.length === 0, String(lines.length))
+
+lines = await bootstrapOf(CLEAN_INSTALL)
+check('a created route says it was created, and how many models it serves',
+  textsOf(lines)[0] === 'Маршрут rustvy создан этим монтированием: 3 модели.', joinedOf(lines))
+check('in a calm tone rather than a warning one', lines[0].tone === 'ok', String(lines[0].tone))
+check('and an absent `source` key is survived rather than guessed at',
+  !joinedOf(lines).includes('локальной копии'), joinedOf(lines))
+check('the switched default names all three strings as they arrived',
+  textsOf(lines).some(item => item.includes('с deepseek-official на rustvy') && item.includes('ahmia-v7-pro')),
+  joinedOf(lines))
+// §8: `null` points at both places without claiming to know anything. The assertion that
+// keeps the two phrasings apart is the negative one — a reword that merged them would put
+// «ещё не задан» back on a machine that works, which is the lie §8 exists to prevent.
+check('a keySet the host could not determine directs without asserting',
+  textsOf(lines).some(item => item.includes('Ключ задаётся в кольце ключей ниже или переменной RUSTVY_API_KEY'))
+  && !joinedOf(lines).includes('не задан'), joinedOf(lines))
+check('and that guidance is quiet rather than a warning',
+  lines.find(line => line.text.includes('Ключ задаётся'))?.tone === 'quiet',
+  String(lines.find(line => line.text.includes('Ключ задаётся'))?.tone))
+
+lines = await bootstrapOf({
+  provider: { state: 'created', models: 3, reason: null, error: null, keySet: false, source: 'served' },
+  defaultModel: null,
+})
+check('a created route with no credential asserts it, then directs',
+  textsOf(lines).includes('Ключ ещё не задан — задайте его в кольце ключей ниже или переменной RUSTVY_API_KEY.'),
+  joinedOf(lines))
+check('and that one warns',
+  lines.find(line => line.text.includes('ещё не задан'))?.tone === 'warn',
+  String(lines.find(line => line.text.includes('ещё не задан'))?.tone))
+check('a served list needs no provenance sentence', !joinedOf(lines).includes('локальной копии'), joinedOf(lines))
+check('and no default-model line when that step did not run',
+  !joinedOf(lines).includes('Модель по умолчанию'), joinedOf(lines))
+
+lines = await bootstrapOf({
+  provider: { state: 'created', models: 3, reason: null, error: null, keySet: true, source: 'served' },
+  defaultModel: null,
+})
+check('a created route whose key resolves says nothing about the key',
+  !joinedOf(lines).includes('Ключ'), joinedOf(lines))
+
+lines = await bootstrapOf({
+  provider: { state: 'created', models: 27, reason: null, error: null, keySet: true, source: 'catalog' },
+  defaultModel: null,
+})
+check('a list taken from the local mirror says so, and what to do about it',
+  textsOf(lines).some(item => item.includes('из локальной копии каталога') && item.includes('когда сеть появится')),
+  joinedOf(lines))
+
+// The steady state, and the cell §6.1 had to rule on because §6 and §8 decide by different
+// dimensions: an existing route with a key is what every current user has, forever.
+lines = await bootstrapOf({
+  provider: { state: 'exists', models: null, reason: null, error: null, keySet: null, source: null },
+  defaultModel: { state: 'skipped', from: null, to: null, model: null, reason: 'route_existed' },
+})
+check('an existing route draws nothing at all', lines.length === 0, joinedOf(lines))
+lines = await bootstrapOf({
+  provider: { state: 'exists', models: null, reason: null, error: null, keySet: true, source: null },
+  defaultModel: null,
+})
+check('and an existing route with a key is just as quiet', lines.length === 0, joinedOf(lines))
+
+// The cell that would otherwise be silent on a broken machine: the route is there, nothing
+// resolves, and the plugin did not create it — so it may not claim credit for it either.
+lines = await bootstrapOf({
+  provider: { state: 'exists', models: null, reason: null, error: null, keySet: false, source: null },
+  defaultModel: { state: 'skipped', from: null, to: null, model: null, reason: 'route_existed' },
+})
+check('an existing route with no credential speaks',
+  lines.length === 1 && lines[0].text.includes('Ключ ещё не задан'), joinedOf(lines))
+check('without claiming a creation it did not do', !joinedOf(lines).includes('создан'), joinedOf(lines))
+
+lines = await bootstrapOf({
+  provider: {
+    state: 'failed', models: null, reason: 'no_model_source', keySet: false, source: null,
+    error: 'источник списка моделей не ответил, а зеркала каталога нет',
+  },
+  defaultModel: null,
+})
+check('a route that could not be created says why, in the host own words',
+  textsOf(lines)[0] === 'Маршрут rustvy не создан: источник списка моделей не ответил, а зеркала каталога нет.',
+  joinedOf(lines))
+check('with the real next action beside it',
+  textsOf(lines).some(item => /перезагрузите окно DSH/iu.test(item)), joinedOf(lines))
+check('and that action is network-side, not the catalog button a dead origin cannot answer',
+  textsOf(lines).some(item => item.includes('прокси') || item.includes('VPN'))
+  && !joinedOf(lines).includes('Обновить каталог и иконки'), joinedOf(lines))
+check('a failed route never mentions a key nothing could use', !joinedOf(lines).includes('Ключ'), joinedOf(lines))
+check('and warns rather than reassures', lines[0].tone === 'warn', String(lines[0].tone))
+
+lines = await bootstrapOf({
+  provider: { state: 'failed', models: null, reason: 'no_config_editor', keySet: null, source: null, error: null },
+  defaultModel: null,
+})
+check('a reason with no host sentence of its own still names itself',
+  textsOf(lines)[0].includes('композиция не монтирует редактор конфигурации'), joinedOf(lines))
+check('and says plainly that a reload will not help',
+  textsOf(lines).some(item => item.includes('Перезагрузка окна не поможет')), joinedOf(lines))
+
+lines = await bootstrapOf({
+  provider: { state: 'skipped', models: null, reason: 'a_reason_from_a_newer_host', keySet: null, source: null, error: null },
+  defaultModel: null,
+})
+check('an unknown reason code is printed as it came rather than replaced by a guess',
+  textsOf(lines)[0].includes('a_reason_from_a_newer_host'), joinedOf(lines))
+lines = await bootstrapOf({
+  provider: { state: 'half_done', models: null, reason: null, keySet: null, source: null, error: null },
+  defaultModel: { state: 'pending', reason: null },
+})
+check('and so is an unknown state on either step',
+  textsOf(lines).some(item => item.includes('half_done')) && textsOf(lines).some(item => item.includes('pending')),
+  joinedOf(lines))
+
+// The default-model step: the plugin looked, found a choice the user had made, and correctly
+// left it alone. Not a failure, and not silence either — a default model still on DeepSeek
+// after the route appeared looks arbitrary without one sentence explaining it.
+lines = await bootstrapOf({
+  provider: { state: 'created', models: 3, reason: null, error: null, keySet: true, source: 'served' },
+  defaultModel: { state: 'skipped', from: null, to: null, model: null, reason: 'user_chose_default' },
+})
+check('a default the user chose themselves is explained, not reported as a fault',
+  textsOf(lines).some(item => item.includes('вы выбирали модель по умолчанию сами')), joinedOf(lines))
+check('and explained quietly',
+  lines.find(line => line.text.includes('вы выбирали'))?.tone === 'quiet',
+  String(lines.find(line => line.text.includes('вы выбирали'))?.tone))
+
+lines = await bootstrapOf({
+  provider: { state: 'created', models: 3, reason: null, error: null, keySet: true, source: 'served' },
+  defaultModel: { state: 'skipped', from: null, to: null, model: null, reason: 'override_unknown' },
+})
+check('a default that could not be verified says it was not verified',
+  textsOf(lines).some(item => item.includes('не удалось проверить') && item.includes('ничего не записал')),
+  joinedOf(lines))
+
+// Placement and furniture.
+STATE.routeBootstrap = CLEAN_INSTALL
+tree = await view()
+text = allText(tree)
+check('the line sits above the uptime box, which stays first whenever nothing renders',
+  text.indexOf('Маршрут rustvy создан') > text.indexOf('Rustvy')
+  && text.indexOf('Маршрут rustvy создан') < text.indexOf('Аптайм моделей'),
+  `${text.indexOf('Маршрут rustvy создан')} vs ${text.indexOf('Аптайм моделей')}`)
+check('and carries no button, because there is nothing a button here could re-run',
+  bootstrapLinesOf(tree).length > 0
+  && bootstrapLinesOf(tree).every(line => collect(line, 'button').length === 0),
+  String(bootstrapLinesOf(tree).length))
+delete STATE.routeBootstrap
+
+// §6.2: `keySet` is computed per request on the host, but the page asks only on mount and on
+// «Перечитать состояние» — so a key added through the ring would leave the line above
+// claiming there is no key while the ring below shows one. The assertion is on the request
+// rather than on the rendered text, and that is deliberate: this stub re-runs every effect on
+// every render pass, so any later `view()` re-reads `/state` with or without the fix, and a
+// text-only check here could not go red. The request is the mechanism, and deleting the call
+// from `mutate` deletes it.
+STATE.routeBootstrap = {
+  provider: { state: 'created', models: 3, reason: null, error: null, keySet: false, source: 'served' },
+  defaultModel: null,
+}
+tree = await view()
+check('the missing-key line is on the page before the key is added', allText(tree).includes('Ключ ещё не задан'))
+findButton(tree, '+').props.onClick()
+await settle()
+tree = await view()
+fieldOf(tree, 'название ключа').props.onChange({ target: { value: 'Проверка свежести' } })
+fieldOf(tree, 'значение ключа').props.onChange({ target: { value: 'sk-freshness-check' } })
+tree = render()
+requests.length = 0
+findButton(tree, 'Добавить').props.onClick()
+await settle()
+check('adding a key makes the page re-read the state that reports it',
+  requests.some(item => item.path === '/dsh-rustvy/state' && item.method === 'GET'),
+  JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
+
+// A mutation that cannot change key availability costs no extra read: the gate is on the
+// action, not on every POST the ring makes.
+tree = await view()
+requests.length = 0
+const defaultButton = buttonsNamed(tree, 'По умолчанию')[0]
+check('the ring still offers a default switch to check the gate against', defaultButton !== undefined)
+if (defaultButton !== undefined) defaultButton.props.onClick()
+await settle()
+check('and choosing a default key does not re-read the state',
+  !requests.some(item => item.path === '/dsh-rustvy/state'),
+  JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
+delete STATE.routeBootstrap
+
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)
 check('unload took the marks with it', menu.querySelectorAll('.dmi-mark').length === 0)

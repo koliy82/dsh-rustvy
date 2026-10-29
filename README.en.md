@@ -167,6 +167,79 @@ To make a model the default:
     reasoningEffort: high
 ```
 
+### A clean profile: the route is created for you
+
+Everything above assumes a profile that already has the route. A clean DSH has none, and
+this plugin used to do nothing and say nothing in that case: the model list kept the
+built-in DeepSeek, whose key nobody has, so nothing worked at all. Now the host half
+checks at mount whether the `llm-pi-ai` row has a `rustvy` provider, and creates one when
+it does not — the address, the name, `apiKeyEnv`, the API shape, and a model list read
+from the provider. An existing route is never overwritten, in any field: `displayName`,
+`apiKeyEnv`, `baseURL` and `models` may have been corrected by hand, and that is knowledge
+about your deployment which no catalog holds.
+
+**DeepSeek is never touched.** It lives in other rows of the composition
+(`llm-deepseek`, `llm-deepseek-account`), and the only write goes into the `llm-pi-ai`
+row, and inside it only into the `rustvy` key, preserving any other provider of that same
+row. That is pinned by a test comparing the `llm-deepseek` row byte for byte before and
+after, not by an argument that the write should not reach it: the user's requirement "do
+not touch deepseek at all" is absolute, and now that two rows are written instead of one it
+matters more, not less.
+
+**No key is asked for at install time.** That is deliberate: creating the route must not
+demand anything, and a route without a key is exactly the state after which the model list
+appears. The key is added afterwards, through the ring on this same settings page or
+through the `RUSTVY_API_KEY` variable. So the normal sight straight after installing is
+"the route was created, the key is not set yet", and that is what the page says.
+
+**The default model is switched only if you never chose one.** Two conditions, both
+required: the route was absent and was created by this same mount, and the
+`agent-default-model` row has no override at the profile layer. The second is the only
+reliable line between a clean install and a deliberate choice — if you ever picked the
+model yourself, the row is left alone and the composer stays on your choice. When the
+choice cannot be checked, the plugin writes nothing: an overwritten model cannot be
+recovered from it, and a guess costs more here than doing nothing.
+
+**What the settings page says.** The outcome of the route creation is a conditional line
+at the top of the Rustvy section, above the uptime box, drawn only when there is something
+to say:
+
+| Outcome | Line |
+|---|---|
+| the route was created by this mount | «Маршрут rustvy создан этим монтированием: N моделей», plus a separate one about the key |
+| the route was already there | nothing — except the key line when no key is set |
+| it could not be created | «Маршрут rustvy не создан: …» with the reason and the next action |
+| the default model was switched | «Модель по умолчанию переключена с X на Y — Z» |
+| not switched because you had chosen it | one calm line explaining that |
+| not switched because the route was already there | nothing |
+
+The section order does not move for it: the line is conditional, and the ordering decision
+was about sections. In the steady state nothing renders, so uptime stays first exactly as it
+was placed; when a line does render the install is broken or was just bootstrapped, and that
+outranks the order.
+
+There is no button on that line, and that is a decision rather than an omission: the
+bootstrap runs at mount only and there is no retry endpoint, so a button could only re-read
+a state that re-runs nothing — a control labelled "retry" that does not retry. The real
+action is a reload of the window, and the line names it in words, differently per reason.
+
+About the key the page claims exactly what it knows. The host asks the same credentials
+mechanism the adapter uses rather than the process environment, and it counts the ring: a key
+added through the ring makes the provider usable while `RUSTVY_API_KEY` in the environment
+stays empty. «Ключ ещё не задан» is printed only when neither resolves; when the host could
+not determine it, the page points at both places and claims nothing. The two phrasings differ
+by exactly one assertion, and a check in the suite keeps them from merging, because merging
+them would put "not set yet" back on a machine that works. The value is recomputed on every
+state request, so a key added through the ring after the page loaded removes the line without
+a reload — otherwise the ring below would show the new key while the line above claimed there
+is none.
+
+The page also says where the model list came from when the origin did not answer and the
+route was created from the local catalog copy: such a list is of unknown age and is worth
+re-reading once the network is back. «Обновить каталог и иконки» is not the remedy here — the
+mirror is built from that same origin, and the host already tried to refresh it while creating
+the route.
+
 ### Using it
 
 Open **Settings → Rustvy**. The page shows what the mirror holds, what the
@@ -910,7 +983,7 @@ loopback only, a loopback `Host`, a same-origin `Sec-Fetch-Site` and a matching
 | `/dsh-rustvy/logo/<name>.svg` | GET, HEAD | one cached logo, fetched from the origin on first ask; `404` when the origin has no such mark, `400` for any name that is not `[A-Za-z0-9._-]+.svg` |
 | `/dsh-rustvy/models.json` | GET | the generated model list and its drift against the installed one; `?cached=1` reports the last computed plan instead of reading the endpoint again |
 | `/dsh-rustvy/models.yaml` | GET, HEAD | the same list as a paste-ready `cordis.patch.yml` row; `?cached=1` as above |
-| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path — `install`, `errorsQueue` and `uptime` among them — last error, the last computed drift, a key-ring summary, and an `errorReport` block: whether collection is on, the collector's address, the anonymous identifier, the sent, queued and dropped counters, the last answer, the last send error and the failures by kind. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks. The settings page draws no part of the `errorReport` block — it is for whoever reads the route by hand — and a host half older than error collection sends neither it nor the two new paths |
+| `/dsh-rustvy/state` | GET | mirror status: version, model count, cached logos, route, proxy (credentials masked), every file path — `install`, `errorsQueue` and `uptime` among them — last error, the last computed drift, a key-ring summary, a `routeBootstrap` block and an `errorReport` block. `routeBootstrap` carries the two steps: `provider` — the outcome of creating the route at mount (`state` out of `created\|exists\|failed\|skipped`, a model count or `null` when nobody counted them, the list's `source`, `keySet`, and the refusal as a stable reason code) — and `defaultModel`, which is `null` outright when that step never ran. `keySet` is recomputed per request rather than frozen at mount, so a key added through the ring shows up without a restart. `errorReport` carries whether collection is on, the collector's address, the anonymous identifier, the sent, queued and dropped counters, the last answer, the last send error and the failures by kind. Never makes a request of its own; the ring summary is synchronous and reads no credential, so it carries counters and routes rather than masks. The settings page draws no part of the `errorReport` block — it is for whoever reads the route by hand — and draws `routeBootstrap` as a conditional line. A host half older than error collection sends neither `errorReport` nor the two new paths, and one older than route creation sends no `routeBootstrap` at all — the key is absent, and the page then draws nothing |
 | `/dsh-rustvy/refresh` | POST | re-read the catalog, re-warm every logo it names, and report — or, when the write mode allows it, apply — the model list |
 | `/dsh-rustvy/apply-models` | POST | write the generated list into the route profile through `ctx.configEditor` |
 | `/dsh-rustvy/revert-models` | POST | put the backed-up route profile back |
@@ -1168,6 +1241,29 @@ so the previous model's state never lingers in the button; and switching off «�
 theirs. The uptime switch is checked the way every other one is — it posts its own field
 to `/config`, and off means the panel explains itself in words and makes no request to the
 mirror at all.
+
+It draws the route-bootstrap line too, across every cell of the state × keySet matrix,
+including the cells whose correct answer is silence. A created route is shown with its
+model count; an absent `source` key is survived without a guess; a switched default model
+names all three strings as they arrived; `keySet: false` asserts and then directs, `true`
+says nothing about the key at all, and `null` only directs — and in that last case the
+rendered text is asserted *not* to contain «не задан», because the two phrasings would
+otherwise merge at the first reword and put "the key is not set yet" back on a machine
+that works. A route that was already there draws nothing except the key line when there is
+no key, and that cell is checked from both sides: for silence when a key is set, and for
+the absence of the word «создан» where the plugin created nothing. A route that could not
+be created names the reason in the host's own words, with a window reload beside it rather
+than the catalog-refresh button — the mirror is built from that same dead origin — and says
+nothing at all about a key, since the harness would resolve `apiKeyEnv` for a route that is
+not there. An unknown reason code and an unknown state are printed as they came rather than
+replaced by a guess. No cell contains a button, and that is asserted rather than observed.
+The freshness of `keySet` is checked separately: adding a key through the ring makes the
+page re-read `/state`, while choosing a default key does not, because that changes which
+key is used rather than whether one exists. The assertion is on the request and not on the
+text, because this suite re-runs every effect on every render pass, so a text-only check
+would pass without the fix and prove nothing. The absence of `routeBootstrap` altogether is
+not an edge case but the population: that is what every install with today's host half
+answers, and it draws nothing and does not throw.
 
 The mark-drawing half is **not** covered by an automated suite in this repository,
 and that is worth knowing up front. It works on the DOM of an already-open page, so

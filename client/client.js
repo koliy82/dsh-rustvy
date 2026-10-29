@@ -2362,8 +2362,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
      * settings page has no session to ask about, and `/keys` is the route that
      * reports `editor` and `defaultKeyId`, which is what decides whether adding a
      * key is offered at all and why.
+     *
+     * @param props - `{ onKeySetChanged }`, called after a mutation that can change
+     *   whether the provider has a usable credential, so the page can re-read `/state`.
      */
-    function KeysSection() {
+    function KeysSection(props) {
       const [data, setData] = React.useState(undefined)
       const [adding, setAdding] = React.useState(false)
       const [busy, setBusy] = React.useState('')
@@ -2394,6 +2397,16 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             ? { kind: 'bad', text: String(answer.error ?? 'Отказано.') }
             : keysNotice(body, answer))
         announce(true)
+        // Adding or removing a key changes whether the provider has a usable credential,
+        // and `/state` is what the bootstrap line above reads — `keySet` is computed per
+        // request there, so it is fresh the moment the page asks again. Without this the
+        // ring below repaints showing the new key while the line above still claims there
+        // is none: two claims about one machine, one screen apart, which is worse than
+        // either being wrong alone. Only these two actions can change it, so a default
+        // switch or a group toggle costs no extra read.
+        if ((body.action === 'add' || body.action === 'remove') && typeof props.onKeySetChanged === 'function') {
+          void props.onKeySetChanged()
+        }
         return answer
       }
 
@@ -3154,6 +3167,190 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
+     * What each reason the route bootstrap can report means, and what to do about it.
+     *
+     * One actionable thing per reason, and the action is the real one. There is no retry
+     * endpoint and the bootstrap runs at mount only, so what re-runs it is a reload of the
+     * window — except where nothing the user does can help, in which case the line says
+     * what is missing instead of instructing.
+     *
+     * `no_model_source` deliberately does *not* send the user to «Обновить каталог и
+     * иконки», which looks like the obvious remedy and is not one: the catalog mirror is
+     * built from the same origin, and the host already runs its own catalog refresh while
+     * creating the route. By the time this reason arrives that button has effectively been
+     * pressed and produced nothing, so pressing it again is a second failure with a
+     * spinner rather than a fix.
+     */
+    const PROVIDER_REASONS = Object.freeze({
+      no_config_editor: Object.freeze({
+        says: 'композиция не монтирует редактор конфигурации — записывать маршрут нечем',
+        does: 'Перезагрузка окна не поможет, пока строка редактора не появится в композиции.',
+      }),
+      entry_not_found: Object.freeze({
+        says: 'в композиции нет адресуемой строки llm-pi-ai',
+        does: 'Перезагрузите окно DSH; если повторится, это вопрос версии харнесса, а не профиля.',
+      }),
+      no_model_source: Object.freeze({
+        says: 'нет ни ответа источника, ни зеркала каталога — создавать маршрут нечем',
+        does: 'Проверьте сеть, прокси или VPN и перезагрузите окно DSH: маршрут создаётся при монтировании.',
+      }),
+      write_failed: Object.freeze({
+        says: 'редактор принял правку, но запись или сверка не прошли',
+        does: 'Перезагрузите окно DSH, чтобы монтирование выполнилось снова; если повторится, патч профиля не записывается.',
+      }),
+    })
+
+    /**
+     * The same, for the step that points the composer's default model at the route.
+     *
+     * `user_chose_default` is the one entry here that is not a problem: the plugin looked,
+     * found a choice the user had made, and left it alone. It still gets a line, because a
+     * default model that stays on DeepSeek after the route appeared would otherwise look
+     * arbitrary, and the reason it is not arbitrary is worth one sentence.
+     */
+    const DEFAULT_MODEL_REASONS = Object.freeze({
+      user_chose_default: Object.freeze({
+        tone: C.labelSecondary,
+        says: 'вы выбирали модель по умолчанию сами, поэтому плагин её не трогает',
+        does: null,
+      }),
+      no_models: Object.freeze({
+        tone: C.warn,
+        says: 'в созданном маршруте нет моделей, выбирать не из чего',
+        does: null,
+      }),
+      entry_not_found: Object.freeze({
+        tone: C.warn,
+        says: 'строка agent-default-model не найдена',
+        does: 'Перезагрузите окно DSH; если повторится, в композиции нет этой строки.',
+      }),
+      override_unknown: Object.freeze({
+        tone: C.warn,
+        says: 'не удалось проверить, выбирали ли вы модель сами, поэтому плагин ничего не записал',
+        does: 'Перезагрузите окно DSH; если повторится, композиция не отвечает на запрос конфигурации.',
+      }),
+      write_failed: Object.freeze({
+        tone: C.warn,
+        says: 'запись не прошла',
+        does: 'Перезагрузите окно DSH, чтобы монтирование выполнилось снова.',
+      }),
+    })
+
+    /**
+     * The lines the route bootstrap has earned, in order, or none.
+     *
+     * Ruled by the product of `provider.state` and `provider.keySet` rather than by either
+     * dimension alone, because the cells that matter are the product: an existing route
+     * with no credential resolving anywhere is a broken machine and has to speak, while an
+     * existing route with a key is the steady state every user lives in and has to stay
+     * silent. A line that renders for everybody trains nobody to read lines — which is
+     * also why the default-model step says nothing when its reason is that the route was
+     * already there.
+     *
+     * Truthiness rather than key presence throughout: the host spreads defaults onto every
+     * branch, so `reason`, `error` and `source` are always present and usually null.
+     *
+     * @param bootstrap - `/state`'s `routeBootstrap`, absent on every install whose host
+     *   half predates the feature.
+     * @returns `{ tone, text }` per line to draw.
+     */
+    function bootstrapLines(bootstrap) {
+      if (typeof bootstrap !== 'object' || bootstrap === null) return []
+      const lines = []
+      const provider = typeof bootstrap.provider === 'object' && bootstrap.provider !== null ? bootstrap.provider : null
+      const state = typeof provider?.state === 'string' ? provider.state : ''
+      const broken = state === 'failed' || state === 'skipped'
+      const models = Number.isFinite(provider?.models) ? provider.models : null
+      const reason = typeof provider?.reason === 'string' && provider.reason !== '' ? provider.reason : null
+      const keySet = provider?.keySet === true || provider?.keySet === false ? provider.keySet : null
+
+      if (state === 'created') {
+        lines.push({
+          tone: C.ok,
+          text: `Маршрут rustvy создан этим монтированием${models === null ? '' : `: ${models} ${plural(models, ['модель', 'модели', 'моделей'])}`}.`,
+        })
+        // Only `catalog` is worth a sentence: `served` means the list was read from the
+        // provider just now, which needs no explanation, while `catalog` means it came
+        // from a local copy of unknown age and the user should re-read it once the network
+        // is back.
+        if (provider?.source === 'catalog') {
+          lines.push({
+            tone: C.labelSecondary,
+            text: 'Список моделей взят из локальной копии каталога, потому что источник не ответил; перечитайте его, когда сеть появится.',
+          })
+        }
+      } else if (broken) {
+        const known = reason === null ? null : PROVIDER_REASONS[reason]
+        const why = typeof provider?.error === 'string' && provider.error !== ''
+          ? provider.error
+          : known?.says ?? reason ?? 'причина не сообщена'
+        lines.push({ tone: C.warn, text: `Маршрут rustvy не создан: ${why}.` })
+        if (known?.does !== undefined && known.does !== null) lines.push({ tone: C.labelSecondary, text: known.does })
+      } else if (state !== '' && state !== 'exists') {
+        // A state this half has no sentence for, printed as it came rather than guessed
+        // at: an unknown word is a gap in the page's knowledge, not a state of the route.
+        lines.push({ tone: C.labelSecondary, text: `Маршрут rustvy: ${state}.` })
+      }
+      // `exists` earns no line of its own, by design.
+
+      // The key sentence is ruled by `keySet`, not by the state. `false` speaks even on a
+      // route this mount did not create, because a route with no credential is a broken
+      // machine whatever its history; a route that could not be created never mentions a
+      // key, since the harness would resolve `apiKeyEnv` for a route that is not there.
+      // The two phrasings differ by exactly one assertion and a test holds them apart: a
+      // `null` says where the key is set without claiming to know whether it is.
+      if (!broken && keySet === false) {
+        lines.push({
+          tone: C.warn,
+          text: 'Ключ ещё не задан — задайте его в кольце ключей ниже или переменной RUSTVY_API_KEY.',
+        })
+      } else if (!broken && keySet === null && state === 'created') {
+        lines.push({
+          tone: C.labelSecondary,
+          text: 'Ключ задаётся в кольце ключей ниже или переменной RUSTVY_API_KEY.',
+        })
+      }
+
+      const step = typeof bootstrap.defaultModel === 'object' && bootstrap.defaultModel !== null
+        ? bootstrap.defaultModel
+        : null
+      if (step !== null) {
+        const stepState = typeof step.state === 'string' ? step.state : ''
+        const stepReason = typeof step.reason === 'string' && step.reason !== '' ? step.reason : null
+        const known = stepReason === null ? null : DEFAULT_MODEL_REASONS[stepReason]
+        if (stepState === 'switched') {
+          const from = typeof step.from === 'string' && step.from !== '' ? step.from : null
+          const to = typeof step.to === 'string' && step.to !== '' ? step.to : null
+          const model = typeof step.model === 'string' && step.model !== '' ? step.model : null
+          lines.push({
+            tone: C.ok,
+            text: `Модель по умолчанию переключена${from === null || to === null ? '' : ` с ${from} на ${to}`}`
+              + `${model === null ? '' : ` — ${model}`}.`,
+          })
+        } else if (stepState === 'kept') {
+          // Reachable by data rather than by code: the host keeps the inherited default
+          // model when the newly created route already serves it, changing only
+          // `provider`. It does not fire on today's catalog — the inherited default is
+          // `deepseek-official`/`deepseek-flash` and the origin serves no such model — so
+          // a catalog change switches this branch on with no change here. Not a dead
+          // branch, and not one to delete because it looks unused.
+          lines.push({ tone: C.labelSecondary, text: 'Модель по умолчанию оставлена прежней.' })
+        } else if (stepState === 'skipped' && stepReason !== 'route_existed') {
+          lines.push({
+            tone: known?.tone ?? C.warn,
+            text: `Модель по умолчанию не переключена: ${known?.says ?? stepReason ?? 'причина не сообщена'}.`,
+          })
+          if (known?.does !== undefined && known.does !== null) lines.push({ tone: C.labelSecondary, text: known.does })
+        } else if (stepState !== '' && stepState !== 'skipped') {
+          lines.push({ tone: C.labelSecondary, text: `Модель по умолчанию: ${stepState}.` })
+        }
+        // `skipped` with `route_existed` is the steady state — the route was already
+        // there, so there was no default to point — and renders nothing.
+      }
+      return lines
+    }
+
+    /**
      * The settings page.
      *
      * Two blocks, because the mirror now does two jobs: what it holds for the
@@ -3288,6 +3485,21 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                 },
               }, notice.text)),
 
+        // Above the uptime box, and only when it has something to say. The order the user
+        // asked for is about sections — uptime up, the catalog mirror down — and a
+        // conditional line is not a section: in the steady state nothing renders here, so
+        // uptime stays first on the page exactly as it was placed. When a line does
+        // render, the install is broken or was just bootstrapped, and that outranks the
+        // order. No button, either: the bootstrap runs at mount and there is no retry
+        // endpoint, so a control labelled "retry" could only re-read a state that re-runs
+        // nothing. The real action is named in the text instead.
+        bootstrapLines(status?.routeBootstrap).map((line, index) => h('div', {
+          key: index,
+          className: 'dmi-bootstrap-line',
+          'data-dmi-tone': line.tone === C.warn ? 'warn' : line.tone === C.ok ? 'ok' : 'quiet',
+          style: { color: line.tone, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '8px' },
+        }, line.text)),
+
         // First on the page, because it is the one thing here that answers the question
         // the page was opened with — is the model I am about to pick answering right
         // now — while everything below it is configuration. Moved as it stands: same
@@ -3393,7 +3605,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
 
         h(YamlPanel, { cached: false }),
 
-        h(KeysSection),
+        h(KeysSection, { onKeySetChanged: refresh }),
 
         // The error collector's own box, rather than a row beside the mark switches:
         // this is the one setting on the page that sends anything off the machine. The
