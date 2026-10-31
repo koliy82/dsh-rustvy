@@ -224,6 +224,11 @@ const STATE = {
     enabled: true, origin: 'https://rustvy.xyz', size: 16, markTrigger: true, hideOtherMarks: true,
     syncModels: true, modelRoute: 'rustvy', modelEntryId: 'llm-pi-ai', modelAutoApply: 'explicit',
     modelNameSource: 'displayName', modelOfferOff: true, modelKeepUnknown: false, modelZones: ['standard'],
+    // Published by the host from the reporter's single constant, so the window length has
+    // one home. `collectSuccesses` and `collectErrors` are deliberately absent: that is the
+    // shape an older host half answers with, and both switches have to read it as "on"
+    // rather than as a refusal.
+    successWindowMs: 900_000,
   },
   version: 130,
   fetchedAt: '2026-10-18T21:00:00.000Z',
@@ -403,41 +408,56 @@ const UPTIME_GREEN = {
   installs: { window: 0, reference: 47, anonymous: 0 },
   summary: {
     totalModels: 12, operational: 12, single: 0, issues: 0, down: 0, slow: 0,
-    uptime: 100, totalErrors: 0, installsAffected: 0, affectedPct: 0,
+    // v3: a real denominator behind the percentage. 480 successes and no failures, so the
+    // hundred is measured rather than assumed — which is the whole difference from v2,
+    // where «100%» over a window nobody requested anything in was a claim nobody checked.
+    uptime: 100, ok: 480, fails: 0, totalErrors: 0, installsAffected: 0, affectedPct: 0,
   },
   byCode: [],
   models: [
     {
       id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
       firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
+      ok: 260, fails: 0, uptime: 100,
       buckets: bucketStrip(48), events: [], lastError: null,
     },
     {
       id: 'gpt-5', name: 'GPT-5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
       firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
+      ok: 220, fails: 0, uptime: 100,
       buckets: bucketStrip(48), events: [], lastError: null,
     },
   ],
   monitorUrl: 'http://185.75.189.247:3789/',
 }
 
-// Every state the v2 rule can produce, plus the two edge cases the rendering has to get
-// right: a model whose share has no denominator (`affectedPct: null`, which must read as
-// «—» and never as 0%), and one whose errors are all anonymous, so that «от 1 установки»
-// is not allowed to stand unqualified.
+// Every state the v2 rule can produce, plus the edge cases the rendering has to get right: a
+// model whose share has no denominator (`affectedPct: null`, which must read as «—» and never
+// as 0%), a model whose failures are partly anonymous, so that «от 1 установки» is not allowed
+// to stand unqualified, and — at the summary level — `installs.anonymous` sitting beside
+// `installs.window` with the values go-collector captured live (4 beside 5), which is the pair
+// that makes a wrong pairing read perfectly while comparing failures with installs.
 const UPTIME_POPULATED = {
   ok: true, range: '24h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
-  stale: false, healthy: false, storage: 'mongo', total: 10,
-  installs: { window: 7, reference: 47, anonymous: 3 },
+  stale: false, healthy: false, storage: 'mongo', total: 11,
+  installs: { window: 5, reference: 47, anonymous: 4 },
   summary: {
     totalModels: 12, operational: 9, single: 1, issues: 1, down: 1, slow: 1,
-    uptime: 88, totalErrors: 10, installsAffected: 7, affectedPct: 14.9,
+    // `fails` is the sum of `n` and `totalErrors` the count of records, so the two differ
+    // by exactly the folding: 14 real failures arrived in 11 records. §5.1 makes the
+    // headline the failures, because publishing the record count next to the honest number
+    // understates by a quarter on the live data.
+    uptime: 96.6, ok: 460, fails: 14, totalErrors: 11, installsAffected: 5, affectedPct: 14.9,
   },
   byCode: [{ code: 'upstream_502', count: 7 }, { code: 'connect_timeout', count: 3 }],
   models: [
     {
       id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 5, installs: 3, anonymous: 0, status: 'down',
       firstAt: 1792600000000, lastAt: 1792616000000, minutesSinceLast: 4, affectedPct: 6.4,
+      // Only failures and no successes at all: `0/(0+5) = 0`, a real percentage and the
+      // case v2 could not show in any form. Not the same as `null`, which is what a window
+      // with neither would give.
+      ok: 0, fails: 5, uptime: 0,
       buckets: bucketStrip(48, { 3: 1, 17: 2, 44: 2 }),
       events: [{ t: 1792616000000, code: 'upstream_502', status: 502, message: 'upstream connect error', plugin: 'dsh-rustvy', id: 'd66d4114-0000' }],
       lastError: {
@@ -450,65 +470,96 @@ const UPTIME_POPULATED = {
       // as hours, never as «только что», whatever window the panel is looking at.
       id: 'glm-5.3', name: 'GLM 5.3', errors: 3, installs: 2, anonymous: 1, status: 'issues',
       firstAt: 1792595000000, lastAt: 1792606532644, minutesSinceLast: 180, affectedPct: 4.3,
+      // Four failures inside three records: one was folded, and `fails` carries the sum of
+      // `n` while `errors` keeps counting records.
+      ok: 120, fails: 4, uptime: 96.8,
       buckets: bucketStrip(48, { 9: 1, 31: 2 }),
       events: [{ t: 1792606532644, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT', plugin: 'dsh-rustvy', id: 'd66d4114-0001' }],
       lastError: { t: 1792606532644, code: 'connect_timeout', status: 0, message: 'connect ETIMEDOUT 185.75.189.247:443', id: 'd66d4114-0001' },
     },
     {
-      // One install, and every one of its errors anonymous: the breadth figure is not a
+      // One install, and most of its failures anonymous: the breadth figure is not a
       // measurement here, and the row has to say so rather than imply "one person".
-      id: 'kimi-k3', name: 'KIMI K3', errors: 2, installs: 1, anonymous: 2, status: 'single',
+      //
+      // `errors`, `fails` and `anonymous` are go-collector's capture off a live collector on
+      // a 24h range — three records carrying five failures, four of them anonymous — taken
+      // verbatim rather than composed, because on an invented spread `fails` and the record
+      // `anonymous: 5` and not go-collector's captured 4, because 4 makes this payload
+      // impossible: the collector's install key is either a real `meta.id` or one shared
+      // anonymous key, so `installs: 1` leaves two shapes only — one identified install and no
+      // anonymous records, or only anonymous records and `anonymous == fails`. Four anonymous
+      // failures beside one attributed one needs two keys, and two keys is `installs: 2`, which
+      // would move this row out of `single` and drop a state from a fixture whose job is
+      // covering all four. A payload that cannot occur still passes checks, which is the quiet
+      // half of the vacuous-check problem: it cannot catch a regression that only appears on
+      // real data. The captured *summary* pair — `window: 5` beside `anonymous: 4` — is
+      // verbatim above, and that is the one the §5.2 header check reads.
+      id: 'kimi-k3', name: 'KIMI K3', errors: 3, installs: 1, anonymous: 5, status: 'single',
       firstAt: 1792609000000, lastAt: 1792612000000, minutesSinceLast: 70, affectedPct: null,
+      ok: 40, fails: 5, uptime: 88.9,
       buckets: bucketStrip(48, { 20: 2 }),
       events: [], lastError: { t: 1792612000000, code: 'upstream_503', status: 503, message: 'service unavailable' },
     },
     {
       id: 'gpt-5', name: 'GPT-5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
       firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
+      // Only successes: `300/(300+0) = 100`, and honestly so. §3 is explicit that this is
+      // a real hundred, not an unmeasured one — the unmeasured case is `null`.
+      ok: 300, fails: 0, uptime: 100,
       buckets: bucketStrip(48), events: [], lastError: null,
     },
   ],
   monitorUrl: 'http://185.75.189.247:3789/',
 }
 
-// The badge fixture: an hour's window, 60 one-minute buckets, and one model in each of
-// the four states, so the shape and colour of every badge is pinned by a real answer
-// rather than by a unit test of a helper. One id the vendor rules recognise rides along,
-// so a badge can be checked on a row that also carries a mark.
+// The badge fixture: an hour's window, and in v3 that is **4 buckets of 15 minutes** rather
+// than 60 of one minute, because a bucket must hold a whole number of success windows (§4) —
+// a percentage is meaningless for a bucket narrower than the window it would divide, and
+// spreading fifteen minutes of successes over one-minute buckets means inventing a
+// distribution. One model in each of the four states, so the shape and colour of every badge
+// is pinned by a real answer rather than by a unit test of a helper. One id the vendor rules
+// recognise rides along, so a badge can be checked on a row that also carries a mark.
 const UPTIME_BADGES = {
   ok: true, range: '1h', generatedAt: 1792617332644, fetchedAt: 1792617566000,
   stale: false, healthy: false, storage: 'mongo', total: 6,
   installs: { window: 5, reference: 47, anonymous: 2 },
   summary: {
     totalModels: 5, operational: 2, single: 1, issues: 1, down: 1, slow: 1,
-    uptime: 80, totalErrors: 6, installsAffected: 5, affectedPct: 10.6,
+    // 24 successes against 6 failures is the 80% the fixture already claimed, now with the
+    // denominator that makes it a measurement rather than a number somebody wrote down.
+    uptime: 80, ok: 24, fails: 6, totalErrors: 6, installsAffected: 5, affectedPct: 10.6,
   },
   byCode: [{ code: 'upstream_502', count: 6 }],
   models: [
     {
       id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
       firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
-      buckets: bucketStrip(60, {}, 60_000), events: [], lastError: null,
+      ok: 9, fails: 0, uptime: 100,
+      buckets: bucketStrip(4, {}, 900_000), events: [], lastError: null,
     },
     {
       id: 'gpt-5', name: 'GPT-5', errors: 0, installs: 0, anonymous: 0, status: 'ok',
       firstAt: null, lastAt: null, minutesSinceLast: null, affectedPct: 0,
-      buckets: bucketStrip(60, {}, 60_000), events: [], lastError: null,
+      ok: 6, fails: 0, uptime: 100,
+      buckets: bucketStrip(4, {}, 900_000), events: [], lastError: null,
     },
     {
       id: 'kimi-k3', name: 'KIMI K3', errors: 1, installs: 1, anonymous: 1, status: 'single',
       firstAt: 1792616000000, lastAt: 1792616900000, minutesSinceLast: 7, affectedPct: 2.1,
-      buckets: bucketStrip(60, { 12: 1 }, 60_000), events: [], lastError: null,
+      ok: 2, fails: 1, uptime: 66.7,
+      buckets: bucketStrip(4, { 0: 1 }, 900_000), events: [], lastError: null,
     },
     {
       id: 'glm-5.3', name: 'GLM 5.3', errors: 3, installs: 2, anonymous: 1, status: 'issues',
       firstAt: 1792615000000, lastAt: 1792616940000, minutesSinceLast: 6, affectedPct: 4.3,
-      buckets: bucketStrip(60, { 20: 1, 41: 2 }, 60_000), events: [], lastError: null,
+      ok: 4, fails: 3, uptime: 57.1,
+      buckets: bucketStrip(4, { 1: 1, 3: 2 }, 900_000), events: [], lastError: null,
     },
     {
       id: 'qwen3.7-plus', name: 'QWEN 3.7 PLUS', errors: 2, installs: 3, anonymous: 0, status: 'down',
       firstAt: 1792616500000, lastAt: 1792617300000, minutesSinceLast: 1, affectedPct: 6.4,
-      buckets: bucketStrip(60, { 55: 2 }, 60_000), events: [], lastError: null,
+      ok: 3, fails: 2, uptime: 60,
+      buckets: bucketStrip(4, { 3: 2 }, 900_000), events: [], lastError: null,
     },
   ],
   monitorUrl: 'http://185.75.189.247:3789/',
@@ -520,10 +571,16 @@ const UPTIME_BADGES = {
 const UPTIME_BADGES_WIDE = {
   ...UPTIME_BADGES,
   range: '30d',
+  // `ok` and `fails` double with `errors` and `anonymous`, because a fixture whose counts
+  // double while its denominator does not is a payload no collector could emit — and
+  // doubling both leaves the percentage where it was, which is the point of this fixture:
+  // the counts move, so a badge repainted from a longer window is visibly wrong.
   models: UPTIME_BADGES.models.map(model => ({
     ...model,
     errors: model.errors * 2,
     anonymous: model.anonymous * 2,
+    ok: (model.ok ?? 0) * 2,
+    fails: (model.fails ?? 0) * 2,
     buckets: bucketStrip(48),
   })),
 }
@@ -565,9 +622,24 @@ const UPTIME_LEGACY = {
 const UPTIME_MONTH = {
   ...UPTIME_POPULATED,
   range: '30d',
-  summary: { ...UPTIME_POPULATED.summary, affectedPct: null },
+  // Kept consistent with the models below, because a fixture whose summary disagrees with
+  // its own rows is a trap for whoever writes the consistency check next.
+  summary: { ...UPTIME_POPULATED.summary, affectedPct: null, ok: 160, fails: 14, uptime: 92 },
   installs: { window: 47, reference: 47, anonymous: 3 },
-  models: UPTIME_POPULATED.models.map(model => ({ ...model, buckets: bucketStrip(48, {}, 900_000) })),
+  // Thirty days over 48 buckets is fifteen hours a bucket (§4: 900 = 60 × 15, unchanged
+  // from v2). The step lives in the fixture rather than in a lookup table because the
+  // width label is measured from the array — so a wrong step here is a wrong label on the
+  // page, which is exactly what measuring instead of looking up is for.
+  //
+  // GPT-5 becomes the window with neither successes nor failures: `ok + fails == 0`, so
+  // `uptime` is `null` and the row draws a dash. That is the third of the three assertions
+  // the percentage has to keep apart — a measured hundred, a measured zero, and nobody
+  // having measured anything — and §3 is explicit that this one is neither of the others.
+  models: UPTIME_POPULATED.models.map(model => ({
+    ...model,
+    ...(model.id === 'gpt-5' ? { ok: 0, fails: 0, uptime: null } : {}),
+    buckets: bucketStrip(48, {}, 54_000_000),
+  })),
 }
 
 /**
@@ -895,7 +967,7 @@ check('auto-apply defaults to explicit', selectWith(tree, 'explicit')?.props.val
   String(selectWith(tree, 'explicit')?.props.value))
 check('the name source defaults to the provider label', selectWith(tree, 'displayName')?.props.value === 'displayName',
   String(selectWith(tree, 'displayName')?.props.value))
-check('nine switches render', boxes.length === 9, String(boxes.length))
+check('ten switches render', boxes.length === 10, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -1133,12 +1205,12 @@ check('the key list comes back with the host route',
 
 // --- the fields the host half added on top of the contract ----------------
 text = allText(tree)
-// Nine, not eight: the page's own display switches — now including the uptime one —
-// plus the ring's master switch and the error-collection switch below it. Found by
-// label rather than by index, so a switch added above it cannot silently retarget
-// this block at some other checkbox.
+// Ten, not eight: the page's own display switches — now including the uptime one — plus
+// the ring's master switch and, in the «Сбор данных Rustvy» box, the success-reporting
+// switch above the error-collection one. Found by label rather than by index, so a switch
+// added above it cannot silently retarget this block at some other checkbox.
 check('the master switch for the ring is offered',
-  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 9
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 10
   && text.includes('Ключи на несколько чатов'))
 check('the key count is shown against the limit', text.includes('2 из 12'))
 check('each key reports how many models its route serves', text.includes('моделей: 12'))
@@ -1238,10 +1310,15 @@ const COLLECTOR_ROWS = [
 ]
 
 const COLLECT_LABEL = 'Собирать ошибки rustvy'
+const SUCCESSES_LABEL = 'Отправлять успешные запросы'
+// Renamed from «Сбор ошибок Rustvy» when the success switch moved in: a caption promising
+// only error collection would describe a box holding both falsely, and the caption is what
+// a user reads to decide whether to open the box.
+const DATA_BOX = 'Сбор данных Rustvy'
 tree = await view()
 text = allText(tree)
 const collectSwitch = switchNamed(tree, COLLECT_LABEL)
-check('the page names the collection block', text.includes('Сбор ошибок Rustvy'))
+check('the page names the collection block', text.includes(DATA_BOX))
 check('the collection switch carries its exact label', collectSwitch !== undefined)
 // The fixture config omits `collectErrors`, which is the shape an older host half
 // answers with: the default is on, and the switch has to say so rather than read a
@@ -1356,9 +1433,13 @@ check('turning collection back on posts the same field',
   requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).collectErrors === true),
   JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
 tree = await view()
-check('and the box is still just its caption and the switch',
+// The box holds a caption, two switches and one short explanation of what success
+// reporting costs — and still none of the readout that was stripped at the user's request.
+// The point of this check is the absence, not the count: a status block creeping back in
+// would be the regression, and adding a switch must not be read as that.
+check('and the box is still its caption, its switches and no readout',
   switchNamed(tree, COLLECT_LABEL)?.props.checked === true
-  && allText(tree).includes('Сбор ошибок Rustvy')
+  && allText(tree).includes(DATA_BOX)
   && !allText(tree).includes('Состояние сборщика')
   && !allText(tree).includes('Одна строка на сбой'))
 
@@ -1370,7 +1451,7 @@ delete STATE.errorReport
 tree = await view()
 text = allText(tree)
 check('an older host half still gets the switch',
-  switchNamed(tree, COLLECT_LABEL)?.props.checked === true && text.includes('Сбор ошибок Rustvy'))
+  switchNamed(tree, COLLECT_LABEL)?.props.checked === true && text.includes(DATA_BOX))
 STATE.errorReport = REPORT
 tree = await view()
 check('and looks the same with the summary put back',
@@ -1409,10 +1490,18 @@ UPTIME_MODE = 'green'
 tree = await view()
 text = allText(tree)
 check('the page names the uptime box', text.includes('Аптайм моделей'))
-check('the header counts states rather than presenting a percentage as availability',
-  text.includes('моделей 12') && text.includes('без ошибок 12') && text.includes('локально 0')
-  && text.includes('сбои 0') && text.includes('лежат 0') && text.includes('ошибок за период 0')
-  && !text.includes('аптайм 100%'))
+// v3 reverses the v2 rule this check used to carry, and reverses it for the reason the
+// contract states: «правило v2 «процента больше нет» было верным для данных, которые были;
+// оно отменяется вместе с появлением данных». The fixture has 480 successes behind the
+// hundred, so «аптайм 100%» is a measurement here and not the unbacked claim it was in
+// v2. It *leads* the header — §5.1 makes it the headline of the view — and it replaces
+// nothing: the state counts stay beside it, because one figure over a day is exactly the
+// number §5.1 warns saturates and hides a three-hour outage, and the rows carry that.
+check('the header presents the measured percentage above the state counts',
+  text.includes('аптайм 100%') && text.includes('моделей 12') && text.includes('без ошибок 12')
+  && text.includes('локально 0') && text.includes('сбои 0') && text.includes('лежат 0')
+  && text.includes('сбоев за период 0'),
+  text.slice(text.indexOf('аптайм'), text.indexOf('аптайм') + 110))
 check('and names the breadth the collector measured', text.includes('затронуто 0 из 47 установок'))
 check('an all-green window is a finding, drawn in words',
   uptimeRows(tree).length === 2 && text.includes('ошибок нет'), String(uptimeRows(tree).length))
@@ -1450,18 +1539,36 @@ const singleRow = uptimeRow(tree, 'KIMI K3')
 check('a model that is down is drawn as down',
   downRow?.props['data-dmi-state'] === 'down' && allText(downRow).includes('Лежит'))
 check('its breadth is the collector own count, not an inference',
-  allText(downRow).includes('ошибок 5 от 3 установок') && allText(downRow).includes('затронуто 6,4% установок'),
+  allText(downRow).includes('сбоев 5 от 3 установок') && allText(downRow).includes('затронуто 6,4% установок'),
   allText(downRow))
 check('a provider failing several people is drawn as issues',
   issuesRow?.props['data-dmi-state'] === 'issues' && allText(issuesRow).includes('Сбои'))
 check('and a last error three hours old reads as hours, never as just now',
   allText(issuesRow).includes('последняя 3 ч назад') && !allText(issuesRow).includes('только что'),
   allText(issuesRow))
+// §5.2: `anonymous` is a sum of the fold counters, so it is a count of *failures*, and it has
+// to be drawn against `fails` and not against the record count. On this row the two differ —
+// three records carrying four failures, one of them anonymous — so «1 из 4» is the homogeneous
+// phrase and «1 из 3» would be two numbers that are each true and mean nothing together. The
+// unit is named in the phrase for the same reason: «сбоев» for failures, «отчётов» for records.
 check('a partly anonymous window qualifies the count it is attached to',
-  allText(issuesRow).includes('ошибок 3 от 2 установок (1 из 3 анонимных)'), allText(issuesRow))
-check('one install whose reports are all anonymous does not read as one person',
+  allText(issuesRow).includes('сбоев 4 от 2 установок (анонимно 1 из 4 сбоев)'), allText(issuesRow))
+check('and the anonymous share is drawn against the failure sum, not the record count',
+  !allText(issuesRow).includes('1 из 3') && !allText(issuesRow).includes('анонимных'), allText(issuesRow))
+check('one install whose failures are all anonymous does not read as one person',
   singleRow?.props['data-dmi-state'] === 'single' && allText(singleRow).includes('Локальный сбой')
-  && allText(singleRow).includes('ошибок 2 от 1 установки (все анонимные)'), allText(singleRow))
+  && allText(singleRow).includes('сбоев 5 от 1 установки (все сбои анонимны)'), allText(singleRow))
+// The pairing, pinned on a spread where the two denominators differ: four failures inside
+// three records, one of them anonymous, so «1 из 4 сбоев» is the homogeneous phrase and «1 из
+// 3» is the two-numbers-each-true-and-meaningless-together one. Point the render at `errors`
+// and the check reddens on the value rather than on an argument. The row also leads with the
+// failure count, so the sentence reads «сбоев 4 … (анонимно 1 из 4 сбоев)» — one unit
+// throughout, which is what §5.1 asks for wherever both numbers could be seen.
+check('and the anonymous share is drawn against the failure sum, not the record count',
+  allText(issuesRow).includes('1 из 4 сбоев') && !allText(issuesRow).includes('1 из 3'),
+  allText(issuesRow))
+check('so the rows add up to the headline the header publishes',
+  allText(issuesRow).includes('сбоев 4 от 2 установок'), allText(issuesRow))
 check('a share with no denominator is a dash, never a zero',
   allText(singleRow).includes('затронуто — установок') && !allText(singleRow).includes('затронуто 0%'),
   allText(singleRow))
@@ -1476,10 +1583,17 @@ check('a clean model in the same window still says so',
   allText(uptimeRow(tree, 'GPT-5')).includes('ошибок нет'))
 check('and claims no breadth nobody measured',
   !allText(uptimeRow(tree, 'GPT-5')).includes('от 0 установок'), allText(uptimeRow(tree, 'GPT-5')))
+// §5.1: the headline total is `fails`, the sum of `n`, and not `errors`, the count of
+// records. On this fixture the two differ by exactly the one folded failure — 11 against
+// 10 — so a header still reading the record count is visibly wrong rather than merely
+// imprecise. The labels differ too, because one word over two quantities is two claims
+// under one name: «сбоев» for failures, and a record count would still say «ошибок».
 check('the header counts what the collector counted',
   text.includes('моделей 12') && text.includes('без ошибок 9') && text.includes('локально 1')
-  && text.includes('сбои 1') && text.includes('лежат 1') && text.includes('ошибок за период 10')
-  && text.includes('затронуто 7 из 47 установок'))
+  && text.includes('сбои 1') && text.includes('лежат 1') && text.includes('сбоев за период 14')
+  && text.includes('затронуто 5 из 47 установок'))
+check('and publishes the failures rather than the smaller record count beside them',
+  !text.includes('ошибок за период 10'), text.slice(text.indexOf('сбоев за период'), text.indexOf('сбоев за период') + 40))
 
 // A collector older than v2: three states instead of four, a percentage this half must
 // not present as availability, and none of the breadth fields. The panel has to come out
@@ -1511,9 +1625,15 @@ rangeSwitch(tree).props.onChange({ target: { value: '1h' } })
 await settle()
 tree = await view()
 const hourRow = uptimeRow(tree, 'GLM 5.3')
-check('an hour is drawn as sixty minute-wide bars, and says so',
-  bars(hourRow).length === 60 && allText(hourRow).includes('1 столбик = 1 мин'),
-  `${bars(hourRow).length} bars`)
+// v3 moves the hour and nothing else: four fifteen-minute buckets instead of sixty
+// one-minute ones, because a bucket has to hold a whole number of success windows (§4).
+// The label is measured from the array rather than read off the range, so this assertion is
+// the one that tells us the moment the collector's alignment and this half's rendering meet
+// — it was true under v2 and becomes false the day the buckets change width, in either
+// direction and without a code change here.
+check('an hour is drawn as four fifteen-minute bars, and says so',
+  bars(hourRow).length === 4 && allText(hourRow).includes('1 столбик = 15 мин'),
+  `${bars(hourRow).length} bars, label ${JSON.stringify(allText(hourRow).slice(allText(hourRow).indexOf('1 столбик'), allText(hourRow).indexOf('1 столбик') + 22))}`)
 
 // A month window is where the two shares part company. The summary's is null — window and
 // reference period are the same set of installs, so a percentage would be the set measured
@@ -1604,7 +1724,7 @@ const SECTIONS = [
   ['the uptime panel', text => text.startsWith('Аптайм моделей')],
   ['the provider models box', text => text.includes('Модели провайдера')],
   ['the key ring', text => text.includes('Ключи на несколько чатов')],
-  ['the error collection box', text => text.includes('Сбор ошибок Rustvy')],
+  ['the data collection box', text => text.includes(DATA_BOX)],
   ['the catalog mirror', text => text.startsWith('Зеркало каталога')],
 ]
 const placed = SECTIONS.map(([name, probe]) => ({
@@ -1844,9 +1964,22 @@ check('the badge reads from the hour, and its tooltip says so',
   titleOfRow('glm-5.3'))
 check('and a quiet one says there was nothing to report',
   titleOfRow('claude-opus-5-5') === 'ошибок не было за последний час', titleOfRow('claude-opus-5-5'))
+// The tooltip carries the same caveat as the row, and the same two labels: «ошибки» for the
+// records the badge counts and «сбоев» for the failures the anonymous share is drawn against,
+// so the two quantities never share a noun even inside one sentence.
 check('an anonymous share is not left standing as breadth',
-  titleOfRow('kimi-k3').includes('(все анонимные)') && titleOfRow('glm-5.3').includes('(1 из 3 анонимных)'),
+  titleOfRow('kimi-k3').includes('(все сбои анонимны)') && titleOfRow('glm-5.3').includes('(анонимно 1 из 3 сбоев)'),
   `${titleOfRow('kimi-k3')} | ${titleOfRow('glm-5.3')}`)
+// The badge decision, pinned rather than merely stated in a report: the picker badge keeps
+// its colour and its error count and gains no percentage, in the text or in the tooltip.
+// Over the hour a badge reads, a percentage comes from a handful of requests — this very row
+// is 4 successes against 3 failures, so «57,1%» would sit beside a count that says exactly
+// what happened and add nothing a person can act on at picker speed, where the question is
+// "is this broken now, and how badly". The panel is where a percentage earns its place, on a
+// day or longer, and it has one.
+check('and the badge carries the count, with no percentage beside it',
+  titleOfRow('glm-5.3').includes('3 ошибки от 2 установок') && !titleOfRow('glm-5.3').includes('%'),
+  titleOfRow('glm-5.3'))
 check('the badge leaves the vendor mark alone', knownRow.querySelectorAll('.dmi-mark').length === 1,
   String(knownRow.querySelectorAll('.dmi-mark').length))
 // Every row this stub builds ends in the host's own `_check`, so this is also the case
@@ -1955,7 +2088,7 @@ rangeSwitch(tree).props.onChange({ target: { value: '24h' } })
 await settle()
 tree = await view()
 check('which is the whole point: the day keeps working while the hour does not',
-  uptimeRows(tree).length === 4 && allText(tree).includes('ошибок 5 от 3 установок'),
+  uptimeRows(tree).length === 4 && allText(tree).includes('сбоев 5 от 3 установок'),
   String(uptimeRows(tree).length))
 
 // A transport failure is the same situation with no answer at all, and it has to clear
@@ -2423,6 +2556,283 @@ check('and choosing a default key does not re-read the state',
   !requests.some(item => item.path === '/dsh-rustvy/state'),
   JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
 delete STATE.routeBootstrap
+
+/* ------------- v3: the percentage, and the toggle that feeds it ------------ */
+
+/** The «аптайм …» token one row drew, or null when it drew none. */
+const uptimeOf = row => (allText(row).match(/аптайм\s+\S+/u) ?? [null])[0]
+
+// go-collector's invariant, asserted over every fixture rather than left in a comment: the
+// collector's install key is either a real `meta.id` or one shared anonymous key, so a model
+// with one install and any anonymous failures has *only* anonymous ones, and `anonymous` can
+// never exceed `fails`. My own fixture broke this once — `installs: 1` with `anonymous: 4`
+// against `fails: 5` needs two distinct keys, so it was a payload no collector can emit, and
+// it passed every check it fed. That is the quiet half of the vacuous-check problem: a check
+// that cannot fail is loud about it eventually, while a fixture that cannot occur never says
+// anything at all, and it silently disagrees with any consumer that validates the invariant.
+const UPTIME_FIXTURES = [UPTIME_GREEN, UPTIME_POPULATED, UPTIME_BADGES, UPTIME_BADGES_WIDE, UPTIME_LEGACY, UPTIME_MONTH]
+const impossiblePayloads = UPTIME_FIXTURES
+  .flatMap(fixture => (Array.isArray(fixture.models) ? fixture.models : [])
+    .filter(model => Number.isFinite(model.fails))
+    .filter(model => !(model.anonymous <= model.fails)
+      || (model.installs === 1 && model.anonymous > 0 && model.anonymous !== model.fails))
+    .map(model => `${fixture.range}/${model.id}: installs=${model.installs} anonymous=${model.anonymous} fails=${model.fails}`))
+check('every fixture payload is one a collector could actually emit',
+  impossiblePayloads.length === 0, impossiblePayloads.join(' | '))
+
+/** The top-level block of the page that holds the data-collection box. */
+const dataBoxOf = node => (node.children ?? []).find(child => allText(child).includes(DATA_BOX))
+
+// §3: a number, a dash and a zero are three different claims, and the month fixture
+// carries all three so the distinction is pinned by a real answer rather than by a unit
+// test of a helper. A measured hundred says everything that ran worked; a zero says
+// everything that ran failed, which is the case v2 could not show in any form; a dash says
+// nobody measured anything, and is neither of the other two.
+UPTIME_MODE = 'month'
+tree = await view()
+const dashRow = uptimeRow(tree, 'GPT-5')
+const zeroRow = uptimeRow(tree, 'OPUS 5.5')
+const shareRow = uptimeRow(tree, 'GLM 5.3')
+check('a window with neither successes nor failures draws a dash',
+  uptimeOf(dashRow) === 'аптайм —', String(uptimeOf(dashRow)))
+check('and draws it as neither of the two things it is not',
+  uptimeOf(dashRow) !== 'аптайм 100%' && uptimeOf(dashRow) !== 'аптайм 0%', String(uptimeOf(dashRow)))
+check('a window of nothing but failures draws a real zero',
+  uptimeOf(zeroRow) === 'аптайм 0%', String(uptimeOf(zeroRow)))
+check('and a window with traffic draws its measured share',
+  uptimeOf(shareRow) === 'аптайм 96,8%', String(uptimeOf(shareRow)))
+check('so the three are three strings on screen rather than one value and two absences',
+  new Set([uptimeOf(dashRow), uptimeOf(zeroRow), uptimeOf(shareRow)]).size === 3,
+  [uptimeOf(dashRow), uptimeOf(zeroRow), uptimeOf(shareRow)].join(' | '))
+check('and the header carries the window aggregate the same way',
+  allText(tree).includes('аптайм 92%'), allText(tree).slice(allText(tree).indexOf('аптайм 92%'), allText(tree).indexOf('аптайм 92%') + 60))
+
+// §5.2's pairing constraint, one level above the row — asserted in the day window, because
+// that is the fixture carrying the captured `installs` pair (4 anonymous beside a window of
+// 5); the month fixture deliberately has window == reference to test a different thing.
+// `installs.anonymous` is a sum of the fold counters — a failure count — sitting inside an
+// object whose other two fields count installs. The name and the container agree and the
+// semantics do not, which is what makes the container actively suggest the wrong reading:
+// «4 из 5 установок анонимные» would read perfectly while comparing failures with installs.
+// Its only correct partner is `summary.fails`, so this header draws no anonymous share at all
+// — and the check is what keeps it that way, because a comment at the render site is the
+// reason and not the mechanism.
+UPTIME_MODE = 'populated'
+tree = await view()
+// Asserted over the whole page rather than over a slice of the header, and that is not a
+// stylistic choice: the first version of this check sliced from the percentage to the breadth
+// clause, and a wrongly paired clause appended *after* that clause sat outside the slice, so
+// the check passed against the exact mutation it exists to catch. Pointing the render at
+// `installs.window` is what found that. A page-wide absence cannot be evaded by where the
+// sentence lands.
+check('and the header pairs no anonymous count with an install count',
+  allText(tree).includes('затронуто 5 из 47 установок') && !allText(tree).includes('установок аноним'),
+  allText(tree).slice(allText(tree).indexOf('затронуто 5 из 47'), allText(tree).indexOf('затронуто 5 из 47') + 100))
+
+// A v1 collector also sent a percentage, computed with no successful request to divide by,
+// and v2 took it off the page for exactly that reason. It does not come back merely because
+// the field name returned: the clause is licensed by the denominator, not by the percentage,
+// so a legacy answer's «61%» stays off the screen while a v3 answer's is drawn.
+UPTIME_MODE = 'legacy'
+tree = await view()
+text = allText(tree)
+check('a collector with no denominator publishes no percentage anywhere',
+  uptimeRows(tree).length === 3 && uptimeRows(tree).every(row => uptimeOf(row) === null)
+  && !text.includes('аптайм 79%'),
+  uptimeRows(tree).map(row => String(uptimeOf(row))).join('|'))
+
+UPTIME_MODE = 'populated'
+tree = await view()
+const successesSwitch = switchNamed(tree, SUCCESSES_LABEL)
+check('the success switch is offered with its exact label', successesSwitch !== undefined)
+// The fixture config omits `collectSuccesses`, which is the shape an older host half answers
+// with: the default is on, and a truth test would draw every current install as switched off.
+check('an absent collectSuccesses renders as on', successesSwitch?.props.checked === true,
+  String(successesSwitch?.props.checked))
+
+const dataBox = dataBoxOf(tree)
+check('both collection switches live in the renamed box, successes above errors',
+  dataBox !== undefined
+  && allText(dataBox).indexOf(SUCCESSES_LABEL) >= 0
+  && allText(dataBox).indexOf(SUCCESSES_LABEL) < allText(dataBox).indexOf(COLLECT_LABEL),
+  dataBox === undefined ? 'no box' : `${allText(dataBox).indexOf(SUCCESSES_LABEL)} vs ${allText(dataBox).indexOf(COLLECT_LABEL)}`)
+check('and the box no longer calls itself error collection',
+  dataBox !== undefined && !allText(dataBox).includes('Сбор ошибок Rustvy'),
+  dataBox === undefined ? 'no box' : '')
+// The user asked for a separate setting above the errors one, not for a data-collection
+// switch among the display toggles at the top of the page, so its position is asserted
+// rather than left to the layout happening to be right.
+check('the success switch sits below the uptime panel, not among the display toggles',
+  (tree.children ?? []).findIndex(child => allText(child).includes(SUCCESSES_LABEL))
+  > (tree.children ?? []).findIndex(child => allText(child).startsWith('Аптайм моделей')),
+  String((tree.children ?? []).findIndex(child => allText(child).includes(SUCCESSES_LABEL))))
+
+text = allText(dataBox)
+check('the explanation names the window from the settings rather than from a constant',
+  text.includes('на окно в 15 мин'), text)
+check('says what one report costs, measured and with its headers',
+  text.includes('около 650 байт вместе с заголовками HTTP'), text)
+check('under the conditions the measurement was taken under',
+  text.includes('при 12 моделях') && text.includes('восьмичасовой'), text)
+check('against the per-request sending it replaces', text.includes('86 % запросов'), text)
+check('with an idle machine as a real zero rather than a rounding',
+  text.includes('ноль байт, а не округление'), text)
+check('and a lifetime total is never turned into a rate',
+  !text.includes('в сутки') && !text.includes('/сутки') && !text.includes('в день'), text)
+// The fixture publishes no success counters, so the page must invent no figure: a number the
+// state does not carry is worse than no number, which is the rule task-42 states outright.
+check('and no total this install has not measured', !text.includes('С начала работы'), text)
+
+STATE.errorReport.successWindows = 3
+STATE.errorReport.successBytes = 1941
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('the install own measured total appears when the host publishes it',
+  text.includes('С начала работы отправлено 3 окна успехов, 1,9 КБ.'), text)
+
+// §7.7: windows that were formed and never left. Since the user's ruling «Оставляем очередь
+// только для ошибок» a success window is neither persisted nor retried, so a delivery failure
+// costs the window outright — and a window is up to fifteen minutes of uptime denominator. The
+// denominator stays honest, but an honest number with a silent hole in it is indistinguishable
+// from one computed over complete data, so this counter is the only trace the hole exists. The
+// name is read out of `summary()`, where it is published beside `successWindows` and
+// `successBytes` in the same unit, rather than retyped from a description of it.
+STATE.errorReport.successWindowsLost = 0
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('a zero loss draws nothing at all', !text.includes('потеряно'), text)
+STATE.errorReport.successWindowsLost = 1
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('one lost window is named, in the singular', text.includes('1 окно успехов потеряно'), text)
+STATE.errorReport.successWindowsLost = 2
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('two read as the few form', text.includes('2 окна успехов потеряно'), text)
+STATE.errorReport.successWindowsLost = 5
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('five read as the many form', text.includes('5 окон успехов потеряно'), text)
+// The two things this line must never become, both §7.2 in a new costume. It explains delivery
+// and nothing else: not a percentage, which comes from a global aggregate while this counter is
+// local to one install, and not a version mismatch, since windows the collector refused for
+// document shape are deliberately not counted here — counting them would climb 96 times a day.
+// The smallest div carrying the phrase, not the first: `collect` walks depth-first, so an
+// ancestor of the line also contains it and would be "found" with the whole box's text inside.
+const lostLine = collect(dataBoxOf(tree), 'div')
+  .filter(item => allText(item).includes('потеряно'))
+  .sort((a, b) => allText(a).length - allText(b).length)[0]
+check('and the line explains delivery rather than any percentage',
+  lostLine !== undefined && !allText(lostLine).includes('аптайм') && !allText(lostLine).includes('процент'),
+  lostLine === undefined ? 'no line' : allText(lostLine))
+check('nor a shape refusal, which is deliberately not counted as a loss',
+  lostLine !== undefined && !allText(lostLine).includes('верси') && !allText(lostLine).includes('форм'),
+  lostLine === undefined ? 'no line' : allText(lostLine))
+delete STATE.errorReport.successWindowsLost
+tree = await view()
+check('and an answer without the counter draws nothing either',
+  !allText(dataBoxOf(tree)).includes('потеряно'), allText(dataBoxOf(tree)))
+
+// task-63: events this machine's own network caused, ruled by the user not sent at all — neither
+// as an error nor as a success. Events, not aggregates, so each leaves no record anywhere else
+// and this counter is the only trace. errors-core asserts in their suite that the field is
+// published under this name and starts at zero; these own the sentence, when it renders, and what
+// it may not say, so the field's existence is not pinned in two suites that could drift.
+STATE.errorReport.suppressedNetworkErrors = 0
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('a zero suppression draws nothing at all', !text.includes('не отправлен'), text)
+STATE.errorReport.suppressedNetworkErrors = 1
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('one suppressed failure is named, in the singular', text.includes('1 сбой сети этой машины не отправлен'), text)
+STATE.errorReport.suppressedNetworkErrors = 2
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('two read as the few form', text.includes('2 сбоя сети этой машины не отправлено'), text)
+STATE.errorReport.suppressedNetworkErrors = 5
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('five read as the many form', text.includes('5 сбоев сети этой машины не отправлено'), text)
+const suppressedLine = collect(dataBoxOf(tree), 'div')
+  .filter(item => allText(item).includes('не отправлено'))
+  .sort((a, b) => allText(a).length - allText(b).length)[0]
+const supText = suppressedLine === undefined ? '' : allText(suppressedLine)
+check('and the line explains this machine, not any percentage',
+  suppressedLine !== undefined && !supText.includes('аптайм') && !supText.includes('процент'), supText)
+// Load-bearing, not decorative: today's sentence is fine, and this is about the day somebody
+// shortens it to «сбой провайдера не отправлен» to fit a narrower box, which asserts a cause the
+// rule does not know. Forbidding the abbreviation is what keeps the honest sentence alive —
+// `провайдер` may appear only inside the clause saying one may be among them.
+check('nor may it blame or clear the provider',
+  suppressedLine !== undefined && (supText.match(/провайдер/u) ?? []).length === 1
+  && supText.includes('может оказаться и настоящий сбой провайдера'), supText)
+// The gate also requires the classifier's kind, so an instant status-less `reset` or `tls`
+// failure is not suppressed and still leaves. Claiming the wider shape would read as wrong to a
+// user comparing this counter against their own log.
+check('and it says the rule is narrower than any instant status-less failure',
+  suppressedLine !== undefined && supText.includes('отнесённый правилом'), supText)
+delete STATE.errorReport.suppressedNetworkErrors
+tree = await view()
+check('an answer without the suppression counter draws nothing either',
+  !allText(dataBoxOf(tree)).includes('не отправлен'), allText(dataBoxOf(tree)))
+STATE.errorReport.successWindows = 0
+STATE.errorReport.successBytes = 0
+tree = await view()
+text = allText(dataBoxOf(tree))
+// A measured zero renders as a zero. This is the difference from the route bootstrap's
+// `models: null`, where nobody had counted and a dash was the only honest mark: the two look
+// identical in a fixture and only one of them is a fact.
+check('and a measured zero is a zero rather than a dash',
+  text.includes('отправлено 0 окон успехов, 0 Б'), text)
+delete STATE.errorReport.successWindows
+delete STATE.errorReport.successBytes
+
+tree = await view()
+requests.length = 0
+switchNamed(tree, SUCCESSES_LABEL).props.onChange({ target: { checked: false } })
+await settle()
+check('turning success reporting off posts collectSuccesses and nothing beside it',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).collectSuccesses === false)
+  && requests.filter(item => item.path.endsWith('/config')).every(item => Object.keys(JSON.parse(item.body)).length === 1),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+
+tree = await view()
+// The window flushes on its own timer and there is no endpoint that would flush it sooner,
+// so a control labelled «отправить сейчас» could only re-read a state that re-runs nothing —
+// the same lie with a border radius that the route-bootstrap line refuses. Asserted rather
+// than merely left out, so adding one reddens a check instead of shipping.
+check('the box offers no flush or retry control',
+  collect(dataBoxOf(tree), 'button').length === 0,
+  String(collect(dataBoxOf(tree), 'button').length))
+
+// §7's third combination: successes counted locally while sending is off. Reachable on a
+// real machine only since errors-core split the sending gate from counting — before that,
+// `noteSuccess` returned before incrementing when error collection was off, so this fixture
+// supplied a shape no host could produce. host-wiring's four-combination matrix now asserts
+// it end to end (20/20, stable across three runs, combination 3 producing a real report on
+// the wire), so the row is a live behaviour and not only this half of a contract.
+STATE.config.collectSuccesses = false
+STATE.errorReport.successes = 5
+tree = await view()
+text = allText(dataBoxOf(tree))
+check('with reporting off the switch says off',
+  switchNamed(tree, SUCCESSES_LABEL)?.props.checked === false,
+  String(switchNamed(tree, SUCCESSES_LABEL)?.props.checked))
+check('and the page says this install is not contributing, which it does know',
+  text.includes('Выключено: эта установка не участвует в подсчёте аптайма.'), text)
+// §7.2's forbidden rendering, asserted absent: the collector's aggregate spans every
+// install, so this install's flag is one possible contributor to a null and never its cause.
+check('without claiming a cause for anything the collector published',
+  !text.includes('процент не считается') && !text.includes('успехи выключены'), text)
+check('and a local counter is not described as sending',
+  !text.includes('отправляются') && !text.includes('уходят'), text)
+check('while the collector own percentages are untouched by this install setting',
+  uptimeOf(uptimeRow(tree, 'OPUS 5.5')) === 'аптайм 0%'
+  && uptimeOf(uptimeRow(tree, 'GLM 5.3')) === 'аптайм 96,8%',
+  [uptimeOf(uptimeRow(tree, 'OPUS 5.5')), uptimeOf(uptimeRow(tree, 'GLM 5.3'))].join(' | '))
+delete STATE.config.collectSuccesses
+STATE.errorReport.successes = 5
 
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)

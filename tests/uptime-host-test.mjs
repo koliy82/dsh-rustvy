@@ -193,6 +193,10 @@ function viewFixture(mode, range) {
   const { buckets } = windowOf(range)
   if (mode === 'green') {
     return {
+      // The fake collector is a v3 collector, and §5.3 makes the version marker what
+      // licenses the percentage. A fixture without it is a fixture for a collector
+      // that cannot publish availability, which is a different test.
+      contractVersion: 3,
       generatedAt: at,
       range,
       storage: 'mongo',
@@ -216,6 +220,7 @@ function viewFixture(mode, range) {
     }
   }
   return {
+    contractVersion: 3,
     generatedAt: at,
     range,
     storage: 'mongo',
@@ -580,7 +585,17 @@ check('no model carries a last error', (first.answer.json?.models ?? []).every(m
 const greenStrip = modelOf(first.answer, MODEL_IDS[0])?.buckets
 const greenStats = bucketStats(greenStrip)
 check('every model keeps the bucket strip it was sent', (first.answer.json?.models ?? []).every(model => bucketStats(model.buckets).count === windowOf(DEFAULT_RANGE).buckets), String(greenStats.count))
-check('every bucket is a from and a count', (greenStrip ?? []).every(bucket => Number.isInteger(bucket.from) && Number.isInteger(bucket.count) && Object.keys(bucket).length === 2), JSON.stringify(greenStrip?.[0]))
+// v3 adds three nullable measurements to a bucket, and §2.2 adds two more. The
+// assertion is on the exact key set rather than on "at least these keys", because a
+// bucket that grows an unannounced field is a contract change nobody told this half
+// about — which is what the check is for. The fixture is a v2-shaped green payload, so
+// all five arrive null: that is the deployment population, and it is asserted again
+// below against an old collector.
+check('every bucket is a from, a count and the five nullable measurements',
+  (greenStrip ?? []).every(bucket => Number.isInteger(bucket.from) && Number.isInteger(bucket.count)
+    && Object.keys(bucket).length === 7 && 'ok' in bucket && 'fails' in bucket && 'uptime' in bucket
+    && 'msMean' in bucket && 'msMax' in bucket),
+  JSON.stringify(greenStrip?.[0]))
 check('an all-green strip sums to no errors', greenStats.errors === 0, String(greenStats.errors))
 check('an all-green strip still scales', greenStats.max === 1, String(greenStats.max))
 check('a strip keeps its outer stamps', Number.isInteger(greenStats.first) && Number.isInteger(greenStats.last) && greenStats.last > greenStats.first, `${greenStats.first} → ${greenStats.last}`)
@@ -866,6 +881,190 @@ await handle.dispose()
 collector.close()
 Date.now = realNow
 rmSync(PROFILE, { recursive: true, force: true })
+
+// --- contract v3: the percentage, and the null that has to survive it ---------
+// v3 gives uptime a real denominator, so the collector publishes `null` when there
+// was nothing to divide by. This section exists because `uptimeOf` turned every
+// non-number into `0`: against a v3 collector, an honest "nobody measured this"
+// arrived at the page as a confident 0% — a total outage, on a page whose whole job
+// is saying whether the provider works. Wrong in the alarming direction this time,
+// which at least gets reported, but a lie on screen either way.
+{
+  check('a null percentage survives the normalizer',
+    normalizeUptimeView({ models: [{ id: 'm', uptime: null }] }).models[0]?.uptime === null,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', uptime: null }] }).models[0]?.uptime))
+  check('and arrives as null rather than as an absent field',
+    'uptime' in normalizeUptimeView({ models: [{ id: 'm', uptime: null }] }).models[0],
+    JSON.stringify(Object.keys(normalizeUptimeView({ models: [{ id: 'm', uptime: null }] }).models[0] ?? {})))
+  check('uptimeOf answers null for an explicit null', uptimeOf({ uptime: null }) === null, String(uptimeOf({ uptime: null })))
+  check('uptimeOf answers null for a payload with no percentage at all', uptimeOf({}) === null, String(uptimeOf({})))
+  check('uptimeOf answers null for a percentage that is not a number', uptimeOf({ uptime: '97.9' }) === null, String(uptimeOf({ uptime: '97.9' })))
+  check('zero stays zero and is not confused with null',
+    uptimeOf({ uptime: 0 }) === 0 && uptimeOf({ uptime: null }) === null,
+    JSON.stringify({ zero: uptimeOf({ uptime: 0 }), absent: uptimeOf({ uptime: null }) }))
+  check('a real percentage keeps the collector own precision rather than being rounded here',
+    uptimeOf({ uptime: 97.9 }) === 97.9 && uptimeOf({ uptime: 99.97 }) === 99.97 && uptimeOf({ uptime: 100 }) === 100,
+    JSON.stringify([uptimeOf({ uptime: 97.9 }), uptimeOf({ uptime: 99.97 })]))
+
+  const v3 = normalizeUptimeView({
+    contractVersion: 3,
+    summary: { uptime: 99.4, ok: 1204, fails: 7 },
+    models: [{
+      id: 'claude-opus-5-5', uptime: 99.7, ok: 812, fails: 2, errors: 2, installs: 2,
+      buckets: [{ from: 1_761_763_200_000, count: 1, ok: 203, fails: 1, uptime: 99.5 }],
+    }],
+  })
+  check('the summary percentage passes through', v3.summary?.uptime === 99.4, JSON.stringify(v3.summary?.uptime))
+  check('the summary successes and failures pass through', v3.summary?.ok === 1204 && v3.summary?.fails === 7,
+    JSON.stringify({ ok: v3.summary?.ok, fails: v3.summary?.fails }))
+  check('the model percentage passes through', v3.models[0]?.uptime === 99.7, JSON.stringify(v3.models[0]?.uptime))
+  check('the model successes and failures pass through', v3.models[0]?.ok === 812 && v3.models[0]?.fails === 2,
+    JSON.stringify({ ok: v3.models[0]?.ok, fails: v3.models[0]?.fails }))
+  check('the record count still means records and is untouched', v3.models[0]?.errors === 2, String(v3.models[0]?.errors))
+  check('a bucket carries its successes, failures and percentage',
+    v3.models[0]?.buckets[0]?.ok === 203 && v3.models[0].buckets[0].fails === 1 && v3.models[0].buckets[0].uptime === 99.5,
+    JSON.stringify(v3.models[0]?.buckets[0]))
+  check('the bucket percentage is the collector and not a recomputation from its neighbours',
+    v3.models[0]?.buckets[0]?.uptime === 99.5, String(v3.models[0]?.buckets[0]?.uptime))
+
+  // A v2 collector sends none of these fields. Nulls, not `undefined`, not a crash —
+  // this is the population during deployment rather than an edge case, and it is the
+  // reason the file still carries both status vocabularies.
+  const v2 = normalizeUptimeView({ models: [{ id: 'm', errors: 3, status: 'ok', buckets: [{ from: 1, count: 2 }] }] })
+  check('an old collector yields null for the percentage rather than undefined', v2.models[0]?.uptime === null, JSON.stringify(v2.models[0]?.uptime))
+  check('and null for its successes and failures', v2.models[0]?.ok === null && v2.models[0]?.fails === null,
+    JSON.stringify({ ok: v2.models[0]?.ok, fails: v2.models[0]?.fails }))
+  check('and null across the summary', v2.summary?.uptime === null && v2.summary?.ok === null && v2.summary?.fails === null,
+    JSON.stringify({ uptime: v2.summary?.uptime, ok: v2.summary?.ok, fails: v2.summary?.fails }))
+  check('and null inside a bucket that carries only v2 fields',
+    v2.models[0]?.buckets[0]?.uptime === null && v2.models[0].buckets[0].ok === null && v2.models[0].buckets[0].fails === null,
+    JSON.stringify(v2.models[0]?.buckets[0]))
+  check('the bucket fields v2 did send are still there', v2.models[0]?.buckets[0]?.count === 2 && v2.models[0].buckets[0].from === 1,
+    JSON.stringify(v2.models[0]?.buckets[0]))
+
+  // The three statements a reader has to be able to tell apart: measured and perfect,
+  // measured and total failure, and never measured. If two of these collapse into one
+  // value the panel cannot say which happened.
+  const three = normalizeUptimeView({ contractVersion: 3, models: [
+    { id: 'perfect', uptime: 100, ok: 40, fails: 0 },
+    { id: 'outage', uptime: 0, ok: 0, fails: 40 },
+    { id: 'unmeasured', uptime: null, ok: null, fails: null },
+  ] })
+  check('perfect, outage and unmeasured are three different answers',
+    three.models[0].uptime === 100 && three.models[1].uptime === 0 && three.models[2].uptime === null,
+    JSON.stringify(three.models.map(model => ({ id: model.id, uptime: model.uptime }))))
+}
+
+// --- contract §5.3: the version discriminator, and the precision of a share ------
+// `uptime` has one field name and two meanings across contract versions: v2 carried a
+// bucket-occupancy share, v3 carries a real availability ratio. Nothing else in the
+// payload names a contract version, so without a discriminator a v2 collector's share
+// would be drawn as availability. §5.3 puts `contractVersion` at the top level, and
+// the percentage is rendered only when it is present and at least 3.
+{
+  const legacyShare = { models: [{ id: 'm', uptime: 74 }], summary: { uptime: 88 } }
+  check('a collector that names no contract version yields a dash, not a number',
+    normalizeUptimeView(legacyShare).models[0]?.uptime === null && normalizeUptimeView(legacyShare).summary?.uptime === null,
+    JSON.stringify({ model: normalizeUptimeView(legacyShare).models[0]?.uptime, summary: normalizeUptimeView(legacyShare).summary?.uptime }))
+  check('a v2 collector legacy bucket share is not drawn as availability',
+    normalizeUptimeView({ ...legacyShare, contractVersion: 2 }).models[0]?.uptime === null,
+    String(normalizeUptimeView({ ...legacyShare, contractVersion: 2 }).models[0]?.uptime))
+  check('a contract version below 3 is a dash even in a bucket',
+    normalizeUptimeView({ contractVersion: 2, models: [{ id: 'm', buckets: [{ from: 1, count: 2, uptime: 74 }] }] }).models[0]?.buckets[0]?.uptime === null,
+    String(normalizeUptimeView({ contractVersion: 2, models: [{ id: 'm', buckets: [{ from: 1, count: 2, uptime: 74 }] }] }).models[0]?.buckets[0]?.uptime))
+  const v3 = { contractVersion: 3, summary: { uptime: 99.4 }, models: [{ id: 'm', uptime: 99.7, buckets: [{ from: 1, count: 2, uptime: 99.5 }] }] }
+  check('a collector that names version 3 has its percentage drawn',
+    normalizeUptimeView(v3).models[0]?.uptime === 99.7 && normalizeUptimeView(v3).summary?.uptime === 99.4,
+    JSON.stringify({ model: normalizeUptimeView(v3).models[0]?.uptime, summary: normalizeUptimeView(v3).summary?.uptime }))
+  check('and in its buckets too', normalizeUptimeView(v3).models[0]?.buckets[0]?.uptime === 99.5,
+    String(normalizeUptimeView(v3).models[0]?.buckets[0]?.uptime))
+  check('a version above 3 is accepted rather than matched exactly',
+    normalizeUptimeView({ contractVersion: 4, models: [{ id: 'm', uptime: 91.2 }] }).models[0]?.uptime === 91.2,
+    String(normalizeUptimeView({ contractVersion: 4, models: [{ id: 'm', uptime: 91.2 }] }).models[0]?.uptime))
+  check('a version that is not a number is treated as no version at all',
+    normalizeUptimeView({ contractVersion: '3', models: [{ id: 'm', uptime: 91.2 }] }).models[0]?.uptime === null,
+    String(normalizeUptimeView({ contractVersion: '3', models: [{ id: 'm', uptime: 91.2 }] }).models[0]?.uptime))
+  // Counts are NOT gated: `ok` and `fails` are new keys in v3 with no earlier meaning,
+  // so a payload that carries them is unambiguous without a version. Gating them too
+  // would mean a collector that forgot the version marker lost its whole measurement
+  // block rather than only the one field whose name is ambiguous.
+  check('the counts a v3 collector publishes are not gated on the version marker',
+    normalizeUptimeView({ models: [{ id: 'm', ok: 12, fails: 1 }] }).models[0]?.ok === 12
+    && normalizeUptimeView({ models: [{ id: 'm', ok: 12, fails: 1 }] }).models[0]?.fails === 1,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', ok: 12, fails: 1 }] }).models[0]))
+
+  // `affectedPct` is read from the collector's answer, so its precision is the
+  // collector's. Rounding it here is the same instinct as clamping a null to zero,
+  // one level milder — and at the boundary it invents a claim: 99.96 becomes 100.0,
+  // which says every install was affected when the collector said it was not.
+  check('a share keeps the collector precision instead of being rounded here',
+    normalizeUptimeView({ models: [{ id: 'm', affectedPct: 99.96 }] }).models[0]?.affectedPct === 99.96,
+    String(normalizeUptimeView({ models: [{ id: 'm', affectedPct: 99.96 }] }).models[0]?.affectedPct))
+  check('and does not become a claim that everybody was affected',
+    normalizeUptimeView({ summary: { affectedPct: 99.96 } }).summary?.affectedPct !== 100,
+    String(normalizeUptimeView({ summary: { affectedPct: 99.96 } }).summary?.affectedPct))
+  check('a real zero share is still zero and a null share is still null',
+    normalizeUptimeView({ models: [{ id: 'm', affectedPct: 0 }, { id: 'n', affectedPct: null }] }).models[0]?.affectedPct === 0
+    && normalizeUptimeView({ models: [{ id: 'm', affectedPct: 0 }, { id: 'n', affectedPct: null }] }).models[1]?.affectedPct === null,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', affectedPct: 0 }, { id: 'n', affectedPct: null }] }).models.map(model => model.affectedPct)))
+}
+
+// --- contract §2.2: duration aggregates, and the absence rule that inverts `n` ----
+// Absent `n` reads as one. Absent `msMean` reads as UNKNOWN and never as zero, because
+// rows written before durations existed carry a count and no sum — and a zero sum
+// beside a non-zero count publishes a mean response time of 0 ms, an instant answer
+// nobody measured. That is `Number(null) === 0` again, arriving from the other side.
+{
+  check('an absent mean is null rather than zero',
+    normalizeUptimeView({ models: [{ id: 'm', ok: 4, fails: 0 }] }).models[0]?.msMean === null,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', ok: 4, fails: 0 }] }).models[0]?.msMean))
+  check('and so is an absent maximum',
+    normalizeUptimeView({ models: [{ id: 'm' }] }).models[0]?.msMax === null,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm' }] }).models[0]?.msMax))
+  check('a measured zero mean stays zero and is not confused with unknown',
+    normalizeUptimeView({ models: [{ id: 'm', msMean: 0 }] }).models[0]?.msMean === 0,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', msMean: 0 }] }).models[0]?.msMean))
+  check('a duration keeps the collector precision rather than being rounded here',
+    normalizeUptimeView({ models: [{ id: 'm', msMean: 1234.567, msMax: 9876.543 }] }).models[0]?.msMean === 1234.567
+    && normalizeUptimeView({ models: [{ id: 'm', msMean: 1234.567, msMax: 9876.543 }] }).models[0]?.msMax === 9876.543,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', msMean: 1234.567, msMax: 9876.543 }] }).models[0]))
+  check('a duration that is not a number is unknown rather than zero',
+    normalizeUptimeView({ models: [{ id: 'm', msMean: '1200' }] }).models[0]?.msMean === null,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', msMean: '1200' }] }).models[0]?.msMean))
+
+  // Buckets carry the mean so that «среднее за последние 15 минут» is read from the
+  // last bucket rather than recomputed on the page — a second computation from one
+  // payload is a second place to get it wrong.
+  const bucketed = normalizeUptimeView({ contractVersion: 3, models: [{ id: 'm', buckets: [
+    { from: 1, count: 0, ok: 4, fails: 0, uptime: 100, msMean: 1180.5 },
+    { from: 2, count: 1, ok: 3, fails: 1, uptime: 75, msMax: 9000 },
+  ] }] })
+  check('a bucket carries its mean', bucketed.models[0]?.buckets[0]?.msMean === 1180.5,
+    JSON.stringify(bucketed.models[0]?.buckets[0]))
+  check('and a bucket with only a maximum has no mean invented for it',
+    bucketed.models[0]?.buckets[1]?.msMean === null && bucketed.models[0]?.buckets[1]?.msMax === 9000,
+    JSON.stringify(bucketed.models[0]?.buckets[1]))
+
+  // The summary carries both, for the banner tile. `models: []` is not decoration:
+  // a payload with no models array is refused outright, so without it this asserts
+  // nothing about durations and everything about the refusal path.
+  check('the summary carries the mean and the maximum',
+    normalizeUptimeView({ models: [], summary: { msMean: 2210.25, msMax: 31204 } }).summary?.msMean === 2210.25
+    && normalizeUptimeView({ models: [], summary: { msMean: 2210.25, msMax: 31204 } }).summary?.msMax === 31204,
+    JSON.stringify(normalizeUptimeView({ models: [], summary: { msMean: 2210.25, msMax: 31204 } }).summary))
+  check('and nulls when the collector measured none',
+    normalizeUptimeView({ models: [{ id: 'm' }] }).summary?.msMean === null
+    && normalizeUptimeView({ models: [{ id: 'm' }] }).summary?.msMax === null,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm' }] }).summary?.msMean))
+
+  // Durations are NOT gated on `contractVersion`, for the reason `ok` and `fails` are
+  // not: these keys have no earlier meaning, so a payload carrying them is unambiguous
+  // without a marker. Only the percentage is gated, because only `uptime` changed
+  // meaning between versions.
+  check('a duration arrives from a collector that names no contract version',
+    normalizeUptimeView({ models: [{ id: 'm', msMean: 1500 }] }).models[0]?.msMean === 1500,
+    JSON.stringify(normalizeUptimeView({ models: [{ id: 'm', msMean: 1500 }] }).models[0]?.msMean))
+}
 
 const failed = results.filter(result => !result.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)

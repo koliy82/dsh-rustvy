@@ -249,6 +249,55 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The noun the anonymous share is counted in.
+     *
+     * §5.1 of the v3 contract made `anonymous` a sum of the fold counters `n` — a count of
+     * *failures* — where it used to be a count of records. Drawing it against the record
+     * count would leave two numbers that are each individually true and meaningless
+     * together, which is the shape the contract calls the worst kind of error precisely
+     * because nothing on screen looks broken. So the unit travels with the denominator and
+     * is named in the phrase: «сбоев» for failures, «отчётов» for records.
+     */
+    const ANONYMOUS_UNITS = Object.freeze({
+      fails: Object.freeze({ some: 'сбоев', all: 'все сбои анонимны' }),
+      reports: Object.freeze({ some: 'отчётов', all: 'все отчёты анонимны' }),
+    })
+
+    /**
+     * The denominator `anonymous` belongs against, and the unit word that goes with it.
+     *
+     * What decides the unit is the answer's `contractVersion`, and the place that reads it is
+     * the host's normaliser, not this function: `lib/uptime.js` nulls `uptime` unless the
+     * marker is present and at least 3, so a v3 percentage is licensed upstream and this half
+     * receives an already-decided payload. The `Number.isFinite(model.fails)` test below sits
+     * **downstream** of that as a second gate — it is what keeps the three states on screen
+     * distinguishable, and two independent gates agreeing is not redundancy to be simplified
+     * away.
+     *
+     * It is deliberately not described here as "a collector that publishes `fails` is a v3
+     * collector". That inference happens to hold on every payload this machine can produce,
+     * including a genuine v2 collector that publishes neither field and a v3-semantics
+     * collector that predates the marker — but it was never verified across versions, and as a
+     * rule it is unsound four ways over: it couples semantics to which fields happen to be
+     * populated rather than to what the producer meant; it cannot tell v3 from a future v4
+     * that redefines `uptime` again, which is the case a discriminator exists for; it breaks
+     * silently the first time any version publishes these fields for another purpose; and it
+     * makes every consumer re-derive a fact the producer already knows.
+     *
+     * Both call sites — the row and the badge tooltip — go through this, so the two cannot
+     * drift apart.
+     *
+     * @param model - one model from the normalised answer.
+     * @param errors - the record count, already normalised to a number or `null`.
+     * @returns `{ count, unit }` for {@link anonymousNote}.
+     */
+    function anonymousBase(model, errors) {
+      return Number.isFinite(model?.fails)
+        ? { count: model.fails, unit: 'fails' }
+        : { count: errors, unit: 'reports' }
+    }
+
+    /**
      * The caveat that belongs next to an install count.
      *
      * «ошибок 3 от 1 установки» is a claim about breadth, and it is only as good as the
@@ -260,19 +309,20 @@ window.__ModuleLoader__.load({
      * and deserves no noise.
      *
      * The all-anonymous case is worded differently from the partial one on purpose: «все
-     * анонимные» says the breadth figure is not a measurement, where «2 из 3 анонимных»
-     * says it is one that undercounts.
+     * сбои анонимны» says the breadth figure is not a measurement at all, where «анонимно
+     * 2 из 3 сбоев» says it is one that undercounts.
      *
-     * @param errors - how many errors the window holds.
+     * @param count - the denominator, in whatever unit `unit` names, or a non-number.
      * @param anonymous - how many of them carried no usable install id.
-     * @returns «все анонимные», «2 из 3 анонимных» or `null` when nothing was anonymous.
+     * @param unit - `'fails'` or `'reports'`, per {@link ANONYMOUS_UNITS}.
+     * @returns «все сбои анонимны», «анонимно 2 из 3 сбоев» or `null` when nothing was.
      */
-    function anonymousNote(errors, anonymous) {
+    function anonymousNote(count, anonymous, unit = 'reports') {
       if (!Number.isFinite(anonymous) || anonymous <= 0) return null
-      const count = Number.isFinite(errors) ? errors : null
-      if (count === null) return `${anonymous} ${plural(anonymous, ['анонимный', 'анонимных', 'анонимных'])}`
-      if (anonymous >= count) return 'все анонимные'
-      return `${anonymous} из ${count} анонимных`
+      const words = ANONYMOUS_UNITS[unit] ?? ANONYMOUS_UNITS.reports
+      if (!Number.isFinite(count)) return `${anonymous} ${plural(anonymous, ['анонимный', 'анонимных', 'анонимных'])}`
+      if (anonymous >= count) return words.all
+      return `анонимно ${anonymous} из ${count} ${words.some}`
     }
 
     /** The one sans stack this half types with, shared by CSS rules and inline styles. */
@@ -897,7 +947,8 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         ? `${errors} ${plural(errors, ['ошибка', 'ошибки', 'ошибок'])}`
         : `${errors} ${plural(errors, ['ошибка', 'ошибки', 'ошибок'])} от `
           + `${installs} ${plural(installs, ['установки', 'установок', 'установок'])}`
-      const note = anonymousNote(errors, model?.anonymous)
+      const base = anonymousBase(model, errors)
+      const note = anonymousNote(base.count, model?.anonymous, base.unit)
       const recency = recencyOf(model)
       return `${spread}${note === null ? '' : ` (${note})`} за последний час`
         + (recency === null ? '' : ` · последняя ${recency}`)
@@ -2840,34 +2891,25 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
     }
 
     /**
-     * The width of one bucket per window, in words.
+     * The width of one bucket, measured from the buckets that arrived.
      *
-     * The collector sends 60 one-minute buckets for an hour and 48 for every longer
-     * window, so the same strip means half an hour on a day, three and a half hours on a
-     * week and fifteen on a month. That is why the strip carries its width as a label:
-     * unlabelled, a strip over a week reads exactly like a strip over an hour.
+     * Measured rather than looked up in a table keyed by range, because in v3 the width is
+     * a whole multiple of the success window and that window is configurable: a table would
+     * be a second rule about bucket geometry, and the two would disagree the moment
+     * `successWindowMs` moved or the collector changed its alignment. An hour over a
+     * fifteen-minute window is four buckets of fifteen minutes and not sixty of one minute,
+     * and only the array knows which. The contract puts it as «настраиваемое окно означает
+     * настраиваемую ширину корзины, а не второе правило».
+     *
+     * `null` when the array cannot say — fewer than two timestamps, or a step that is not
+     * positive — and then the strip carries no width label at all. An unlabelled strip is
+     * honest about not knowing; a label from a table would state a resolution the data does
+     * not have, which is the one thing the label exists to prevent.
+     *
+     * @param buckets - the buckets that came with the answer.
+     * @returns «15 мин», «30 мин», «3,5 ч», … or `null` when nothing says.
      */
-    const BUCKET_WIDTHS = Object.freeze({
-      '1h': '1 мин',
-      '24h': '30 мин',
-      '7d': '3,5 ч',
-      '30d': '15 ч',
-    })
-
-    /**
-     * The width of one bucket, for a window this half may not know.
-     *
-     * Measured from the buckets' own timestamps when the window is not in the table,
-     * because the collector decides how many buckets it sends and the strip is scaled to
-     * whatever arrived.
-     *
-     * @param range - the window the answer is for.
-     * @param buckets - the buckets that came with it.
-     * @returns «1 мин», «30 мин», «3,5 ч», … or `null` when nothing says.
-     */
-    function bucketWidth(range, buckets) {
-      const known = BUCKET_WIDTHS[typeof range === 'string' ? range : '']
-      if (known !== undefined) return known
+    function bucketWidth(buckets) {
       const from = (Array.isArray(buckets) ? buckets : []).map(bucket => bucket?.from).filter(Number.isFinite)
       if (from.length < 2) return null
       const minutes = Math.round((from[1] - from[0]) / 60_000)
@@ -2887,6 +2929,24 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       if (!Number.isFinite(value)) return '—'
       const rounded = Math.round(value * 10) / 10
       return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1).replace('.', ',')}%`
+    }
+
+    /**
+     * A byte count as a size a person can compare against a data allowance.
+     *
+     * `0` is a real answer here and not a missing one — it is what the counter holds
+     * before the first window goes out — so it renders as «0 Б» rather than as a dash.
+     * The dash is reserved for "nobody counted", which is what the route bootstrap's
+     * `models: null` means and what an absent counter means.
+     *
+     * @param value - a non-negative integer byte count.
+     * @returns «0 Б», «812 Б», «1,7 КБ», «2,4 МБ».
+     */
+    function bytesText(value) {
+      if (!Number.isFinite(value)) return '—'
+      if (value < 1024) return `${Math.round(value)} Б`
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1).replace('.', ',')} КБ`
+      return `${(value / (1024 * 1024)).toFixed(1).replace('.', ',')} МБ`
     }
 
     /**
@@ -2962,7 +3022,26 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       // than v2 does not measure breadth, and «от 0 установок» would read as "nobody was
       // affected" rather than as "we do not know".
       const installs = Number.isFinite(model.installs) ? model.installs : null
-      const note = anonymousNote(errors, model.anonymous)
+      const anonBase = anonymousBase(model, errors)
+      /**
+       * The count this row leads with, and the noun that goes with it.
+       *
+       * §5.1, and the reason is arithmetic rather than preference: the header publishes
+       * `summary.fails`, so a row leading with its record count makes the page show a total
+       * that is not the sum of its own rows — a headline of 39 above rows that add up to 13,
+       * with no way for the reader to tell which of the two is wrong. A page contradicting
+       * itself is the §5.1 defect with a second copy of it on the same screen.
+       *
+       * Display and rule are separate concerns: the state word keeps being computed from
+       * `errors`, which is what §5.1's compatibility rule and §6's deferred thresholds both
+       * depend on, and neither cares what the page prints. An answer with no `fails` predates
+       * v3 and keeps the record count under its own label, because that is the only magnitude
+       * it carries — and the anonymous clause follows the same discriminator, so the two
+       * numbers in one sentence are always in the same unit.
+       */
+      const shown = anonBase.unit === 'fails' ? model.fails : errors
+      const shownWord = anonBase.unit === 'fails' ? 'сбоев' : 'ошибок'
+      const note = anonymousNote(anonBase.count, model.anonymous, anonBase.unit)
       const caveat = note === null ? '' : ` (${note})`
       const recency = recencyOf(model)
       // A bar's slot is the array's own, never a timestamp divided by a width. The
@@ -2988,12 +3067,32 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       // Sixty empty bars say nothing a word does not say better, and "no errors in this
       // window" is the answer the collector gives most days.
       const hasErrors = counts.some(count => count > 0) || events.length > 0
-      const width = bucketWidth(props.range, buckets)
+      const width = bucketWidth(buckets)
       const last = typeof model.lastError === 'object' && model.lastError !== null ? model.lastError : null
       // `undefined` means the field is not in the answer at all — a collector older than
       // v2 — and `null` means it is there with nothing to divide by. Only the second one
       // is worth a line of its own.
       const affected = model.affectedPct === undefined ? undefined : model.affectedPct
+      // A percentage is rendered only when the same object carries the denominator it was
+      // computed from. An older contract also sent `uptime`, derived without a single
+      // successful request to divide by — which is exactly what v2 took off the page — so
+      // rendering it again because the field name came back would put a fabricated number
+      // under a real one's label.
+      //
+      // Which contract an answer follows is decided by `contractVersion` in the host's
+      // normaliser (`lib/uptime.js`), and that is what actually licenses the clause: it nulls
+      // `uptime` unless the marker is present and at least 3. This test is the second gate,
+      // downstream of the first, and it stays because it is what makes the three states on
+      // screen distinguishable — not because the presence of a field identifies a version,
+      // which is an inference nobody verified across versions and which a future contract
+      // reusing these names would break silently. `undefined` then means "no denominator
+      // here" and draws nothing; an explicit `null` beside a `fails` means the collector
+      // measured and found nothing to divide, and draws a dash — never «100%», per §3.
+      //
+      // Per §7.2 that dash claims no cause: it is not "your successes are off", because the
+      // collector's aggregate spans every install and this install's flag is one possible
+      // contributor rather than a reason.
+      const uptime = Number.isFinite(model.fails) && model.uptime !== undefined ? model.uptime : undefined
       return h('div', { className: 'dmi-up-row', 'data-dmi-state': status, style: { marginBottom: '9px' } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px', flexWrap: 'wrap' } },
           h('span', {
@@ -3004,16 +3103,19 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           h('span', { style: { fontSize: '12.5px', flex: '1 1 auto', minWidth: 0 } }, String(model.name ?? model.id ?? '—')),
           h('span', { style: { fontSize: '11.5px', fontWeight: 600, color: tone.color } }, tone.label),
           h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } },
-            errors === null
-              ? 'ошибок —'
-              : errors === 0
-                ? 'ошибок нет'
+            shown === null || shown === undefined
+              ? `${shownWord} —`
+              : shown === 0
+                ? `${shownWord} нет`
                 : installs === null
-                  ? `ошибок ${errors}${caveat}`
-                  : `ошибок ${errors} от ${installs} ${plural(installs, ['установки', 'установок', 'установок'])}${caveat}`),
+                  ? `${shownWord} ${shown}${caveat}`
+                  : `${shownWord} ${shown} от ${installs} ${plural(installs, ['установки', 'установок', 'установок'])}${caveat}`),
           recency === null
             ? null
             : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `последняя ${recency}`),
+          uptime === undefined
+            ? null
+            : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } }, `аптайм ${pctText(uptime)}`),
           affected === undefined
             ? null
             : h('span', { style: { fontSize: '11.5px', color: C.labelSecondary } },
@@ -3103,12 +3205,42 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       // The breadth the collector measured: how many distinct installs reported in this
       // window, and how many reported at all over the 30-day reference. `null` means the
       // answer predates the field, which is not the same as zero.
+      //
+      // §5.2, and the reason `installs.anonymous` is deliberately not read here: since v3
+      // that field is a sum of the fold counters, so it counts *failures*, while its two
+      // siblings in this same object count installs. The name and the container agree and
+      // the semantics do not, which is what makes the container actively suggest the wrong
+      // reading — on a live 24h capture it is `window: 5, reference: 5, anonymous: 4`, and
+      // «4 из 5 установок анонимные» would compare failures with installs while reading
+      // perfectly and looking broken nowhere. Its only correct partner is `summary.fails`,
+      // so this header draws no anonymous share at all and a check pins that.
       const installs = typeof data?.installs === 'object' && data.installs !== null ? data.installs : null
       const models = Array.isArray(data?.models) ? data.models : []
       const refused = typeof data?.error === 'string' && data.error !== '' ? data.error : state.uptimeError
       const generatedAt = Number.isFinite(data?.generatedAt) ? new Date(data.generatedAt).toLocaleString() : '—'
       const cachedAt = Number.isFinite(data?.fetchedAt) ? new Date(data.fetchedAt).toLocaleString() : '—'
       const monitorUrl = typeof data?.monitorUrl === 'string' && data.monitorUrl !== '' ? data.monitorUrl : null
+      /**
+       * §5.1: the headline total is `fails` — the sum of `n`, so real failures — and not
+       * `errors`, which counts records and understates by a quarter on the live data
+       * (21 published against 28 actual). The two labels have to differ wherever both
+       * numbers can be seen, so a failure total says «сбоев» and a record count keeps
+       * saying «ошибок»: one word over two quantities is two claims under one name. An
+       * answer carrying no `fails` keeps the count it has; which contract an answer follows is the
+        * normaliser's call from `contractVersion`, not an inference from populated fields.
+       *
+       * The substitution cannot contradict the state word beside it, because `n` is never
+       * zero and a missing `n` reads as one — so `errors == 0` exactly when `fails == 0`,
+       * and the state rule, which only tests for zero, agrees with either.
+       */
+      const fails = Number.isFinite(summary.fails) ? summary.fails : null
+      const failsClause = fails === null
+        ? `ошибок за период ${summary.totalErrors ?? data?.total ?? '—'}`
+        : `сбоев за период ${fails}`
+      // Gated on the denominator rather than on the percentage itself: see the row.
+      const headlineUptime = fails === null || summary.uptime === undefined
+        ? ''
+        : `аптайм ${pctText(summary.uptime)} · `
 
       return h('div', {
         style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
@@ -3147,9 +3279,22 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                         `показано кешированное от ${cachedAt}; коллектор недоступен: ${refused ?? 'причина не сообщена'}`)
                     : null,
                   h('div', { style: { fontSize: '12.5px', marginBottom: '8px' } },
-                    `моделей ${summary.totalModels ?? '—'} · без ошибок ${summary.operational ?? '—'}`
+                    // The percentage leads, because §5.1 makes it the headline of the view
+                    // rather than a detail row: there is a denominator now, which is exactly
+                    // what v2 lacked and why the rule «процента больше нет» was right then and
+                    // is repealed now. It leads and it replaces nothing — the state counts stay
+                    // beside it, since one figure over a day is the number §5.1 itself warns
+                    // saturates and hides a three-hour outage, and the per-model rows and their
+                    // strips are what carry that. Gated on `summary.fails` rather than on
+                    // `summary.uptime` for the reason the row gives: an older contract also sent a
+                    // percentage, computed with no successful request to divide by, and v2 took
+                    // it off the page. It comes back when there is a denominator behind it, and
+                    // which contract an answer follows is the normaliser's call from
+                    // `contractVersion`, not an inference from which fields are populated.
+                    (headlineUptime)
+                    + `моделей ${summary.totalModels ?? '—'} · без ошибок ${summary.operational ?? '—'}`
                     + ` · локально ${summary.single ?? 0} · сбои ${summary.issues ?? summary.slow ?? 0}`
-                    + ` · лежат ${summary.down ?? 0} · ошибок за период ${summary.totalErrors ?? data?.total ?? '—'}`
+                    + ` · лежат ${summary.down ?? 0} · ${failsClause}`
                     // Dropped entirely when the answer has no install counts: an older
                     // collector measures nothing about breadth, and dashes in the header
                     // would be noise rather than honesty.
@@ -3418,6 +3563,108 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
        */
       const collecting = config.collectErrors !== false
 
+      /**
+       * Whether success reporting is on, read from the setting and from nowhere else.
+       *
+       * `config.collectSuccesses` is what this toggle writes and what the user chose. The
+       * reporter resolves the same boolean internally to decide whether a window may leave
+       * the machine, and a second published copy of that resolution was considered and
+       * withdrawn: a checkbox has to show the stored setting, because driven by a resolved
+       * value it could sit in a position the user never put it, and clicking it would post
+       * a change to something else. Reading both in order to compare them is what would
+       * give the two paths a chance to disagree on screen, so this half reads one — the
+       * same single-source rule that keeps the window length in `config.successWindowMs`
+       * rather than in the reporter's copy of it.
+       *
+       * "Not explicitly off" for the reason the error switch uses: a host half older than
+       * the field publishes no `collectSuccesses`, and the default is on, so a truth test
+       * would draw every current install as switched off.
+       */
+      const reportingSuccesses = config.collectSuccesses !== false
+
+      // The aggregation window, from the settings surface rather than from the reporter's
+      // copy of the same number, so one value has one home.
+      const windowMs = Number.isFinite(config.successWindowMs) && config.successWindowMs > 0
+        ? config.successWindowMs
+        : null
+      const windowLabel = windowMs === null
+        ? null
+        : windowMs % 60_000 === 0
+          ? `${Math.round(windowMs / 60_000)} мин`
+          : `${(windowMs / 60_000).toFixed(1).replace('.', ',')} мин`
+
+      /**
+       * What success reporting has cost this install, measured by the host rather than
+       * estimated from the contract.
+       *
+       * A lifetime total and never a rate: turning it into «в сутки» needs an elapsed span
+       * nobody publishes, and dividing by a guess is how a measured field becomes an
+       * invented sentence. `0` before the first window is a *measured* zero and renders as
+       * `0`, unlike the route bootstrap's `models: null`, where nobody had counted and a
+       * dash is the only honest mark — the two look identical in a fixture and only one of
+       * them is a fact.
+       *
+       * Absent counters render no sentence at all, because a page must not draw a number
+       * the state does not contain.
+       */
+      const report = status?.errorReport
+      const windowsSent = Number.isFinite(report?.successWindows) ? report.successWindows : null
+      const bytesSent = Number.isFinite(report?.successBytes) ? report.successBytes : null
+      const cost = windowsSent === null || bytesSent === null
+        ? null
+        : `С начала работы отправлено ${windowsSent} ${plural(windowsSent, ['окно', 'окна', 'окон'])} успехов, ${bytesText(bytesSent)}.`
+
+      /**
+       * Windows that were formed and never left, counted in windows and not in samples.
+       *
+       * Since the user's ruling «Оставляем очередь только для ошибок» a success window is
+       * neither persisted nor retried, so a delivery failure costs the window outright — and
+       * a window is up to fifteen minutes of uptime denominator. The denominator stays honest,
+       * because less data is not more invention, but an honest number with a silent hole in it
+       * is indistinguishable from one computed over complete data. This counter is the only
+       * trace that the hole exists.
+       *
+       * Rendered only above zero. A zero loss is not an achievement worth reporting, and a
+       * line that stands empty for most installs for their whole life teaches the reader to
+       * skip the block it lives in.
+       *
+       * Two things this line must never become, both of them §7.2 wearing a different coat.
+       * It does not explain any percentage: lost windows here are one possible contribution to
+       * the collector having less data, never the cause of a particular number, and the
+       * percentage comes from a global aggregate while this counter is local to one install —
+       * so it is drawn in the collection box, nowhere near the uptime panel, and adjacency
+       * that invites an inference is itself an assertion. And it does not hint at a version
+       * mismatch: windows the collector refused for document *shape* are deliberately not
+       * counted, since counting them would climb 96 times a day, which is what §7.6's refusal
+       * latch exists to avoid. A rising counter is about delivery and nothing else.
+       */
+      const lost = Number.isFinite(report?.successWindowsLost) && report.successWindowsLost > 0
+        ? report.successWindowsLost
+        : null
+      /**
+       * Events this machine's own network caused, which the user ruled are not sent at all.
+       *
+       * Events, not aggregates, which makes this heavier than `lost`: a lost window is a
+       * disposable aggregate, while each of these leaves no record anywhere, so the counter is
+       * the only trace it existed. Same terms, then — above zero only, warning tone, own line.
+       *
+       * The sentence states no cause because the rule cannot know one. It is also narrower than
+       * "any instant status-less failure", on errors-core's correction: the gate also requires
+       * the classifier's kind, so an instant status-less `reset` or `tls` failure is *not*
+       * suppressed and still leaves. Claiming the wider shape would read as wrong to a user
+       * comparing the counter against their own log, and listing the four kinds would put a
+       * spec on a settings page. Nothing here may blame or clear the provider, and a check
+       * forbids the shorter wording that would, because a check against the abbreviation is
+       * what keeps the honest sentence alive.
+       *
+       * Not a rate — a lifetime count has no published span to divide by — and not paired with
+       * the local counters that still see the event: two numbers for one event on one line is
+       * the name-drift shape again.
+       */
+      const suppressed = Number.isFinite(report?.suppressedNetworkErrors) && report.suppressedNetworkErrors > 0
+        ? report.suppressedNetworkErrors
+        : null
+
       return h('div', { style: { font, color: C.label, padding: '4px 2px 24px', maxWidth: '760px' } },
         // The heading carries the gap to the first toggle itself: the paragraph that
         // used to supply it is gone, and 6px would put a checkbox under the title.
@@ -3618,7 +3865,67 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         h('div', {
           style: { border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 12px', marginBottom: '16px', background: C.surface },
         },
-          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '6px' } }, 'Сбор ошибок Rustvy'),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', marginBottom: '6px' } }, 'Сбор данных Rustvy'),
+
+          // Above the error switch, in this box rather than in the display toggles at the
+          // top of the page: the user asked for a separate setting «над ошибками», and the
+          // top block is entirely about pixels — marks, the trigger icon, hiding other
+          // skins, icon size — where a data-collection switch would sit beside settings
+          // that change nothing but how things look. Two related settings belong together,
+          // and no section moves for it.
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer' } },
+            h('input', {
+              type: 'checkbox',
+              checked: reportingSuccesses,
+              onChange: event => { void post('/config', { collectSuccesses: event.target.checked }, 'save') },
+            }),
+            h('span', { style: { fontSize: '12.5px' } }, 'Отправлять успешные запросы')),
+
+          // The one piece of prose this box keeps, and it is kept because the user asked
+          // what collection costs: the page has to answer «сколько я трачу» without
+          // sending the reader to the contract.
+          //
+          // Both figures are measurements rather than estimates, and §2 of the v3 contract
+          // is where they come from: one report serialises to 534 bytes at twelve models
+          // and costs about 647 with HTTP request headers, so 32 windows over an
+          // eight-hour working day is about 20.2 KiB of requests. The header-inclusive
+          // number is the one shown, because a body size understates what the user is
+          // being asked to accept. The conditions travel with the figures — twelve models,
+          // a continuous day — so neither reads as this install's own usage, which is what
+          // the measured counters below are for. An idle machine is a real zero and not a
+          // rounding, because an empty window is never sent at all.
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '10px' } },
+            `Успехи — знаменатель процента аптайма: без них коллектор знает только об ошибках и не отличает «всё работало» от «никто не измерял». `
+            + `Стоит одного отчёта на окно${windowLabel === null ? '' : ` в ${windowLabel}`}, а не одного на запрос — агрегация убирает 86 % запросов. `
+            + `Один отчёт при 12 моделях — около 650 байт вместе с заголовками HTTP, непрерывный восьмичасовой день — около 20 КиБ; `
+            + `пустое окно не отправляется вовсе, поэтому простаивающая машина не платит ничего, и это ноль байт, а не округление. `
+            // This install's own measured total, and deliberately not a rate: «в сутки»
+            // would need an elapsed span nobody publishes, and dividing by a guess is how
+            // a measured field becomes an invented sentence.
+            + (cost === null ? '' : `${cost} `)
+            // The statement §7.2 allows, because it is about this install and this install
+            // does know it: not «процент не считается, успехи выключены», which would be a
+            // causal claim about the collector's global aggregate made from a local flag.
+            + (reportingSuccesses ? '' : 'Выключено: эта установка не участвует в подсчёте аптайма.')),
+
+          // Its own line rather than a clause of the cost sentence, so the two cannot be read
+          // as one statement about the same quantity: that sentence says what reporting costs,
+          // this one says what it failed to deliver.
+          lost === null
+            ? null
+            : h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '10px' } },
+                `${lost} ${plural(lost, ['окно успехов потеряно', 'окна успехов потеряно', 'окон успехов потеряно'])}: `
+                + 'окно не пишется на диск и не отправляется повторно, поэтому сбой доставки убирает данные, а не откладывает их.'),
+
+          // Its own line and its own quantity: events, not aggregates, and each one leaves no
+          // record anywhere else. Local by construction and stating no cause, because the rule
+          // cannot know one — see the comment on `suppressed`.
+          suppressed === null
+            ? null
+            : h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginBottom: '10px' } },
+                `${suppressed} ${plural(suppressed, ['сбой сети этой машины не отправлен', 'сбоя сети этой машины не отправлено', 'сбоев сети этой машины не отправлено'])}: `
+                + 'мгновенный отказ без HTTP-статуса, отнесённый правилом к сети этой машины, не отправляется вовсе — '
+                + 'изнутри плагина такой отказ неотличим от отказа шлюза, поэтому среди них может оказаться и настоящий сбой провайдера.'),
 
           h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer' } },
             h('input', {

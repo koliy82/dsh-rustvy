@@ -52,6 +52,30 @@ const HAS_LATIN = /[A-Za-z]/u
 const HAS_CYRILLIC = /[\u0400-\u04FF]/u
 
 /**
+ * A backslash escape: `\` followed by one ASCII letter.
+ *
+ * Inside a template or string literal that letter belongs to the escape, not to a
+ * word. A `\n` escape immediately followed by a Russian word is a newline and then
+ * that word, but tokenised as it stands it yields one token holding both alphabets
+ * and reports corruption where the author typed two separate things. Five such
+ * findings in `rustvy-uptime/public/index.html` against zero real corruptions is
+ * enough to stop the scanner being run: a detector whose output has to be filtered
+ * by hand stops being run at all, and then it catches nothing.
+ *
+ * Replaced with a SPACE rather than deleted, so the escape still BREAKS the run.
+ * That is what keeps the exemption from swallowing a real glued token sitting
+ * immediately after an escape — the direction a naive fix gets wrong. Deleting the
+ * two characters instead would join whatever precedes the escape to whatever
+ * follows it and invent tokens that were never in the file; a negative lookbehind
+ * on the first letter would exempt the whole run that follows it.
+ *
+ * What the exemption genuinely costs: a mixed token whose first letter immediately
+ * follows a backslash and IS that escape's letter. In a string literal the two are
+ * indistinguishable, and guessing otherwise restores the false positives.
+ */
+const ESCAPE = /\\[A-Za-z]/g
+
+/**
  * Inclusive codepoint ranges every text file may hold, whatever its language:
  * the whitespace a text file needs, printable ASCII, and the ten typographic
  * characters this project's Russian prose actually uses — section sign,
@@ -177,14 +201,20 @@ export function scanText(text, { profile = PROFILES.latinCyrillic, file = '<text
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]
     const at = index + 1
+    // Words are sought in a view of the line where each backslash escape has become
+    // a separator, because the escape's letter is not a letter of a word. The
+    // character inventory below still walks the ORIGINAL line: the substitution is
+    // about the mixed-token rule only, and must not change which codepoints are
+    // expected, nor shift a line number.
+    const words = line.replace(ESCAPE, ' ')
     TOKEN.lastIndex = 0
-    let match = TOKEN.exec(line)
+    let match = TOKEN.exec(words)
     while (match !== null) {
       const token = match[0]
       if (HAS_LATIN.test(token) && HAS_CYRILLIC.test(token)) {
         findings.push({ file, line: at, kind: 'mixed-alphabet', detail: token })
       }
-      match = TOKEN.exec(line)
+      match = TOKEN.exec(words)
     }
     for (const char of line) {
       const codepoint = char.codePointAt(0)
@@ -298,10 +328,12 @@ export function describe(findings, root, limit = 6) {
  * written as literals, so this module does not itself contain the corruption it
  * hunts.
  *
- * @returns one entry per case, each the findings from a throwaway file. The four
+ * @returns one entry per case, each the findings from a throwaway file. The six
  *   corruption cases — a mixed token, an ideograph where none is allowed, Cyrillic
- *   inside `en.json`, and a locale language this gate has no rule for — must come
- *   back non-empty; the three clean ones must come back empty.
+ *   inside `en.json`, a locale language this gate has no rule for, a mixed token
+ *   immediately after an escape, and a mixed token elsewhere in a document that
+ *   also holds an escape — must come back non-empty; the four clean ones must come
+ *   back empty.
  */
 export function selfTest() {
   let dir
@@ -354,6 +386,30 @@ export function selfTest() {
     const clean = join(docs, 'clean.md')
     writeFileSync(clean, 'Отчёт гарантированно уходит: uptimeEndpoint, 502 status code, http_502, «кавычки» — best-effort.\n', 'utf8')
     results.cleanDocument = scanFile(clean)
+
+    /* The escape exemption, asserted in BOTH directions.
+     *
+     * A rule change proven only in the "fewer false positives" direction is how a
+     * detector gets quietly switched off, so the exemption is required to keep
+     * catching a real glued token sitting immediately after an escape — the case a
+     * naive fix swallows. Built by concatenation for the reason the corrupted
+     * samples above are: this module must not itself carry the shape it asserts on,
+     * or its own scan would depend on the rule it is documenting. */
+    const BS = '\\'
+    const glued = 'garant' + 'ировано'
+    // A `\n` before a Russian word is a newline and then that word: clean.
+    const escapeClean = join(docs, 'escape-clean.md')
+    writeFileSync(escapeClean, 'Сводка:' + BS + 'n' + 'и ещё 3' + BS + 'n' + 'в 2 интервалах не измерялось.\n', 'utf8')
+    results.escapeThenCyrillic = scanFile(escapeClean)
+    // A genuinely glued token IMMEDIATELY AFTER an escape is still corruption.
+    const escapeMixed = join(docs, 'escape-mixed.md')
+    writeFileSync(escapeMixed, 'Сводка:' + BS + 'n' + glued + ' уходит.\n', 'utf8')
+    results.mixedAfterEscape = scanFile(escapeMixed)
+    // And the exemption is positional, not global: the same document carries an
+    // escape and a glued token further along, and the glued token is still caught.
+    const escapeElsewhere = join(docs, 'escape-elsewhere.md')
+    writeFileSync(escapeElsewhere, 'Сводка:' + BS + 'n' + 'строка. Затем ' + glued + ' уходит.\n', 'utf8')
+    results.mixedAwayFromEscape = scanFile(escapeElsewhere)
 
     results.chineseLocale = scanFile(makeLocale('zh.json',
       `{"meta":{"description":"${String.fromCodePoint(0x4E2D, 0x6587, 0x8BF4, 0x660E, 0xFF0C, 0x3002)}"}}\n`))

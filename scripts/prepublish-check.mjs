@@ -160,10 +160,12 @@ check('the client bundle exists', existsSync(join(ROOT, 'client/client.js')))
 check('no leftover duplicate entry ships', !existsSync(join(ROOT, 'lib/live.js')),
   existsSync(join(ROOT, 'lib/live.js')) ? 'the loader row no longer names it' : '')
 // This gate runs no suite — it has no child process and no sockets, by design, so
-// that it works offline and anywhere. That makes the existence check the only
-// publish-time guarantee about the regression tests: the file ships, and whoever
-// runs the suite has the assertion that pins lib/net.js's proxy route. Proving the
-// route works needs a socket, which is that file's job rather than this one's.
+// that it works offline and anywhere. The suites are run beside it rather than inside
+// it: `prepublishOnly` chains this file and `scripts/run-tests.mjs`, so publication
+// still requires both halves while this half keeps its no-child-process property.
+// The existence checks below stay, because a suite that does not ship is a different
+// defect from a suite that fails — and because discovery in the runner is what makes
+// these names a floor rather than a list to maintain.
 check('the proxy regression test ships', existsSync(join(ROOT, 'tests/net-proxy-test.mjs')))
 
 // The pure mapping module can be imported without touching the network, which
@@ -334,10 +336,19 @@ try {
     byCode: [],
     models: [{ id: 'claude-opus-5-5', name: 'OPUS 5.5', errors: 0, uptime: 100, status: 'up', buckets: [], events: [], lastError: null }],
   })
-  check('an all-green v1 view normalizes with every field guaranteed',
+  // The fixture above is a v1 answer: `status: 'up'`, no `ok`/`fails`, and no
+  // `contractVersion`. §5.3 makes the version marker what licenses a percentage, so
+  // `uptime` is guaranteed here to be `null` — the same kind of guarantee as every
+  // other field in this check, only the guaranteed value changed. Asserting 100 would
+  // pin the behaviour that was just removed: a v1 collector's bucket-occupancy share
+  // drawn on screen as availability. The detail names the two fields this check is
+  // about rather than dumping a truncated view, which is what made the failure hard to
+  // read from the other side.
+  check('an all-green v1 view normalizes with every field guaranteed, its percentage suppressed',
     view.ok === true && view.range === '24h' && view.generatedAt === 1792605459264
-    && view.storage === 'mongo' && view.summary.uptime === 100 && view.models.length === 1
-    && view.models[0].status === 'ok' && view.models[0].lastError === null, JSON.stringify(view).slice(0, 120))
+    && view.storage === 'mongo' && view.summary.uptime === null && view.models[0].uptime === null
+    && view.models.length === 1 && view.models[0].status === 'ok' && view.models[0].lastError === null,
+    JSON.stringify({ summaryUptime: view.summary.uptime, modelUptime: view.models[0]?.uptime }))
   check('a count the deployed server never computed stays unknown rather than zero',
     view.models[0].installs === null && view.installs.window === null && view.installs.reference === null
     && view.summary.affectedPct === null && view.summary.single === null,
@@ -349,14 +360,29 @@ try {
     && uptime.statusOf({ status: 'DOWN' }) === 'down' && uptime.statusOf({ status: ' Slow ' }) === 'issues',
     `up→${uptime.statusOf({ status: 'up' })} slow→${uptime.statusOf({ status: 'slow' })}`)
 
-  const odd = uptime.normalizeUptimeView({ models: [{ id: 'm', status: 'exploded', uptime: 140 }] }).models[0]
+  // `contractVersion: 3` is what licenses a percentage at all under §5.3, so the clamp
+  // can only be exercised on a payload that carries it. Without the marker the same
+  // value is `null`, and with the marker but a value that is not a number it is `null`
+  // too: three distinct reasons for a dash, asserted separately because they used to
+  // collapse into one behaviour that answered 100 for all of them.
+  const odd = uptime.normalizeUptimeView({ contractVersion: 3, models: [{ id: 'm', status: 'exploded', uptime: 140 }] }).models[0]
   check('an unrecognised status falls back to quiet, not to an outage', odd.status === 'ok', odd.status)
   check('and never to a green state beside a non-zero error count',
     uptime.statusOf({ status: 'exploded', errors: 3 }) === 'single',
     uptime.statusOf({ status: 'exploded', errors: 3 }))
-  check('a percentage is clamped to something a bar can draw', odd.uptime === 100, String(odd.uptime))
+  const unlicensed = uptime.normalizeUptimeView({ models: [{ id: 'm', status: 'exploded', uptime: 140 }] }).models[0]
+  const unreadable = uptime.normalizeUptimeView({ contractVersion: 3, models: [{ id: 'm', uptime: '140' }] }).models[0]
+  check('a percentage is clamped when it is licensed and readable, and null when it is either not',
+    odd.uptime === 100 && unlicensed.uptime === null && unreadable.uptime === null,
+    JSON.stringify({ clamped: odd.uptime, noVersionMarker: unlicensed.uptime, notANumber: unreadable.uptime }))
+  // 99.96 rather than 97.9, deliberately: 97.9 is a fixed point of one-decimal
+  // rounding, so with that value this check stayed green whether the normalizer
+  // rounded or passed the collector's precision through, and it could not detect the
+  // defect its own label names. 99.96 rounds to 100 and passes through as 99.96, so
+  // the two behaviours finally answer differently — and 100 is the worse of them,
+  // since it claims every install was affected when the collector said otherwise.
   check('a percentage keeps the decimal the collector sent',
-    uptime.uptimeOf({ uptime: 97.9 }) === 97.9, String(uptime.uptimeOf({ uptime: 97.9 })))
+    uptime.uptimeOf({ uptime: 99.96 }) === 99.96, String(uptime.uptimeOf({ uptime: 99.96 })))
 
   const pct = uptime.normalizeUptimeView({
     installs: { window: 3, reference: 47, anonymous: 1 },
@@ -470,6 +496,17 @@ try {
     check('an unrecognised locale language fails rather than being skipped',
       probe.unknownLocaleLanguage.length > 0, charset.describe(probe.unknownLocaleLanguage, undefined, 1))
     check('a clean document is not flagged', probe.cleanDocument.length === 0, charset.describe(probe.cleanDocument, undefined, 1))
+    // The backslash-escape exemption, asserted in both directions. Exempting `\n`
+    // before a word fixed five false positives in a dashboard template; a rule
+    // change proven only in the "fewer findings" direction is how a detector gets
+    // quietly switched off, so the two assertions that must still go red are here
+    // beside the one that must not.
+    check('a `\\n` escape before a Russian word is not a mixed token',
+      probe.escapeThenCyrillic.length === 0, charset.describe(probe.escapeThenCyrillic, undefined, 1))
+    check('a mixed token immediately after an escape is still caught',
+      probe.mixedAfterEscape.length > 0, charset.describe(probe.mixedAfterEscape, undefined, 1))
+    check('a mixed token elsewhere in a document that also holds an escape is still caught',
+      probe.mixedAwayFromEscape.length > 0, charset.describe(probe.mixedAwayFromEscape, undefined, 1))
     check('the Chinese locale passes with Chinese text', probe.chineseLocale.length === 0, charset.describe(probe.chineseLocale, undefined, 1))
     check('the Russian locale passes with Russian text', probe.russianLocale.length === 0, charset.describe(probe.russianLocale, undefined, 1))
   }
@@ -511,6 +548,52 @@ try {
     charset.describe(docsFindings.filter(one => one.kind === 'unexpected-character'), ROOT))
 } catch (error) {
   check('the character-set scanner imports', false, error.message)
+}
+
+/* ------------------------------- test discovery ------------------------------ */
+
+// The defect this section exists to prevent is silent, which is why it survived four
+// releases: an enumerated list of suites that omits one still reports *green*, because
+// the omitted suite is never run. The publisher sees the number they expect and gets no
+// signal at all. So nothing here names a count — every number is derived from what is on
+// disk, and the only hand-written names are suites whose *absence* is itself a defect.
+try {
+  const runner = join(ROOT, 'scripts/run-tests.mjs')
+  check('the suite runner ships', existsSync(runner))
+
+  const onDisk = readdirSync(join(ROOT, 'tests')).filter(name => name.endsWith('.mjs')).sort()
+  const discovered = (await import(`file://${runner.replace(/\\/g, '/')}`)).discoverSuites()
+    .map(file => file.replace(/\\/g, '/').split('/').pop())
+    .sort()
+  // Derived on both sides: the floor is the directory, so adding a suite cannot make
+  // this check stale and removing one cannot make it pass by accident.
+  check('discovery finds every suite on disk', discovered.length === onDisk.length && discovered.every((name, i) => name === onDisk[i]),
+    `discovered ${discovered.length}, on disk ${onDisk.length}: missing ${onDisk.filter(name => !discovered.includes(name)).join(', ') || 'none'}`)
+  check('discovery found at least the suites this release depends on', discovered.length >= 11, String(discovered.length))
+
+  // Named individually because each one's absence is a defect rather than a tidy-up:
+  // these pin behaviour a user requirement depends on absolutely.
+  for (const required of [
+    'net-proxy-test.mjs',            // the proxy route in lib/net.js
+    'route-bootstrap-host-test.mjs', // the byte-identical DeepSeek-untouched assertion
+    'success-report-host-test.mjs',  // the four combinations of the two collection settings
+    'success-settings-host-test.mjs',// collectSuccesses and its three sources
+    'error-report-host-test.mjs',    // the veto/prepend regression that shipped in 1.2.2
+    'uptime-host-test.mjs',
+  ]) {
+    check(`the ${required.replace(/-test\.mjs$/u, '')} suite ships`, onDisk.includes(required), onDisk.join(', '))
+  }
+
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  const scripts = manifest.scripts ?? {}
+  check('package.json has a test script', typeof scripts.test === 'string' && scripts.test.includes('run-tests.mjs'), String(scripts.test))
+  // Both halves, in this order: the structural gate is cheap and offline, so it runs
+  // first and a red suite still blocks publication behind it.
+  check('prepublishOnly runs the structural gate', typeof scripts.prepublishOnly === 'string' && scripts.prepublishOnly.includes('prepublish-check.mjs'), String(scripts.prepublishOnly))
+  check('prepublishOnly runs the suites too', typeof scripts.prepublishOnly === 'string' && scripts.prepublishOnly.includes('run-tests.mjs'), String(scripts.prepublishOnly))
+  check('a red suite can actually block publication', typeof scripts.prepublishOnly === 'string' && /&&/.test(scripts.prepublishOnly), String(scripts.prepublishOnly))
+} catch (error) {
+  check('the discovery section ran', false, error.message)
 }
 
 const failed = results.filter(ok => !ok).length

@@ -258,7 +258,7 @@ whichever chat is open, without leaving the conversation.
 **Settings → Rustvy**
 
 Top to bottom the page runs: the switches and fields, then the **«Аптайм моделей»** box,
-**«Модели провайдера»**, **«Ключи на несколько чатов»**, **«Сбор ошибок Rustvy»** and, at
+**«Модели провайдера»**, **«Ключи на несколько чатов»**, **«Сбор данных Rustvy»** and, at
 the very bottom, **«Зеркало каталога»** with its addresses and files. Uptime comes first
 because it is the only block that answers the question the page is opened with — is the
 model about to be picked alive — and the mirror comes last, next to the warning about a
@@ -320,13 +320,30 @@ Error collection:
 
 | Control | Default | Meaning |
 |---|---|---|
+| Отправлять успешные запросы | on | the denominator of the uptime percentage. Successes are aggregated into a window (15 minutes by default) and leave as one report rather than one per request: aggregation removes 86% of the requests compared with sending each. An empty window is never sent at all, so an idle machine pays nothing — a real zero, not a rounding. Switching it off stops sending but not counting: the counter keeps closing folded failures and keeps answering whether the observer is alive |
 | Собирать ошибки rustvy | on | master switch for the collector: one line per infrastructure fault of the provider goes to the uptime collector. Off sends nothing, and the queue already on disk stays on disk |
 
-The switch has a block of its own, «Сбор ошибок Rustvy», because it is the only setting
-on the page that sends anything off the machine — one line per failure of the provider
-goes to the monitor's collector. The block itself is a caption and a switch and nothing
-more: no explanation under the switch, no counters and no send buttons on the page. What
-leaves, what never does and when collection fires is written in
+Both switches live in the **«Сбор данных Rustvy»** block — successes above errors, as the user
+asked — because they are the only two settings on the page that send anything off the machine.
+The block was retitled from «Сбор ошибок Rustvy»: a caption promising only error collection
+would describe its contents falsely, and the caption is what a user reads to decide whether to
+open the block. They were not moved up into the display-settings block, which is entirely about
+pixels — marks, the trigger icon, size — where a data-collection switch would sit beside
+settings that change nothing but how things look.
+
+Under the successes switch is one short explanation of the cost, because the user asked about
+traffic specifically: what one report weighs and what a working day comes to. The figures in it
+are measured on a real document rather than taken from an estimate, and they travel with the
+conditions they were measured under; beside them appears this install's own total — how many
+windows and bytes have left since it started — whenever the host publishes it. A number the
+state does not carry is not drawn at all: an invented traffic estimate on screen is worse than
+no estimate. There are no send or retry buttons in the block and there will be none: the window
+flushes on its own timer and there is no endpoint for flushing it sooner, so a button labelled
+"send now" could only re-read a state that re-runs nothing — a control labelled "retry" that
+does not retry. As its own line, and only when the counter is non-zero, the block reports
+«N окон потеряно» — how many success windows this install formed and never delivered to the
+collector; a zero loss is not drawn, because a line that stands empty for most installs for
+their whole life teaches the reader to skip the block. What leaves, what never does and when collection fires is written in
 [Error collection and uptime](#error-collection-and-uptime) below and in
 `docs/error-report.md` — the disclosure did not disappear with the text on the page, it
 moved somewhere it can be read in full. The state of the collection — the collector's
@@ -718,19 +735,26 @@ because a number resembling a status appears in it.
 not: the prefix means the provider's gateway named what its own origin answered, so what
 broke is over there, and not in the request you composed.
 
-### Successes go nowhere
+### Successes go, one window at a time
 
-The collector receives failures only: a report about a request that succeeded is never
-sent. Successes are still observed locally, for one thing — settling a model's
-still-folding failure the moment a request goes through again, so that report reaches the
-collector at the instant of recovery rather than at the end of a folding window; the gap
-between the two timestamps is the length of the outage. The counters successes move are
-still served by the host in `errorReport`, but the settings page draws none of them, as
-it draws no part of the collection summary.
+The collector does not receive failures only: successes go too, but not one at a time —
+they are aggregated into a fifteen-minute window, one document per window per route,
+carrying a count for each model. An install that made 230 requests in a day sends about
+32 small documents rather than 230, and an install that did no work sends nothing at all.
+The measured cost is 534 bytes per document at twelve models and about 20 KiB per day
+including HTTP headers; the table, the scenarios and how to reproduce the measurement are
+in [docs/error-report.md](<docs/error-report.md>).
 
-The consequence is worth stating plainly: uptime on the monitor is the absence of errors
-in a window, not a ratio of two kinds of report. A model nobody asked about looks the
-same there as a model that is up.
+Successes still do the second, local job: settling a model's still-folding failure the
+moment a request goes through again, so that report reaches the collector at the instant
+of recovery rather than at the end of a folding window, and the gap between the two
+timestamps is the length of the outage.
+
+Uptime on the monitor is therefore a real ratio — `ok / (ok + fails)` — rather than the
+absence of errors in a window. A model nobody asked about no longer looks the same as a
+model that is up: it has no denominator, and a dash is drawn instead of a percentage. A
+dash, a zero and a number are three different statements, and collapsing any two of them
+is a lie on screen.
 
 ### The anonymous identifier and the two files
 
@@ -813,21 +837,67 @@ Every number in the box is the collector's own. The plugin recomputes nothing: a
 worked out locally would disagree with the monitor's web page, and two answers to "is this
 model up" is worse than one.
 
-### There is no percentage any more
+### The percentage is back, with a denominator
 
-The plugin reports errors only: it sees no successful requests and no traffic volume, so a
-"percent available" has no denominator in principle. The number that used to be drawn on
-the badge was the share of buckets with no errors in them, and it had three bad
-properties: it moved with the window for the very same stream of events, it saturated — 47
-errors in a bucket and one error contributed the same — and it was blind to breadth, so
-one person's outage and a provider's looked identical.
+The rule "there is no percentage any more" was right for the data that existed, and it is
+repealed along with the arrival of data rather than in spite of it. While the plugin reported
+errors only, a percent-available had no denominator in principle: the number drawn on the
+badge was the share of buckets with no errors in them, and it had three bad properties — it
+moved with the window for the very same stream of events, it saturated (47 errors in a bucket
+and one error contributed the same), and it was blind to breadth, so one person's outage and
+a provider's looked identical.
 
-What is measured well is something else: how many distinct installs reported errors, how
-long ago the last one came, and how many there were. That is why the headline is now a
-state rather than a percentage. The only share left on screen is **«затронуто N%
-установок»** — distinct installs that reported errors in the window over distinct installs
-that reported anything over 30 days. Its denominator is real, and it means reach rather
-than availability; it is never called uptime anywhere.
+Successes are now collected behind their own setting, and the percentage is a real one:
+`uptime = ok / (ok + fails) × 100`, where `ok` is the successful requests in the window and
+`fails` is the sum of the repeat counter `n` across every failure. A failure folded from three
+attempts into one record gives `fails: 3` and not `1`, and the percentage is computed from
+three: folding saves space in the store, it does not shrink the outage.
+
+**The zero-capability rule.** When `ok + fails == 0` there is no percentage and the field is
+`null` — not `100` and not `0`. "100%" over a window in which nothing happened is a claim
+nobody verified; "0%" over the same window is slander. The page draws a dash. The three
+assertions have to be distinguishable on screen and are pinned by a check: a **number**, a
+**dash** and a **zero** are three different strings, not one value and two absences. A window
+of nothing but successes honestly gives `100`, and a window of nothing but failures honestly
+gives `0` — the case the previous scheme could not show at all.
+
+**An old collector's percentage is not drawn.** A collector older than v3 also sent an `uptime`
+field, but computed it without a single successful request in the denominator — that is, the
+very number the previous version took off the screen. It does not come back merely because the
+field name returned: what licenses the percentage is the **contract version**, not the
+percentage itself and not the fields beside it. The plugin's normalizer draws `uptime` only
+when the collector published `contractVersion` as a number at least 3, and draws a dash
+otherwise.
+
+Inferring the version from the presence of `fails` or `ok` is not allowed, though the temptation
+is understandable: those fields appeared in v3. Such an inference ties a field's meaning to what
+happens to be populated rather than to what the producer meant; it cannot tell v3 from a future
+v4 that redefines `uptime` again; and it makes every consumer re-derive a fact the producer
+already knows and can state in one integer. The full argument, including what it does not claim,
+is in [docs/uptime-view.md](<docs/uptime-view.md>).
+
+**A dash is not given a cause.** `uptime: null` is a fact about the collector's aggregate
+across every install: the denominator was missing there, not at yours. Your install's
+`collectSuccesses` flag is one possible contributor and not a cause, so the page never writes
+"the percentage is not computed because your successes are off". On a network where other
+installs report, that sentence would make a causal claim about a global value from a local
+flag. A dash is drawn as a dash and nothing more, and the statement "this install does not
+take part in the count" lives in the explanation beside its own switch — because about this
+install the page does know the truth.
+
+The **«затронуто N% установок»** share stays on screen and still means reach rather than
+availability: distinct installs that reported errors in the window over distinct installs that
+reported anything over 30 days. A real percentage now sits beside it, and the two quantities
+carry different labels, because one is about traffic and the other about how widely failures
+are known. Reach is never called uptime anywhere.
+
+**The panel's headline counts failures, not records.** «Сбоев за период» is `fails`, the sum of
+`n`, so real failures; the old «ошибок за период» was a count of records and understated by a
+quarter on live data (21 published records against 28 actual failures). The two quantities
+carry different labels wherever both numbers are visible — «сбоев» for failures and «ошибок»
+for records — because one word over two quantities is two claims under one name. The state
+rule still reads records, and the substitution cannot contradict it: `n` is never zero and a
+missing `n` reads as one, so there are no records exactly when there are no failures.
 
 ### Where it is read from
 
@@ -866,25 +936,73 @@ model nobody complained about, not a fifth category the wire never mentioned.
 
 The window switch — 1 hour, 24 hours, 7 days, 30 days, a day by default — is the panel's
 own state rather than a setting: it is not written to `config.json`, so one glance at last
-month does not become a preference every other surface inherits. The answer carries as
-many buckets as the collector sent: 60 one-minute ones for an hour and 48 for every longer
-window, so a bucket's width changes with the window — a minute over an hour, half an hour
-over a day, three and a half over a week, fifteen over a month. The strip carries its
-width as a label («1 столбик = 30 мин»), because unlabelled a week of bars reads exactly
-like an hour of them. Bars are scaled by `max(1, …counts)`, which is what makes a single
-error visible.
+month does not become a preference every other surface inherits. The answer carries as many
+buckets as the collector sent, and a bucket's width has to be a whole multiple of the
+success-collection window: a percentage is meaningless for a bucket narrower than the window
+it would divide, and spreading fifteen minutes of successes over one-minute buckets is only
+possible by inventing a distribution — exactly what the previous version gave up in the
+history strip.
+
+| Window | Former width | Now | A multiple of the 15-minute window? |
+|---|---|---|---|
+| 1 hour | 60 × 1 min | **4 × 15 min** | 1 min is not a multiple of 15, widened |
+| 24 hours | 48 × 30 min | 48 × 30 min | 30 = 2 × 15, unchanged |
+| 7 days | 48 × 3.5 h | 48 × 3.5 h | 210 = 14 × 15, unchanged |
+| 30 days | 48 × 15 h | 48 × 15 h | 900 = 60 × 15, unchanged |
+
+Only the hour changes, and the reason is arithmetic rather than taste. Failures do carry exact
+timestamps and could live in one-minute buckets, but two different widths in one strip is two
+scales on one drawing.
+
+The width label («1 столбик = 15 мин») is taken **from the bucket array itself** rather than
+from a table keyed by window. That is not style: the collection window is configurable, so a
+configurable window means a configurable bucket width and not a second rule about it. A
+per-window table would be exactly that second rule, and the two would diverge the first day
+somebody changed the window — while the drawing went on asserting a one-minute width over
+fifteen-minute data. When the array cannot be measured — fewer than two timestamps — there is
+no label at all: an unlabelled strip is honest about not knowing, while a label from a table
+would state a resolution the data does not have. Bars are scaled by `max(1, …counts)`, which
+is what makes a single error visible.
 
 ### The model row
 
-The state word, «ошибок N от M установок», «последняя X назад», the bucket strip with its
-width label, and «затронуто N% установок» when there is a denominator; underneath, the
-last error with its time, its code and the provider's own text.
+The state word, «сбоев N от M установок», «последняя X назад», «аптайм N%», «затронуто N%
+установок» when the denominators exist, and the bucket strip with its width label; underneath,
+the last error with its time, its code and the provider's own text. The percentage and the
+reach stand side by side under different names, because they are two different quantities: one
+is about the availability of traffic, the other about how widely the failures are known.
 
-Some reports arrive with no usable `meta.id`, and those cannot be counted against anybody.
-Then «ошибок 3 от 1 установки» quietly promises a breadth that was never measured — and
-that is exactly the number a person acts on when deciding whether to trust a model. So a
-caveat goes next to it: «(все анонимные)» when every error was anonymous, «(2 из 3
-анонимных)» when some were. When none were, which is the common case, nothing is written.
+The row leads with **failures** rather than records, and the reason is arithmetic: the header
+publishes `summary.fails`, so rows leading with a record count would not add up to its total —
+a headline of 39 above rows summing to 13, with no way for the reader to tell which of the two
+is wrong. A page contradicting itself is the §5.1 defect with a second copy of it on the same
+screen. The state rule still reads records: reading and displaying are different concerns, and
+neither §6's thresholds nor §5.1's compatibility rule depend on which number is printed. An
+answer from a collector older than v3 carries no `fails`, and then the row shows records under
+their own label, because that is the only magnitude such an answer contains.
+
+Some failures arrive with no usable `meta.id`, and those cannot be counted against anybody.
+Then «ошибок 3 от 1 установки» quietly promises a breadth that was never measured — and that
+is exactly the number a person acts on when deciding whether to trust a model. So a caveat
+goes next to it: «(все сбои анонимны)» when every failure was anonymous, «(анонимно 2 из 3
+сбоев)» when some were. When none were, which is the common case, nothing is written.
+
+The caveat's denominator is `fails` and not the record count, and that is not a detail. Since
+v3 `anonymous` is a sum of the repeat counter `n`, so it counts **failures** rather than
+reports; drawn against the record count it would produce a pair of numbers each individually
+true and meaningless together — the worst kind of error, because nothing on screen looks
+broken. So the unit is named inside the phrase: «сбоев» for failures and «отчётов» for
+records, and an answer from a collector older than v3, which carries no `fails`, gets its
+caveat against records under its own label.
+
+The same trap exists one level up and deserves its own paragraph. `installs.anonymous` is also
+a sum of `n` — failures — but it lives inside an object whose other two fields count
+**installs**. The name and the container agree while the semantics do not, which is what makes
+the container actively suggest the wrong reading: on a live capture that is `window: 5,
+reference: 5, anonymous: 4`, and «4 из 5 установок анонимные» would read perfectly while
+comparing failures with installs. Its only correct partner is `summary.fails`, so the panel's
+header draws no anonymous share at all, and that is pinned by an absence check rather than by
+a comment alone: a comment at the render site is the reason, not the mechanism.
 
 An answer from a collector older than v2 carries no `installs`, no `affectedPct` and no
 `minutesSinceLast`. The row then shows the error count without «от M установок», shows no
@@ -1264,6 +1382,32 @@ text, because this suite re-runs every effect on every render pass, so a text-on
 would pass without the fix and prove nothing. The absence of `routeBootstrap` altogether is
 not an edge case but the population: that is what every install with today's host half
 answers, and it draws nothing and does not throw.
+
+It draws the uptime percentage too — and checks that its three outcomes are distinguishable
+on screen: a measured number, a dash and a real zero give three different strings rather than
+one value and two absences. Separately pinned is that an old collector's percentage is not
+drawn: the clause is licensed by the denominator and not by the field name, so an `uptime`
+with no `fails` beside it stays off the screen — otherwise the invented number that was once
+removed would come back wearing a real one's label. A dash is given no cause: this install's
+switched-off successes do not become an explanation for the collector's missing denominator.
+The hour is checked for 4 buckets and the label «1 столбик = 15 мин», with the width measured
+from the array — and that is the assertion which was true at the former width and will redden
+at the moment the two halves meet, rather than at integration. The panel's headline is checked
+for «сбоев за период» rather than the former record count, and for neither number appearing
+under the other's label.
+
+The data-collection block is checked as a whole: its caption, both switches and their order
+(successes above errors), its position below the uptime panel rather than among the display
+settings, the cost explanation with its measured figures and the conditions they were measured
+under, the window taken from `config.successWindowMs` rather than from a constant, and this
+install's own total — including its absence when the state carries no counters, because a
+number the state does not contain is not drawn. A measured zero is drawn as a zero and not as a
+dash: this is precisely the place where two zeros look identical and only one of them is a
+fact. There are no flush or retry buttons in the block, and that is asserted explicitly — the
+way it is for the route-bootstrap line — so a button cannot be added without reddening a check.
+The combination "successes off but the counter is counting" is supplied by a fixture directly,
+with a comment saying that no real machine produced it until the sending gate was split from
+counting; now that it has been split, the comment records reachability instead.
 
 The mark-drawing half is **not** covered by an automated suite in this repository,
 and that is worth knowing up front. It works on the DOM of an already-open page, so

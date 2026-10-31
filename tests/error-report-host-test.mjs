@@ -74,10 +74,19 @@ function answerFor(body) {
   }
   const described = (typeof body?.message === 'string' && body.message !== '')
     || (typeof body?.code === 'string' && body.code !== '')
+  // v3 puts a second document shape on the same endpoint: a success window carries
+  // neither `message` nor `code`, so the v2 rule alone answers every window with a
+  // 400 — and a 4xx other than 429 is dropped rather than retried, by design. That
+  // is the interop failure waiting for a plugin released ahead of its collector, and
+  // the fake collector has to model the contract the real one is being written to
+  // rather than the one it used to have.
+  const successWindow = body?.kind === 'ok'
+    && Number.isFinite(body?.window?.from) && Number.isFinite(body?.window?.to)
+    && Array.isArray(body?.c)
   // The accepted answer carries a server-side id this half never reads; a `send`
   // that insisted on a shape it knew would be one collector change away from
   // treating every success as a failure.
-  return described ? { status: 200, body: { ok: true, id: Date.now() } } : { status: 400, body: { ok: false, error: 'need a message or code field' } }
+  return described || successWindow ? { status: 200, body: { ok: true, id: Date.now() } } : { status: 400, body: { ok: false, error: 'need a message or code field' } }
 }
 
 /**
@@ -130,7 +139,7 @@ writeFileSync(join(STATE, 'catalog.json'), `${JSON.stringify({
 }, null, 2)}\n`)
 
 const { start, build } = await import('../lib/host.js')
-const { classifyFailure, FOLD_LIMITS } = await import('../lib/errors.js')
+const { classifyFailure, FOLD_LIMITS, createReporter, successPayload, SUCCESS_WINDOW_MS } = await import('../lib/errors.js')
 
 /**
  * A clock the test moves.
@@ -772,7 +781,12 @@ check('a reported failure keeps its attempt until the turn ends', (await summary
 endTurn(failingAttempt, { kind: 'error', error: { message: IDLE_TIMEOUT, code: 'TIMEOUT' } })
 check('ending the turn releases the attempt', (await summary()).tracked === trackedBefore, `${trackedBefore + 1} → ${(await summary()).tracked}`)
 const trackedDrain = await drain()
-check('the turn end did not report that failure a second time', trackedDrain.reports.length === 1 && trackedDrain.reports[0]?.code === 'upstream_502', JSON.stringify(trackedDrain.reports))
+// The intent is that `turn/end` does not report a failure the waterfall already
+// reported. Filtered to failure reports because a drain under v3 also carries any
+// success window that closed, and counting documents instead of failures would make
+// this assertion about the wrong thing.
+const trackedFailures = trackedDrain.reports.filter(one => one?.kind !== 'ok')
+check('the turn end did not report that failure a second time', trackedFailures.length === 1 && trackedFailures[0]?.code === 'upstream_502', JSON.stringify(trackedDrain.reports))
 
 for (const [message, code, kind, status] of INFRA.slice(1)) {
   const { drained } = await reportOf({ message, code })
@@ -924,8 +938,11 @@ check('the top-level message is used', String(splitDrain.reports[0]?.message ?? 
 check('the nested code is used', splitDrain.reports[0]?.meta?.harnessCode === 'TRANSPORT', String(splitDrain.reports[0]?.meta?.harnessCode))
 
 // --- the success side ------------------------------------------------------
-// A success is an uptime sample, and it is what closes an outage — but it is not a
-// report, and under this API it never reaches the wire.
+// A success is an uptime sample, and it is what closes an outage. Under v2 it never
+// reached the wire, because uptime was the absence of reports in a window; v3 gives
+// uptime a denominator, so successes are sent — aggregated into one window report
+// rather than one document per request, which is the traffic constraint the user set
+// and the reason `c` holds counts instead of samples.
 const beforeSuccess = await summary()
 for (let index = 0; index < 3; index += 1) {
   const attempt = await begin('sess-ok', 'rustvy', MODEL, index + 1)
@@ -933,10 +950,31 @@ for (let index = 0; index < 3; index += 1) {
   succeed(attempt)
 }
 const successDrain = await drain()
-check('no success reaches the collector', successDrain.posts.length === 0 && successDrain.reports.length === 0, JSON.stringify(successDrain.reports))
+const successReport = successDrain.reports.find(one => one?.kind === 'ok')
+check('three successes in one window are one report', successDrain.reports.length === 1, JSON.stringify(successDrain.reports))
+check('three successes are one POST, not three', successDrain.posts.length === 1, String(successDrain.posts.length))
+check('the success report says what it is', successReport?.kind === 'ok', String(successReport?.kind))
+// One aggregated row per model, never a row per request. The durations are not pinned
+// here because `succeed()` derives one from the clock, so the exact aggregate is
+// asserted in the §2.1 block below against inputs this file controls.
+check('it counts per model rather than listing requests',
+  Array.isArray(successReport?.c) && successReport.c.length === 1
+  && successReport.c[0]?.m === MODEL && successReport.c[0]?.n === 3,
+  JSON.stringify(successReport?.c))
+check('it carries the window it covers', Number.isFinite(successReport?.window?.from) && Number.isFinite(successReport?.window?.to)
+  && successReport.window.to > successReport.window.from, JSON.stringify(successReport?.window))
+check('it shares the error report envelope', successReport?.plugin === 'dsh-rustvy' && successReport?.provider === 'rustvy'
+  && typeof successReport?.meta?.id === 'string' && successReport.meta.id !== '',
+  JSON.stringify({ plugin: successReport?.plugin, provider: successReport?.provider, id: successReport?.meta?.id?.slice(0, 8) }))
+// Meaningful because the host does pass `ms` here: it is measured at the attempt and
+// arrives at `noteSuccess`. An assertion that a dropped field is absent is only real
+// if the field was offered.
+check('it carries no duration', !JSON.stringify(successReport).includes('"ms"'), JSON.stringify(successReport).slice(0, 200))
 const afterSuccess = await summary()
 check('successes are still counted locally', afterSuccess.successes === beforeSuccess.successes + 3, `${beforeSuccess.successes} → ${afterSuccess.successes}`)
 check('counting a success still counts an attempt', afterSuccess.attempts === beforeSuccess.attempts + 3, `${beforeSuccess.attempts} → ${afterSuccess.attempts}`)
+check('the window that left is counted as one', afterSuccess.successWindows === beforeSuccess.successWindows + 1, `${beforeSuccess.successWindows} → ${afterSuccess.successWindows}`)
+check('what it cost is measured rather than estimated', afterSuccess.successBytes > beforeSuccess.successBytes, `${beforeSuccess.successBytes} → ${afterSuccess.successBytes}`)
 
 // The reason successes are observed at all: one closes the failure window it
 // recovers from, and does so at note time. Proven on the queue rather than on
@@ -951,8 +989,16 @@ succeed(recovered)
 const afterRecovery = await summary()
 check('a success flushes the failure it recovers from', afterRecovery.queued === 1, String(afterRecovery.queued))
 const recoveryDrain = await drain()
-check('only the outage is delivered, not the recovery', recoveryDrain.reports.length === 1, JSON.stringify(recoveryDrain.reports))
-check('what is delivered is the outage', recoveryDrain.reports[0]?.code === 'upstream_503' && recoveryDrain.reports[0]?.status === 503, JSON.stringify(recoveryDrain.reports[0]))
+// Both documents leave, and the property worth pinning is that they are different
+// documents: the recovery arrives as an aggregated window and must not masquerade as
+// a second outage. Under v2 this asserted the recovery was absent; absence was the
+// only way to be sure it was not a second error record, and a shape distinction is
+// the stronger form now that both are sent.
+const recoveryOutage = recoveryDrain.reports.find(one => one?.kind !== 'ok')
+const recoveryWindow = recoveryDrain.reports.find(one => one?.kind === 'ok')
+check('the outage and the recovery window are both delivered', recoveryOutage !== undefined && recoveryWindow !== undefined, JSON.stringify(recoveryDrain.reports))
+check('what is delivered as the outage is the outage', recoveryOutage?.code === 'upstream_503' && recoveryOutage?.status === 503, JSON.stringify(recoveryOutage))
+check('the recovery is a window and not a second outage', recoveryWindow?.kind === 'ok' && recoveryWindow?.code === undefined && recoveryWindow?.status === undefined, JSON.stringify(recoveryWindow))
 
 // Two of the same failure inside one window are one outage that happened twice.
 const folding = await begin('sess-fold', 'rustvy', MODEL)
@@ -1475,6 +1521,836 @@ await handle.dispose()
 
 collector.close()
 Date.now = realNow
+
+// --- the reporter on its own ------------------------------------------------
+// Everything above drives the host. What follows drives `createReporter` directly,
+// because the success window is the reporter's own machinery: which samples join a
+// window, when a window may leave, what survives a restart and what the ceilings do
+// to it are questions the host cannot answer and the wire can.
+//
+// These live in this file rather than a new one on purpose: the documented release
+// command names its test files explicitly, and a ninth file would not be run by it.
+const TEST_WINDOW = 1000
+
+/**
+ * A reporter with an injected clock and a capturing transport.
+ * @param overrides - extra `createReporter` dependencies; `limits` is merged.
+ * @returns `{ reporter, posts, advance, limits }`.
+ */
+function windowReporter(overrides = {}) {
+  const posts = []
+  let now = 1_700_000_000_000
+  const reporter = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { posts.push(body); return { status: 200 } },
+    now: () => now,
+    ...overrides,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW, FAILURE_WINDOW_MS: TEST_WINDOW, ...(overrides.limits ?? {}) },
+  })
+  return {
+    reporter,
+    posts,
+    advance: by => { now += by; return now },
+    at: () => now,
+  }
+}
+
+{
+  // One success must not cost a request: the window exists so that a machine making
+  // 230 requests a day sends dozens of documents rather than 230.
+  const one = windowReporter()
+  one.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 12 })
+  await one.reporter.flush()
+  check('one success inside an open window sends nothing', one.posts.length === 0, String(one.posts.length))
+  check('it is counted and shows as pending', one.reporter.summary().successes === 1 && one.reporter.summary().pendingSuccesses === 1,
+    JSON.stringify({ successes: one.reporter.summary().successes, pending: one.reporter.summary().pendingSuccesses }))
+  one.reporter.dispose()
+
+  // N successes in one window are exactly one report, carrying the count and the
+  // duration aggregate rather than the samples.
+  const many = windowReporter()
+  for (let index = 0; index < 12; index += 1) many.reporter.noteSuccess({ model: 'claude-opus-5-5', route: 'rustvy', ms: 100 + index })
+  many.advance(TEST_WINDOW + 1)
+  await many.reporter.flush()
+  check('twelve successes in one window are one POST', many.posts.length === 1, String(many.posts.length))
+  // 1266 is 100+101+…+111 and 111 is the largest of them, both from inputs this file
+  // chooses, so the aggregate is pinned exactly rather than merely present.
+  check('the one POST carries the count and the aggregate, not the samples',
+    JSON.stringify(many.posts[0]?.c) === JSON.stringify([{ m: 'claude-opus-5-5', n: 12, s: 1266, x: 111 }]),
+    JSON.stringify(many.posts[0]?.c))
+  check('the window spans the interval it counted', many.posts[0]?.window?.to - many.posts[0]?.window?.from === TEST_WINDOW, JSON.stringify(many.posts[0]?.window))
+  // §2.1 lifted the prohibition on durations but not on samples: what leaves is the
+  // window aggregate, never a per-request sequence. `ms` was offered on all twelve
+  // calls, so this asserts a duration that really was measured rather than one that
+  // never arrived — and two integers are what remains of twelve samples.
+  check('no per-request duration leaves, only the window aggregate',
+    !JSON.stringify(many.posts[0]).includes('"ms"') && many.posts[0]?.c?.length === 1
+    && Object.keys(many.posts[0].c[0]).length === 4,
+    JSON.stringify(many.posts[0]).slice(0, 160))
+  check('the sent window is counted once', many.reporter.summary().successWindows === 1, String(many.reporter.summary().successWindows))
+  const measuredBytes = Buffer.byteLength(JSON.stringify(many.posts[0]), 'utf8')
+  check('the byte counter is the size of what left', many.reporter.summary().successBytes === measuredBytes,
+    `${many.reporter.summary().successBytes} vs ${measuredBytes}`)
+  many.reporter.dispose()
+
+  // An idle machine pays nothing.
+  const idle = windowReporter()
+  idle.advance(TEST_WINDOW * 5)
+  await idle.reporter.flush({ settle: true })
+  check('a window with no successes sends nothing at all', idle.posts.length === 0, String(idle.posts.length))
+  check('and counts no window', idle.reporter.summary().successWindows === 0, String(idle.reporter.summary().successWindows))
+  idle.reporter.dispose()
+
+  // Two routes are two windows, because a report names exactly one provider.
+  const routes = windowReporter()
+  routes.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  routes.reporter.noteSuccess({ model: 'm', route: 'rustvy-k2', ms: 5 })
+  await routes.reporter.flush({ settle: true })
+  check('two routes are two windows, each naming its own provider',
+    routes.posts.length === 2 && routes.posts.map(one => one.provider).sort().join(',') === 'rustvy,rustvy-k2',
+    JSON.stringify(routes.posts.map(one => one.provider)))
+  routes.reporter.dispose()
+
+  // The consent rule: a sample noted while sending was off must never leave, even
+  // after the setting is switched back on. The request happened under a promise.
+  const consent = windowReporter()
+  consent.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5, send: false })
+  consent.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5, send: false })
+  check('a sample noted while sending was off is still counted locally', consent.reporter.summary().successes === 2, String(consent.reporter.summary().successes))
+  check('and is not pending in any window', consent.reporter.summary().pendingSuccesses === 0, String(consent.reporter.summary().pendingSuccesses))
+  consent.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  consent.advance(TEST_WINDOW + 1)
+  await consent.reporter.flush()
+  check('re-enabling does not retroactively send what was promised away',
+    consent.posts.length === 1 && consent.posts[0]?.c?.[0]?.n === 1, JSON.stringify(consent.posts[0]?.c))
+  consent.reporter.dispose()
+
+  // Collection and delivery are separate gates: a window aggregated while sending was
+  // on is held, not dropped, when sending is switched off — and goes out when it is
+  // switched back on.
+  let sending = true
+  const held = windowReporter({ successEnabled: () => sending })
+  held.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  sending = false
+  held.advance(TEST_WINDOW + 1)
+  await held.reporter.flush()
+  check('switching sending off stops a window that is already aggregated', held.posts.length === 0, String(held.posts.length))
+  check('and the window is dropped and counted rather than held, because nothing retains it',
+    held.reporter.summary().queued === 0 && held.reporter.summary().successWindowsLost === 1,
+    JSON.stringify({ queued: held.reporter.summary().queued, lost: held.reporter.summary().successWindowsLost }))
+  sending = true
+  await held.reporter.flush()
+  check('so switching it back on does not resurrect it',
+    held.posts.length === 0 && held.reporter.summary().successWindowsLost === 1,
+    JSON.stringify({ posts: held.posts.length, lost: held.reporter.summary().successWindowsLost }))
+  held.reporter.dispose()
+
+  // Combination 3 of the four the contract requires: successes on, errors off.
+  const errorsOff = windowReporter({ enabled: () => false })
+  errorsOff.reporter.noteFailure({ model: 'm', route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: 'the model origin is unavailable', ms: 4 })
+  errorsOff.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  check('a failure is not noted while error collection is off', errorsOff.reporter.summary().failures === 0, String(errorsOff.reporter.summary().failures))
+  check('a success is still noted while error collection is off', errorsOff.reporter.summary().successes === 1, String(errorsOff.reporter.summary().successes))
+  await errorsOff.reporter.flush({ settle: true })
+  check('the success window still leaves with error collection off',
+    errorsOff.posts.length === 1 && errorsOff.posts[0]?.kind === 'ok', JSON.stringify(errorsOff.posts.map(one => one?.kind)))
+  errorsOff.reporter.dispose()
+
+  // A restart DOES lose an open success window, by decision: the disk queue exists for
+  // error reports, because an error needs durability and a fifteen-minute aggregate does
+  // not. The counter cannot record that loss — it lives in memory and dies with the
+  // process — so the honest statement is that windows open at exit are lost uncounted.
+  let stored
+  const store = { read: () => structuredClone(stored ?? []), write: value => { stored = structuredClone(value) } }
+  const before = windowReporter({ store })
+  before.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  before.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  before.reporter.dispose()
+  check('an open success window is not part of the persisted backlog',
+    Array.isArray(stored) && stored.every(record => record?.w !== true),
+    JSON.stringify((stored ?? []).map(record => ({ w: record?.w ?? false, c: record?.c }))))
+  const after = windowReporter({ store })
+  await after.reporter.flush({ settle: true })
+  check('and a restart does not deliver it',
+    after.posts.every(one => one?.kind !== 'ok'), JSON.stringify(after.posts.map(one => one?.kind)))
+  after.reporter.dispose()
+
+  // The only path by which an empty window can reach the queue is a truncated or
+  // foreign backlog: `countSuccess` never opens one without counting into it. Sending
+  // it would put a document on the wire saying a window elapsed and counted nothing,
+  // which is the same shape as an error record with no message — worse than silence,
+  // because it looks like data.
+  const emptyStore = { read: () => [{ v: 1, w: true, t: 1_700_000_000_000, to: 1_700_000_900_000, route: 'rustvy', c: [], id: 'x' }], write: () => {} }
+  const emptyRestore = windowReporter({ store: emptyStore })
+  await emptyRestore.reporter.flush({ settle: true })
+  check('a restored window with nothing counted in it is not sent', emptyRestore.posts.length === 0, JSON.stringify(emptyRestore.posts))
+  emptyRestore.reporter.dispose()
+
+  const junkStore = { read: () => [{ v: 1, w: true, t: 1_700_000_000_000, to: 1_700_000_900_000, route: 'rustvy', c: [['', 3], ['m', 0]], id: 'x' }], write: () => {} }
+  const junkRestore = windowReporter({ store: junkStore })
+  await junkRestore.reporter.flush({ settle: true })
+  check('a restored window whose counts are all unusable is not sent either', junkRestore.posts.length === 0, JSON.stringify(junkRestore.posts))
+  junkRestore.reporter.dispose()
+
+  // Successes share the error queue's ceilings rather than having their own budget:
+  // one window is one report, and a report is a report.
+  const batched = windowReporter({ limits: { MAX_BATCH: 1 } })
+  batched.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  batched.advance(TEST_WINDOW + 1)
+  batched.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  batched.advance(TEST_WINDOW + 1)
+  batched.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  await batched.reporter.flush({ settle: true })
+  check('success windows obey MAX_BATCH like any other report', batched.posts.length === 1, String(batched.posts.length))
+  check('the rest stay queued rather than being dropped', batched.reporter.summary().queued === 2 && batched.reporter.summary().dropped === 0,
+    JSON.stringify({ queued: batched.reporter.summary().queued, dropped: batched.reporter.summary().dropped }))
+  batched.reporter.dispose()
+
+  // The denominator's honesty, on the wire rather than in the classifier: a folded
+  // failure carries `n`, and a single one carries no `n` key at all — so a collector
+  // that reads a missing `n` as zero understates failures and overstates uptime.
+  const folded = windowReporter()
+  for (let index = 0; index < 5; index += 1) {
+    folded.reporter.noteFailure({ model: 'm', route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: 'the model origin is unavailable', ms: 3 })
+  }
+  folded.reporter.noteFailure({ model: 'other', route: 'rustvy', kind: 'upstream_502', status: 502, code: 'PI_AI_ERROR', err: 'bad gateway', ms: 3 })
+  await folded.reporter.flush({ settle: true })
+  const foldedDoc = folded.posts.find(one => one?.model === 'm')
+  const singleDoc = folded.posts.find(one => one?.model === 'other')
+  check('five folded failures are one record carrying n: 5', foldedDoc?.meta?.n === 5, JSON.stringify(foldedDoc?.meta))
+  check('a single failure carries no n key at all', singleDoc !== undefined && !('n' in (singleDoc.meta ?? {})), JSON.stringify(singleDoc?.meta))
+  folded.reporter.dispose()
+}
+
+{
+  // A collector that has never seen `kind: 'ok'` answers 400, and that answer does
+  // not change within its own version. Retrying every window would spend the rest of
+  // the process producing dropped reports and a climbing counter instead of one line
+  // in the log — which is precisely the silent failure the deployment-order warning
+  // is about. So: refuse once, announce once, stop.
+  const lines = []
+  let mode = 400
+  const posts = []
+  let now = 1_700_000_000_000
+  const refused = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => {
+      posts.push(body)
+      return mode === 200 ? { status: 200 } : { status: mode, body: { ok: false, error: 'need a message or code field' } }
+    },
+    log: message => { lines.push(String(message)) },
+    now: () => now,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  refused.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  await refused.flush({ settle: true })
+  const refusalLines = () => lines.filter(line => line.includes('does not understand this document shape'))
+  check('a collector that cannot store the shape is told once', posts.length === 1 && refusalLines().length === 1,
+    JSON.stringify({ posts: posts.length, lines: refusalLines().length }))
+  check('the announcement names the consequence and that errors are unaffected',
+    refusalLines()[0]?.includes('no further success windows') === true && refusalLines()[0]?.includes('error reporting is unaffected') === true,
+    String(refusalLines()[0]))
+  check('the refused document is counted as dropped', refused.summary().dropped === 1, String(refused.summary().dropped))
+
+  for (let round = 0; round < 3; round += 1) {
+    now += TEST_WINDOW + 1
+    refused.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+    await refused.flush({ settle: true })
+  }
+  check('three more windows produce no further request', posts.length === 1, String(posts.length))
+  check('the discarded windows do not fill the queue', refused.summary().queued === 0, String(refused.summary().queued))
+  check('nor climb as dropped, which is the silent counter this avoids', refused.summary().dropped === 1, String(refused.summary().dropped))
+  check('and the refusal is announced once rather than once per window', refusalLines().length === 1, String(refusalLines().length))
+  check('the successes are still counted locally throughout', refused.summary().successes === 4, String(refused.summary().successes))
+
+  mode = 200
+  refused.noteFailure({ model: 'm', route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: 'the model origin is unavailable', ms: 3 })
+  await refused.flush({ settle: true })
+  const errorPosts = posts.filter(one => one?.kind !== 'ok')
+  check('an error report still leaves after success windows were refused',
+    errorPosts.length === 1 && errorPosts[0]?.code === 'upstream_503', JSON.stringify(errorPosts.map(one => one?.code)))
+  refused.dispose()
+}
+
+{
+  // 429 and 5xx are transient and must not be mistaken for "this server will never
+  // understand the shape" — a collector that is merely busy or down has to be retried.
+  for (const status of [429, 503]) {
+    const posts = []
+    let now = 1_700_000_000_000
+    const retrying = createReporter({
+      endpoint: 'https://collector.test/api/report',
+      identity: { id: 'install-under-test' },
+      send: async body => { posts.push(body); return { status } },
+      now: () => now,
+      limits: { SUCCESS_WINDOW_MS: TEST_WINDOW, RETRY_MS: 1 },
+    })
+    retrying.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+    await retrying.flush({ settle: true })
+    check(`a ${status} on a success window drops and counts it instead of holding it for retry`,
+      retrying.summary().queued === 0 && retrying.summary().successWindowsLost === 1 && retrying.summary().dropped === 0,
+      JSON.stringify({ queued: retrying.summary().queued, lost: retrying.summary().successWindowsLost, dropped: retrying.summary().dropped }))
+    now += TEST_WINDOW + 1
+    retrying.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+    await retrying.flush({ settle: true })
+    // `dropped` staying at zero is the point of the second assertion: a 429 or a 5xx must
+    // not be mistaken for the permanent shape refusal, which latches for the revision and
+    // would stop every later window from even being attempted.
+    check(`and a ${status} is still not mistaken for a shape refusal`,
+      retrying.summary().successWindowsLost === 2 && posts.length === 2 && retrying.summary().dropped === 0,
+      JSON.stringify({ posts: posts.length, lost: retrying.summary().successWindowsLost }))
+    retrying.dispose()
+  }
+}
+
+{
+  // The refusal is process state and is never persisted, because it describes the
+  // collector version this process is talking to. A restart — which is also how a
+  // plugin or collector upgrade arrives — has to be allowed to try again.
+  const posts = []
+  let now = 1_700_000_000_000
+  const refusing = () => createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { posts.push(body); return { status: 400, body: { ok: false, error: 'need a message or code field' } } },
+    now: () => now,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  const firstRun = refusing()
+  firstRun.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  await firstRun.flush({ settle: true })
+  firstRun.dispose()
+  const afterFirst = posts.length
+  now += TEST_WINDOW + 1
+  const secondRun = refusing()
+  secondRun.noteSuccess({ model: 'm', route: 'rustvy', ms: 5 })
+  await secondRun.flush({ settle: true })
+  secondRun.dispose()
+  check('a restart tries again, because the refusal is not persisted', posts.length === afterFirst + 1, `${afterFirst} → ${posts.length}`)
+}
+
+{
+  // Contract §2.1: a success window carries the sum and the maximum of the durations
+  // it counted, because `ms` is already measured on every attempt and was being thrown
+  // away. The user priced this at 774 bytes a document, so the byte count is part of
+  // the agreement and not an implementation detail.
+  const DURATIONS = [2500, 2500, 2500, 2500, 2500, 2500, 2500, 31204]
+  const sumOf = list => list.reduce((total, one) => total + one, 0)
+  let now = 1_700_000_000_000
+  const bodies = []
+  const durations = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { bodies.push(body); return { status: 200 } },
+    now: () => now,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  for (const ms of DURATIONS) durations.noteSuccess({ model: 'm', route: 'rustvy', ms })
+  await durations.flush({ settle: true })
+  const entry = bodies[0]?.c?.[0]
+  check('a window of eight successes carries the sum of their durations', entry?.s === sumOf(DURATIONS), JSON.stringify(entry))
+  check('and the maximum, which is the case a mean hides', entry?.x === 31204, JSON.stringify(entry))
+  check('and still carries the count', entry?.n === 8, JSON.stringify(entry))
+  check('the sum has exactly as many terms as the count',
+    entry?.n === DURATIONS.length && entry?.s === sumOf(DURATIONS),
+    JSON.stringify({ n: entry?.n, terms: DURATIONS.length, s: entry?.s, expected: sumOf(DURATIONS) }))
+  durations.dispose()
+
+  // A sample taken under `send: false` left the machine under a promise. A duration is
+  // data leaving the machine just as much as a count is, and `x` is the sharper half:
+  // one excluded sample would raise the maximum for every reader of that window, and a
+  // maximum is not diluted by the other seven.
+  let nowB = 1_700_000_000_000
+  const bodiesB = []
+  const promised = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { bodiesB.push(body); return { status: 200 } },
+    now: () => nowB,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  promised.noteSuccess({ model: 'm', route: 'rustvy', ms: 2000 })
+  promised.noteSuccess({ model: 'm', route: 'rustvy', ms: 99999, send: false })
+  promised.noteSuccess({ model: 'm', route: 'rustvy', ms: 3000 })
+  await promised.flush({ settle: true })
+  const promisedEntry = bodiesB[0]?.c?.[0]
+  check('a send:false sample is not counted', promisedEntry?.n === 2, JSON.stringify(promisedEntry))
+  check('nor does its duration enter the sum', promisedEntry?.s === 5000, JSON.stringify(promisedEntry))
+  check('nor does it raise the maximum, which is the sharper half of the promise',
+    promisedEntry?.x === 3000 && promisedEntry?.x !== 99999, JSON.stringify(promisedEntry))
+  promised.dispose()
+
+  // A sample with no usable duration cannot join a sum that claims to cover the count.
+  // Either `s` covers exactly `n` samples or it is absent, because a partial sum beside
+  // a full count understates the mean — the same failure as reading absence as zero.
+  let nowC = 1_700_000_000_000
+  const bodiesC = []
+  const partial = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { bodiesC.push(body); return { status: 200 } },
+    now: () => nowC,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  partial.noteSuccess({ model: 'm', route: 'rustvy', ms: 2000 })
+  partial.noteSuccess({ model: 'm', route: 'rustvy' })
+  partial.noteSuccess({ model: 'm', route: 'rustvy', ms: 3000 })
+  await partial.flush({ settle: true })
+  const partialEntry = bodiesC[0]?.c?.[0]
+  check('the count is unaffected by a missing duration', partialEntry?.n === 3, JSON.stringify(partialEntry))
+  check('and the sum is omitted rather than covering two of three',
+    partialEntry !== undefined && !('s' in partialEntry) && !('x' in partialEntry), JSON.stringify(partialEntry))
+  partial.dispose()
+
+  // A record written by an earlier version carries `n` and no `s`. Restoring it must
+  // not invent a zero: a zero sum beside a non-zero count is a mean of 0 ms, an instant
+  // answer nobody measured, which is `Number(null) === 0` arriving from the other side.
+  // A record written before durations existed carries `n` and no `s`. Such a record is no
+  // longer restored at all — success windows are not read from disk any more, and the
+  // task-58 block below asserts that a leftover one is discarded and counted — but the
+  // serialiser still has to handle the shape, because that is what an old queue file
+  // holds and what a hand-built record can hold. So the absence rule is asserted directly
+  // against the serialiser rather than through a restore that no longer happens.
+  const legacyEntry = successPayload({ v: 1, w: true, t: 1, to: 2, route: 'rustvy', c: [['m', 5]], id: 'install-under-test' }).c[0]
+  check('a legacy window record without durations keeps its count', legacyEntry?.n === 5, JSON.stringify(legacyEntry))
+  check('and carries no sum rather than a zero one',
+    legacyEntry !== undefined && !('s' in legacyEntry) && !('x' in legacyEntry), JSON.stringify(legacyEntry))
+}
+
+{
+  // The number the user agreed to pay. If the implemented shape is not 774 bytes at
+  // twelve models, what ships is not what was priced — and the agreement was made
+  // against a number, not against a description.
+  const PRICED_MODELS = [
+    'claude-opus-5-5', 'claude-sonnet-4-5', 'gpt-6.1-sol', 'gpt-6.1-luna',
+    'deepseek-chat', 'deepseek-reasoner', 'gemini-2.5-pro', 'gemini-2.5-flash',
+    'qwen3-max', 'kimi-k2-instruct', 'llama-4-maverick', 'mistral-large-3',
+  ]
+  let now = 1_700_000_000_000
+  const bodies = []
+  const priced = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'd66d4114-3f2a-4c81-9b7e-0a5f1c2d3e44' },
+    send: async body => { bodies.push(body); return { status: 200 } },
+    now: () => now,
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  for (const model of PRICED_MODELS) {
+    for (const ms of [2500, 2500, 2500, 2500, 2500, 2500, 2500, 31204]) priced.noteSuccess({ model, route: 'rustvy', ms })
+  }
+  await priced.flush({ settle: true })
+  const size = Buffer.byteLength(JSON.stringify(bodies[0]), 'utf8')
+  check('the implemented shape costs the 774 bytes the user agreed to', size === 774, `${size} bytes`)
+  check('and one document still covers all twelve models', (bodies[0]?.c ?? []).length === 12 && bodies.length === 1,
+    JSON.stringify({ models: (bodies[0]?.c ?? []).length, documents: bodies.length }))
+  priced.dispose()
+}
+
+{
+  // Task-56: how big is the problem §2.1's rule creates? The rule is acceptable while
+  // samples without a usable duration are rare and unacceptable if they are common —
+  // then the feature renders as mostly dashes while looking like it works. The size is
+  // not knowable from the code, so it is counted off the wire rather than guessed.
+  //
+  // The counter reads the completeness path, not the `ms` value: a sample is undated
+  // exactly when `nullableMs` returned null, which is what makes `complete` false. That
+  // keeps it independent of the host's call shape, and it means the counter reads 0 on
+  // a host that still reports an unattributed success as `ms: 0` — blind rather than
+  // wrong, and the reason task-55 has to land before this can be read on a live install.
+  function counterReporter() {
+    const posts = []
+    const reporter = createReporter({
+      endpoint: 'https://collector.test/api/report',
+      identity: { id: 'install-under-test' },
+      send: async body => { posts.push(body); return { status: 200 } },
+      limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+    })
+    return { reporter, posts }
+  }
+
+  const before = counterReporter()
+  check('the counter is published under a name that says what it counts',
+    before.reporter.summary().successesWithoutDuration === 0 && before.reporter.summary().successWindowsWithoutDuration === 0,
+    JSON.stringify({ samples: before.reporter.summary().successesWithoutDuration, windows: before.reporter.summary().successWindowsWithoutDuration }))
+  before.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 2500 })
+  before.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 2600 })
+  check('an attributed success does not move it', before.reporter.summary().successesWithoutDuration === 0,
+    String(before.reporter.summary().successesWithoutDuration))
+  before.reporter.noteSuccess({ model: 'm', route: 'rustvy' })
+  check('an undated success moves it by one', before.reporter.summary().successesWithoutDuration === 1,
+    String(before.reporter.summary().successesWithoutDuration))
+  check('and the dated total is unchanged, so the two are readable as a ratio',
+    before.reporter.summary().successes === 3, String(before.reporter.summary().successes))
+  check('the window has not lost its aggregate yet, because it is still open',
+    before.reporter.summary().successWindowsWithoutDuration === 0,
+    String(before.reporter.summary().successWindowsWithoutDuration))
+  await before.reporter.flush({ settle: true })
+  check('and it is counted once the window settles', before.reporter.summary().successWindowsWithoutDuration === 1,
+    String(before.reporter.summary().successWindowsWithoutDuration))
+  check('and the window that lost its aggregate publishes no sum at all',
+    before.posts.length === 1 && ('s' in before.posts[0].c[0]) === false && before.posts[0].c[0].n === 3,
+    JSON.stringify(before.posts[0]?.c))
+  before.reporter.dispose()
+
+  // A window whose samples are all dated must not be counted, or the ratio means nothing.
+  const clean = counterReporter()
+  clean.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  clean.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 200 })
+  await clean.reporter.flush({ settle: true })
+  check('a fully dated window moves neither counter',
+    clean.reporter.summary().successesWithoutDuration === 0 && clean.reporter.summary().successWindowsWithoutDuration === 0
+    && clean.posts[0]?.c?.[0]?.s === 300,
+    JSON.stringify({ samples: clean.reporter.summary().successesWithoutDuration, windows: clean.reporter.summary().successWindowsWithoutDuration, c: clean.posts[0]?.c }))
+  clean.reporter.dispose()
+
+  // One undated sample in a window of many still costs that model its whole aggregate,
+  // which is the price §2.1 charges and the number this counter exists to size.
+  const mixed = counterReporter()
+  for (let index = 0; index < 7; index += 1) mixed.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 2500 })
+  mixed.reporter.noteSuccess({ model: 'm', route: 'rustvy' })
+  await mixed.reporter.flush({ settle: true })
+  check('one undated sample out of eight costs the model its aggregate',
+    mixed.reporter.summary().successesWithoutDuration === 1 && mixed.reporter.summary().successWindowsWithoutDuration === 1
+    && mixed.posts[0]?.c?.[0]?.n === 8 && !('s' in mixed.posts[0].c[0]),
+    JSON.stringify(mixed.posts[0]?.c))
+  mixed.reporter.dispose()
+
+  // The comment on the settle-time count claims a window discarded because the collector
+  // refused the shape is not counted, since it never reached anybody and never rendered
+  // as a dash. An unasserted comment is how a claim survives being wrong, so this asserts
+  // it. The window that *triggered* the refusal is counted: it did go out and it did lose
+  // its aggregate. It is the ones discarded afterwards that must not be.
+  let refusedPosts = 0
+  const refusing = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async () => { refusedPosts += 1; return { status: 400, error: 'unknown document kind' } },
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  refusing.noteSuccess({ model: 'm', route: 'rustvy' })
+  await refusing.flush({ settle: true })
+  check('the window that triggered a refusal is counted, because it did go out',
+    refusing.summary().successWindowsWithoutDuration === 1 && refusedPosts === 1,
+    JSON.stringify({ windows: refusing.summary().successWindowsWithoutDuration, posts: refusedPosts }))
+  refusing.noteSuccess({ model: 'm', route: 'rustvy' })
+  await refusing.flush({ settle: true })
+  check('and a window discarded after the refusal is not',
+    refusing.summary().successWindowsWithoutDuration === 1 && refusedPosts === 1,
+    JSON.stringify({ windows: refusing.summary().successWindowsWithoutDuration, posts: refusedPosts }))
+  check('while the sample counter keeps counting, because the sample really was undated',
+    refusing.summary().successesWithoutDuration === 2, String(refusing.summary().successesWithoutDuration))
+  refusing.dispose()
+}
+
+{
+  // Task-58: the disk queue is for errors only. A success window is delivered on the
+  // next flush or dropped and counted — never persisted, never retried. The reasoning is
+  // the nature of the data: an error needs durability and a fifteen-minute aggregate
+  // does not, so losing one shifts a daily percentage by a fraction while the next window
+  // restores the picture. Paying for that with the eviction of an error report was the
+  // bad trade, and that is what this removes.
+  function diskReporter(options = {}) {
+    const state = { stored: [], posts: [] }
+    const reporter = createReporter({
+      endpoint: 'https://collector.test/api/report',
+      identity: { id: 'install-under-test' },
+      send: async () => { state.posts.push(1); return { status: options.status ?? 200 } },
+      store: {
+        read: () => structuredClone(state.stored),
+        write: value => { state.stored = structuredClone(value) },
+      },
+      successEnabled: options.successEnabled,
+      limits: { SUCCESS_WINDOW_MS: TEST_WINDOW, ...(options.limits ?? {}) },
+    })
+    return { reporter, state }
+  }
+  const windowsOnDisk = state => state.stored.filter(record => record?.w === true)
+
+  const delivered = diskReporter()
+  delivered.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  check('an open success window is never written to the queue file',
+    windowsOnDisk(delivered.state).length === 0, JSON.stringify(delivered.state.stored))
+  await delivered.reporter.flush({ settle: true })
+  check('a deliverable window still leaves', delivered.state.posts.length === 1, String(delivered.state.posts.length))
+  check('and it is still not on disk afterwards', windowsOnDisk(delivered.state).length === 0,
+    JSON.stringify(delivered.state.stored))
+  delivered.reporter.dispose()
+
+  const blocked = diskReporter({ successEnabled: () => false })
+  blocked.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  await blocked.reporter.flush({ settle: true })
+  check('a window the delivery gate blocks is counted as lost, not held',
+    blocked.reporter.summary().successWindowsLost === 1, String(blocked.reporter.summary().successWindowsLost))
+  check('and it neither left nor reached the disk',
+    blocked.state.posts.length === 0 && windowsOnDisk(blocked.state).length === 0,
+    JSON.stringify({ posts: blocked.state.posts.length, disk: blocked.state.stored }))
+  check('the loss counter reads as lost rather than sent',
+    blocked.reporter.summary().successWindows === 0 && blocked.reporter.summary().successWindowsLost === 1,
+    JSON.stringify({ sent: blocked.reporter.summary().successWindows, lost: blocked.reporter.summary().successWindowsLost }))
+  blocked.reporter.dispose()
+
+  // The transient-failure cost the user accepted: a brief collector outage now costs a
+  // window instead of a retry, because nothing is retained.
+  const outage = diskReporter({ status: 503 })
+  outage.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  await outage.reporter.flush({ settle: true })
+  check('a window whose send failed is dropped rather than retried',
+    outage.reporter.summary().successWindowsLost === 1 && windowsOnDisk(outage.state).length === 0,
+    JSON.stringify({ lost: outage.reporter.summary().successWindowsLost, disk: outage.state.stored }))
+  await outage.reporter.flush({ settle: true })
+  check('and a later flush does not resurrect it',
+    outage.state.posts.length === 1 && outage.reporter.summary().successWindowsLost === 1,
+    JSON.stringify({ posts: outage.state.posts.length, lost: outage.reporter.summary().successWindowsLost }))
+  outage.reporter.dispose()
+
+  // Error reports keep every property they had: persisted, retried, surviving restart.
+  const errors = diskReporter({ status: 503 })
+  errors.reporter.noteFailure({ model: 'm', route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: 'the model origin is unavailable', ms: 4 })
+  await errors.reporter.flush({ settle: true })
+  check('an error report that could not be delivered is still persisted',
+    errors.state.stored.some(record => record?.w !== true), JSON.stringify(errors.state.stored))
+  check('and is not counted as a lost success window', errors.reporter.summary().successWindowsLost === 0,
+    String(errors.reporter.summary().successWindowsLost))
+  errors.reporter.dispose()
+  const revived = diskReporter()
+  revived.state.stored = errors.state.stored
+  const revivedReporter = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async () => { revived.state.posts.push(1); return { status: 200 } },
+    store: { read: () => structuredClone(revived.state.stored), write: value => { revived.state.stored = structuredClone(value) } },
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  await revivedReporter.flush({ settle: true })
+  check('and it still survives a restart and leaves once the collector answers',
+    revived.state.posts.length === 1, String(revived.state.posts.length))
+  revivedReporter.dispose()
+
+  // Windows already on disk, written by a version that persisted them, are discarded
+  // rather than delivered: honouring the current rule means not treating them as backlog,
+  // and by now they may be days old.
+  const leftover = diskReporter()
+  leftover.state.stored = [{ v: 1, w: true, t: 1, to: 2, route: 'rustvy', c: [['m', { n: 5, s: 100, x: 40 }]], id: 'install-under-test' }]
+  const leftoverReporter = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async () => { leftover.state.posts.push(1); return { status: 200 } },
+    store: { read: () => structuredClone(leftover.state.stored), write: value => { leftover.state.stored = structuredClone(value) } },
+    limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  await leftoverReporter.flush({ settle: true })
+  check('a success window left on disk by an older version is not delivered',
+    leftover.state.posts.length === 0, String(leftover.state.posts.length))
+  check('and it is counted, because a window vanishing silently is a hole nobody sees',
+    leftoverReporter.summary().successWindowsLost === 1, String(leftoverReporter.summary().successWindowsLost))
+  leftoverReporter.dispose()
+
+  // The eviction this change exists to prevent, at a queue size that makes it reachable:
+  // a full queue of error reports must not lose one to make room for a success window.
+  const full = diskReporter({ status: 503, limits: { MAX_QUEUE: 2 } })
+  full.reporter.noteFailure({ model: 'a', route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: 'one', ms: 4 })
+  full.reporter.noteFailure({ model: 'b', route: 'rustvy', kind: 'upstream_502', status: 502, code: 'PI_AI_ERROR', err: 'two', ms: 4 })
+  await full.reporter.flush({ settle: true })
+  const queuedBefore = full.reporter.summary().queued
+  const droppedBefore = full.reporter.summary().dropped
+  full.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  await full.reporter.flush({ settle: true })
+  check('a full queue of error reports does not evict one for a success window',
+    full.reporter.summary().queued === queuedBefore && full.reporter.summary().dropped === droppedBefore,
+    JSON.stringify({ queuedBefore, queuedAfter: full.reporter.summary().queued, droppedBefore, droppedAfter: full.reporter.summary().dropped }))
+  check('and the window that did not fit is the one counted lost',
+    full.reporter.summary().successWindowsLost === 1, String(full.reporter.summary().successWindowsLost))
+  full.reporter.dispose()
+
+  // The privacy-critical half of the principle is untouched by any of this: a sample
+  // collected while the setting was off is never aggregated, so it never leaves, and a
+  // later re-enable does not grant permission retroactively.
+  const offThenOn = diskReporter({ successEnabled: () => false })
+  offThenOn.reporter.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  offThenOn.reporter.dispose()
+  const onNow = diskReporter({ successEnabled: () => true })
+  await onNow.reporter.flush({ settle: true })
+  check('a sample collected while off still never leaves, whatever happens afterwards',
+    onNow.state.posts.length === 0, String(onNow.state.posts.length))
+  onNow.reporter.dispose()
+}
+
+{
+  // Task-62: an error this machine's own network caused is not sent at all — «ни как
+  // запрос ошибки, ни как успех». The rule is three conjunctive conditions, and the first
+  // is load-bearing: any HTTP status, including a 5xx, proves the machine reached the
+  // gateway and the gateway answered, so a status-carrying error is never suppressed at
+  // any threshold. That is what protects the case this monitor exists for.
+  //
+  // The second reads the classifier's verdict rather than re-deriving one, so suppression
+  // is a gate at the point of sending and not a fourth kind of classification. The third
+  // is a duration bound that requires the duration to have been MEASURED: `lib/host.js`
+  // reports `ms: 0` for a failure that matched no attempt, where zero means "not measured"
+  // rather than "instant". Reading that zero as a duration would suppress on an unknown,
+  // which is `Number(null) === 0` arriving a third time.
+  function suppressionReporter(options = {}) {
+    const state = { posts: [] }
+    const reporter = createReporter({
+      endpoint: 'https://collector.test/api/report',
+      identity: { id: 'install-under-test' },
+      send: async body => { state.posts.push(body); return { status: options.status ?? 200 } },
+      now: () => 1_700_000_000_000,
+      limits: { SUCCESS_WINDOW_MS: TEST_WINDOW },
+    })
+    return { reporter, state }
+  }
+  const note = (reporter, over) => reporter.noteFailure({
+    model: 'm', route: 'rustvy', code: 'UNKNOWN', at: 1_700_000_000_000, ...over,
+  })
+  const sent = state => state.posts.map(one => one?.kind ?? one?.meta?.kind)
+
+  // The anchor case first, so it is the first thing to fail if the rule is ever widened.
+  // This error has a status and a body and it must leave at any threshold value.
+  for (const ms of [17, 23, 79, 200, 499, 500, 501, 300_000]) {
+    const anchor = suppressionReporter()
+    note(anchor.reporter, { kind: 'http_502', status: 502, ms, err: 'upstream_error: Upstream request failed: fetch failed' })
+    await anchor.reporter.flush({ settle: true })
+    check(`the 502 that started this monitor leaves at ${ms} ms`, anchor.state.posts.length === 1,
+      JSON.stringify(sent(anchor.state)))
+    check(`and is not counted as suppressed at ${ms} ms`, anchor.reporter.summary().suppressedNetworkErrors === 0,
+      String(anchor.reporter.summary().suppressedNetworkErrors))
+    anchor.reporter.dispose()
+  }
+
+  // Any status at all, including a 5xx, means the gateway answered.
+  for (const [kind, status] of [['http_503', 503], ['http_500', 500], ['http_429', 429], ['http_404', 404]]) {
+    const withStatus = suppressionReporter()
+    note(withStatus.reporter, { kind, status, ms: 18, err: 'the gateway answered and then failed' })
+    await withStatus.reporter.flush({ settle: true })
+    check(`a ${status} leaves even when it is instant and infrastructural`, withStatus.state.posts.length === 1,
+      JSON.stringify(sent(withStatus.state)))
+    withStatus.reporter.dispose()
+  }
+
+  // Condition 1 tested on its own, and the reason it needs its own test is a finding.
+  // `classifyFailure` cannot produce a local-set kind together with a non-zero status:
+  // every branch that names a status sets the kind to `http_NNN`. So this pair is not
+  // reachable from the classifier today, and without asserting it the status condition is
+  // untested — removing it leaves the whole suite green, because the kind condition alone
+  // already protects every case the classifier can produce. The gate reads what the caller
+  // passed rather than re-classifying, so a future host change could pass an inconsistent
+  // pair, and this is what keeps the load-bearing condition load-bearing.
+  for (const [kind, status] of [['transport', 502], ['refused', 503], ['dns', 500], ['unreachable', 429]]) {
+    const inconsistent = suppressionReporter()
+    note(inconsistent.reporter, { kind, status, ms: 18, err: 'a status and a local kind together' })
+    await inconsistent.reporter.flush({ settle: true })
+    check(`a ${kind} carrying status ${status} leaves, because any status means the gateway answered`,
+      inconsistent.state.posts.length === 1 && inconsistent.reporter.summary().suppressedNetworkErrors === 0,
+      JSON.stringify({ posts: sent(inconsistent.state), suppressed: inconsistent.reporter.summary().suppressedNetworkErrors }))
+    inconsistent.reporter.dispose()
+  }
+
+  // The signature case: instant, no status, a kind that means nothing remote was reached.
+  for (const [kind, ms] of [['transport', 17], ['transport', 23], ['refused', 19], ['dns', 21], ['unreachable', 20], ['transport', 79], ['refused', 480]]) {
+    const instant = suppressionReporter()
+    note(instant.reporter, { kind, status: 0, ms, err: 'the machine could not reach anything' })
+    await instant.reporter.flush({ settle: true })
+    check(`an instant status-less ${kind} at ${ms} ms is suppressed`,
+      instant.state.posts.length === 0 && instant.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(instant.state), suppressed: instant.reporter.summary().suppressedNetworkErrors }))
+    instant.reporter.dispose()
+  }
+
+  // The kinds that need an established connection, or that name the provider, are not in
+  // the local set — so «terminated» on a live network is NOT suppressed, and the threshold
+  // is not what protects it. The kind is.
+  for (const [kind, label] of [['connect_timeout', 'a connect timeout, which carries no status and is asserted reported above'], ['reset', 'the server aborting a live connection'], ['timeout', 'stream silence'], ['tls', 'a certificate failure'], ['server', 'the provider naming its own failure'], ['unknown', 'an unclassified failure']]) {
+    const remote = suppressionReporter()
+    note(remote.reporter, { kind, status: 0, ms: 18, err: 'whatever the wording was' })
+    await remote.reporter.flush({ settle: true })
+    check(`a status-less ${kind} at 18 ms still leaves, because it is ${label}`,
+      remote.state.posts.length === 1 && remote.reporter.summary().suppressedNetworkErrors === 0,
+      JSON.stringify({ posts: sent(remote.state), suppressed: remote.reporter.summary().suppressedNetworkErrors }))
+    remote.reporter.dispose()
+  }
+
+  // Stream silence, three orders of magnitude above the local signature.
+  const silence = suppressionReporter()
+  note(silence.reporter, { kind: 'transport', status: 0, ms: 300_000, err: 'body stream error' })
+  await silence.reporter.flush({ settle: true })
+  check('stream silence at 300000 ms is not suppressed even under a transport kind',
+    silence.state.posts.length === 1 && silence.reporter.summary().suppressedNetworkErrors === 0,
+    JSON.stringify(sent(silence.state)))
+  silence.reporter.dispose()
+
+  // The threshold is a bound: at it and above it, the error leaves.
+  for (const ms of [500, 501, 5000]) {
+    const atThreshold = suppressionReporter()
+    note(atThreshold.reporter, { kind: 'transport', status: 0, ms, err: 'slow enough to be something else' })
+    await atThreshold.reporter.flush({ settle: true })
+    check(`a transport failure at ${ms} ms is at or above the threshold and leaves`,
+      atThreshold.state.posts.length === 1, JSON.stringify(sent(atThreshold.state)))
+    atThreshold.reporter.dispose()
+  }
+
+  // An unmeasured duration is not an instant one. `lib/host.js` reports `ms: 0` when no
+  // attempt matched, and zero there means "unknown". Suppressing on it would discard a
+  // real failure whose duration nobody measured.
+  for (const ms of [0, undefined, null, -5, Number.NaN]) {
+    const unmeasured = suppressionReporter()
+    note(unmeasured.reporter, { kind: 'transport', status: 0, ms, err: 'no attempt matched this one' })
+    await unmeasured.reporter.flush({ settle: true })
+    check(`an unmeasured duration (${String(ms)}) is not read as instant, so the error leaves`,
+      unmeasured.state.posts.length === 1 && unmeasured.reporter.summary().suppressedNetworkErrors === 0,
+      JSON.stringify({ posts: sent(unmeasured.state), suppressed: unmeasured.reporter.summary().suppressedNetworkErrors }))
+    unmeasured.reporter.dispose()
+  }
+
+  // A suppressed error is not a success: it settles no folded failure of the same model,
+  // opens no success window, and enters neither side of the percentage. Settling is driven
+  // by successes today, so this needs its own assertion rather than an inference.
+  const notASuccess = suppressionReporter()
+  note(notASuccess.reporter, { kind: 'http_503', status: 503, ms: 1200, err: 'a real outage begins' })
+  note(notASuccess.reporter, { kind: 'transport', status: 0, ms: 18, err: 'then the local network dies' })
+  await notASuccess.reporter.flush({ settle: true })
+  check('a suppressed error does not settle the folded failure of the same model',
+    notASuccess.state.posts.length === 1 && notASuccess.reporter.summary().suppressedNetworkErrors === 1,
+    JSON.stringify({ posts: sent(notASuccess.state), suppressed: notASuccess.reporter.summary().suppressedNetworkErrors }))
+  check('and it opens no success window and counts no success',
+    notASuccess.reporter.summary().successes === 0 && notASuccess.reporter.summary().successWindows === 0
+    && notASuccess.reporter.summary().successWindowsLost === 0,
+    JSON.stringify({ successes: notASuccess.reporter.summary().successes, windows: notASuccess.reporter.summary().successWindows }))
+  notASuccess.reporter.dispose()
+
+  // Local visibility survives: suppression is about the wire only. If the local counters
+  // stopped seeing it, the rule would be indistinguishable from not noticing.
+  const local = suppressionReporter()
+  note(local.reporter, { kind: 'transport', status: 0, ms: 18, err: 'the machine could not reach anything' })
+  note(local.reporter, { kind: 'transport', status: 0, ms: 19, err: 'the machine could not reach anything' })
+  await local.reporter.flush({ settle: true })
+  check('the local counters still see every suppressed error',
+    local.reporter.summary().failures === 2 && local.reporter.summary().attempts === 2,
+    JSON.stringify({ failures: local.reporter.summary().failures, attempts: local.reporter.summary().attempts }))
+  check('and the suppression counter counts each one',
+    local.reporter.summary().suppressedNetworkErrors === 2, String(local.reporter.summary().suppressedNetworkErrors))
+  check('while nothing at all reached the wire', local.state.posts.length === 0, JSON.stringify(sent(local.state)))
+  local.reporter.dispose()
+
+  const quiet = suppressionReporter()
+  check('the suppression counter is published and starts at zero',
+    quiet.reporter.summary().suppressedNetworkErrors === 0, String(quiet.reporter.summary().suppressedNetworkErrors))
+  quiet.reporter.dispose()
+}
+
+// The serialiser on its own, for the inputs a hostile or truncated backlog can hold.
+check('successPayload survives a record with nothing in it', successPayload(undefined).kind === 'ok' && Array.isArray(successPayload(undefined).c),
+  JSON.stringify(successPayload(undefined)))
+check('successPayload drops a count with no model to attribute it to',
+  JSON.stringify(successPayload({ c: [['', 4], ['m', 0], ['m2', 3]] }).c) === JSON.stringify([{ m: 'm2', n: 3 }]),
+  JSON.stringify(successPayload({ c: [['', 4], ['m', 0], ['m2', 3]] }).c))
+check('successPayload never lets the window run backwards',
+  successPayload({ t: 500, to: 100 }).window.to >= successPayload({ t: 500, to: 100 }).window.from,
+  JSON.stringify(successPayload({ t: 500, to: 100 }).window))
+check('the exported window default is the contract default', SUCCESS_WINDOW_MS === 900_000 && FOLD_LIMITS.SUCCESS_WINDOW_MS === SUCCESS_WINDOW_MS,
+  String(SUCCESS_WINDOW_MS))
+
 const failed = results.filter(result => !result.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 if (failed.length > 0) {
