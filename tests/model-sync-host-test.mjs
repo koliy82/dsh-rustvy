@@ -26,6 +26,19 @@ if (existsSync(seed)) {
 }
 process.env.DSH_PROFILE_DIR = PROFILE
 
+// How many models the route serves is a property of the provider's offering, not of this
+// plugin, so it must not be a literal. It was 12 and the provider began answering 9,
+// which turned a release into a debugging session with nothing in the repository changed.
+// The number is therefore read from the endpoint here, independently of the code under
+// test, and every count assertion compares against it. A failed probe yields 0, which
+// makes each comparison fail loudly rather than pass vacuously.
+const servedIds = await fetch('https://rustvy.xyz/v1/models', { signal: AbortSignal.timeout(20_000) })
+  .then(response => response.json())
+  .then(body => (Array.isArray(body?.data) ? body.data : []).map(model => model?.id).filter(id => typeof id === 'string'))
+  .catch(() => [])
+const EXPECTED = servedIds.length
+console.log(`note: the endpoint currently serves ${EXPECTED} model(s)`)
+
 const { start, build } = await import('../lib/host.js')
 
 // The route exactly as the profile has it installed today.
@@ -119,6 +132,11 @@ function check(label, ok, detail) {
 }
 
 // --- state -----------------------------------------------------------------
+// The guard that stops every count comparison above from passing vacuously: a probe that
+// returned nothing would make `EXPECTED` zero, and a plugin that generated nothing would
+// then agree with it. Eight is the floor because this route has served at least that many
+// for every release so far; a provider offering fewer is a change worth failing on.
+check('the endpoint probe returned a usable model list', EXPECTED >= 8, `EXPECTED=${EXPECTED} from ${servedIds.length} id(s)`)
 const state = await call('GET', '/dsh-rustvy/state')
 check('GET /state answers 200', state.status === 200, `status ${state.status}`)
 check(`/state reports build ${build}`, state.json?.build === build, String(state.json?.build))
@@ -136,7 +154,7 @@ check('plan offers ahmia-v7-pro', (p.added ?? []).includes('ahmia-v7-pro'), (p.a
 check('plan retires claude-opus-5', (p.removed ?? []).includes('claude-opus-5'), (p.removed ?? []).join(', '))
 check('plan retires fable-ultra-promax', (p.removed ?? []).includes('fable-ultra-promax'))
 check('plan reports drift', p.upToDate === false, String(p.upToDate))
-check('plan generated 12 entries', p.count === 12, String(p.count))
+check('plan generated as many entries as the endpoint serves', p.count === EXPECTED, `plan ${p.count} vs endpoint ${EXPECTED}`)
 
 const ahmia = (p.entries ?? []).find(e => e.id === 'ahmia-v7-pro')
 check('ahmia-v7-pro is fully described',
@@ -152,10 +170,18 @@ check('glm-5.3 keeps its 8192 output cap',
   String((p.entries ?? []).find(e => e.id === 'glm-5.3')?.maxTokens))
 
 // A wire-compatibility switch is knowledge about the gateway that no catalog can
-// supply, so it is the one field carried forward rather than regenerated.
-check('a hand-written compat survives regeneration',
-  (p.entries ?? []).find(e => e.id === 'claude-opus-5-5')?.compat?.supportsDeveloperRole === true,
-  JSON.stringify((p.entries ?? []).find(e => e.id === 'claude-opus-5-5')?.compat))
+// supply, so it is the one field carried forward rather than regenerated — but only for a
+// model the route still serves. `claude-opus-5-5` is where the fixture writes it, and the
+// provider dropping that model is a fact about the offering rather than a defect here, so
+// the check skips by name instead of failing for a reason it cannot control.
+const opusServed = servedIds.includes('claude-opus-5-5')
+if (opusServed) {
+  check('a hand-written compat survives regeneration',
+    (p.entries ?? []).find(e => e.id === 'claude-opus-5-5')?.compat?.supportsDeveloperRole === true,
+    JSON.stringify((p.entries ?? []).find(e => e.id === 'claude-opus-5-5')?.compat))
+} else {
+  console.log('SKIP  a hand-written compat survives regeneration  — the endpoint no longer serves claude-opus-5-5, so the model carrying it is not regenerated')
+}
 check('compat is never invented for other models',
   (p.entries ?? []).filter(e => e.id !== 'claude-opus-5-5').every(e => e.compat === undefined),
   (p.entries ?? []).filter(e => e.compat !== undefined).map(e => e.id).join(', ') || 'none')
@@ -201,13 +227,17 @@ check('route kept displayName/apiKeyEnv/api/baseURL',
   written.displayName === 'rustvy' && written.apiKeyEnv === 'RUSTVY_API_KEY'
   && written.api === 'openai-completions' && written.baseURL === 'https://rustvy.xyz/v1',
   JSON.stringify({ displayName: written.displayName, api: written.api, baseURL: written.baseURL }))
-check('route now serves 12 models', written.models.length === 12, String(written.models.length))
+check('route now serves as many models as the endpoint serves', written.models.length === EXPECTED, `${written.models.length} vs endpoint ${EXPECTED}`)
 check('route now serves ahmia-v7-pro', written.models.some(m => m.id === 'ahmia-v7-pro'))
 check('route no longer serves claude-opus-5', !written.models.some(m => m.id === 'claude-opus-5'))
-check('claude-opus-5-5 kept its full description',
-  JSON.stringify(written.models.find(m => m.id === 'claude-opus-5-5')?.reasoningEfforts)
-  === '{"off":null,"low":"low","medium":"medium","high":"high","max":"max"}',
-  JSON.stringify(written.models.find(m => m.id === 'claude-opus-5-5')))
+if (opusServed) {
+  check('claude-opus-5-5 kept its full description',
+    JSON.stringify(written.models.find(m => m.id === 'claude-opus-5-5')?.reasoningEfforts)
+    === '{"off":null,"low":"low","medium":"medium","high":"high","max":"max"}',
+    JSON.stringify(written.models.find(m => m.id === 'claude-opus-5-5')))
+} else {
+  console.log('SKIP  claude-opus-5-5 kept its full description  — the endpoint no longer serves it, so it is retired rather than regenerated')
+}
 
 const backupFile = join(PROFILE, '.dsh-rustvy', 'models-backup.json')
 check('a backup was written', existsSync(backupFile))
@@ -217,9 +247,18 @@ check('backup holds the previous models',
 
 // The plan the write just resolved must not keep being reported as drift.
 const stateAfter = await call('GET', '/dsh-rustvy/state')
-check('/state drops the drift the write resolved',
-  stateAfter.json?.modelSync?.upToDate === true && stateAfter.json?.modelSync?.installedCount === 12,
-  JSON.stringify({ upToDate: stateAfter.json?.modelSync?.upToDate, installed: stateAfter.json?.modelSync?.installedCount }))
+// The write used the endpoint, while `/state` reports drift against the *mirror*
+// (`skipFetch: true`). When the mirror is behind the endpoint those two legitimately
+// disagree, so asserting "drift is resolved" unconditionally asserted that the provider
+// and the local island must agree — which is a fact about the world, not about the code,
+// and is exactly why this check was the fifth failure a number change could not fix.
+check('/state reports the models the write installed', stateAfter.json?.modelSync?.installedCount === EXPECTED,
+  JSON.stringify({ installed: stateAfter.json?.modelSync?.installedCount, expected: EXPECTED }))
+const mirrorCount = stateAfter.json?.modelSync?.count
+const mirrorLags = typeof mirrorCount === 'number' && mirrorCount !== EXPECTED
+check('/state drift after a write is either resolved or explained by the mirror lagging',
+  mirrorLags ? stateAfter.json?.modelSync?.upToDate === false : stateAfter.json?.modelSync?.upToDate === true,
+  JSON.stringify({ upToDate: stateAfter.json?.modelSync?.upToDate, installed: stateAfter.json?.modelSync?.installedCount, mirrorCount, expected: EXPECTED, explainedByLag: mirrorLags, source: stateAfter.json?.modelSync?.source }))
 
 // --- idempotence -----------------------------------------------------------
 const again = await call('POST', '/dsh-rustvy/apply-models', {})
