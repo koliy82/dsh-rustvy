@@ -52,6 +52,13 @@ const ORIGIN = `http://127.0.0.1:${origin.address().port}`
 writeFileSync(join(STATE, 'config.json'), `${JSON.stringify({
   enabled: false, syncModels: false, apiKeys: true, collectErrors: false, uptimeView: false,
   origin: ORIGIN,
+  // The catalogue's primary source is now the collector, whose address derives from this
+  // endpoint. Pointing it at a closed port keeps this file hermetic — the collector path
+  // is skipped and the provider path below is what runs, which is what these scenarios are
+  // about. Left at its default it reached the live collector and created a route from its
+  // nine models, which silently redefined what "an unreachable origin" meant here and made
+  // the suite depend on somebody else's deployment.
+  uptimeEndpoint: 'http://127.0.0.1:9/api/report',
 }, null, 2)}\n`)
 
 const { start } = await import('../lib/host.js')

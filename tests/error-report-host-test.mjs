@@ -1296,31 +1296,101 @@ check('the default is what the settings file would carry', defaultEndpoint?.conf
 check('collection defaults to on', defaultEndpoint?.collect === true, String(defaultEndpoint?.collect))
 rmSync(defaultProfile, { recursive: true, force: true })
 
-// --- the histogram is bounded -----------------------------------------------
-// A failure storm produces many kinds, and an unbounded map would be the one part of
-// this summary that could grow for the life of the process. Driven well past the cap
-// on purpose, with `http_NNN` because that is the open-ended family a real gateway
-// can emit — one kind per status it happens to answer with.
-const beforeHistogram = await summary()
-const kindsBefore = Object.keys(beforeHistogram.ignoredByKind ?? {}).length
-// 430-459 rather than 400-429: `./errors.js` calls 404 and 408 infrastructure by
-// design — a gateway with no route for the model it was asked to route, and a request
-// that never finished, are both facts about the service rather than about the caller
-// — so a range including them mixes reported failures into what is meant to be a run
-// of drops, and the arithmetic below would measure two things at once.
-for (let status = 430; status < 460; status += 1) {
-  const capped = await begin(`sess-cap-${status}`, 'rustvy', MODEL)
-  await failInBand(capped, { message: `the origin answered ${status}`, code: 'SERVER' })
+// --- the suppressed vocabulary is closed, and this is all of it --------------
+// What stood here was a cap: thirty statuses in the 430-459 band, driven past a limit
+// of twenty-four kinds to prove the histogram stopped growing at twenty-five keys.
+// That guard is gone because task-71 moved what it was guarding. Those statuses are
+// service refusals now — they are *sent*, they never reach `ignoredByKind` — and after
+// that no open family does: `http_NNN` stops being suppressive the moment its status is
+// refusable, so what is left is the kinds `./errors.js` writes from fixed tables plus the
+// bare statuses `NOT_A_REFUSAL_STATUS` excludes by decision. Seventeen of them, every one
+// written out below. A cap of twenty-four against a closed set of seventeen can only fire
+// in a version that has already broken something else; a guard that cannot fire is
+// indistinguishable from one that works, which this release has paid for more than once.
+//
+// So the guard is the enumeration below instead of a number. Every kind the drop gate
+// can still suppress, one failure each, with where the classifier gets it from and why
+// it stays off the wire. Two directions are asserted against it: each of these is still
+// reachable, and nothing outside this list is ever counted.
+//
+// The one suppression not represented here is the reporter's own local-network gate
+// (`isLocalNetworkRefusal` in `./errors.js`), which is a different mechanism with its
+// own written-out vocabulary of four kinds and a duration bound; it is asserted by the
+// suppression block further down. The transport kinds — `dns`, `refused`, `unreachable`,
+// `transport`, `timeout`, `reset`, `tls`, `connect_timeout` — are infrastructure by
+// classification, so they never reach this map at all: the host sends them and the
+// reporter's gate decides.
+//
+// The same list is the «нет» column of the `code` vocabulary in `docs/error-report.md`.
+// The two are written out in two places on purpose and are meant to move together: the
+// doc is what the collector's owner reads, and this is what fails when it stops being true.
+const SUPPRESSED_KINDS = [
+  // The harness's own structured verdict, one per family. A code is a verdict from the
+  // layer that made the request, so it outranks anything this module infers: the account
+  // or request words below are what the same failures would be called if only their prose
+  // were read.
+  ['aborted', { message: 'the user stopped the request', code: 'ABORTED' }],
+  ['request', { message: 'the adapter could not read the arguments', code: 'INVALID_REQUEST' }],
+  ['context', { message: 'the prompt did not fit the window', code: 'CONTEXT_WINDOW_EXCEEDED' }],
+  ['quota', { message: 'the account has no credits left', code: 'QUOTA' }],
+  ['auth', { message: 'the api key was rejected', code: 'AUTH' }],
+  ['rate_limit', { message: 'the provider is throttling this account', code: 'RATE_LIMIT' }],
+  // The account short-circuit: prose about the caller's own situation. `billing` and
+  // `model` have no code of their own, which is why they are the two rows that need a
+  // message rather than a verdict.
+  ['billing', { message: 'the subscription for this account has expired', code: 'UNKNOWN' }],
+  ['model', { message: 'the model gpt-6.1-sol does not exist', code: 'UNKNOWN' }],
+  // Neither one of the account words nor an infrastructure code: an unrecognised code is
+  // read as the caller's request rather than as an outage, because reporting "we do not
+  // know what this is" as a provider failure is the mistake that makes a dashboard lie.
+  ['unknown', { message: 'the provider answered with something this adapter does not understand', code: 'PI_UNEXPECTED_RESPONSE' }],
+  // A status that `NOT_A_REFUSAL_STATUS` excludes, and it names nothing else: the decision
+  // is about the status, so the status lands here as a kind instead of going out as a
+  // refusal. `401`, `402` and `403` are the three that are there because HTTP names the
+  // party in the status — a credential, a balance, and a verdict whose ambiguity points at
+  // the caller — so a bare one is the caller's, and the prose tables catch them again as
+  // `billing`/`auth` the moment a body says so.
+  ['http_401', { message: 'the origin turned the request away', code: 'PI_UNEXPECTED_RESPONSE', status: 401 }],
+  ['http_402', { message: 'the origin turned the request away', code: 'PI_UNEXPECTED_RESPONSE', status: 402 }],
+  ['http_403', { message: 'the origin turned the request away', code: 'PI_UNEXPECTED_RESPONSE', status: 403 }],
+  ['http_429', { message: 'the origin turned the request away', code: 'PI_UNEXPECTED_RESPONSE', status: 429 }],
+  // The gateway faithfully relaying a verdict of the caller's own — auth, payment,
+  // forbidden, rate limit. `upstream_` is not what makes a failure an outage; the status
+  // it names is, and these four are the ones `UPSTREAM_USER_STATUSES` keeps ours.
+  ['upstream_401', { message: 'upstream_401: the gateway relayed an authentication refusal', code: 'PI_AI_ERROR' }],
+  ['upstream_402', { message: 'upstream_402: the gateway relayed a payment requirement', code: 'PI_AI_ERROR' }],
+  ['upstream_403', { message: 'upstream_403: the gateway relayed a forbidden verdict', code: 'PI_AI_ERROR' }],
+  ['upstream_429', { message: 'upstream_429: the gateway relayed a rate limit', code: 'PI_AI_ERROR' }],
+]
+const SUPPRESSED_SET = new Set(SUPPRESSED_KINDS.map(([kind]) => kind))
+const beforeVocabulary = await summary()
+for (const [kind, failure] of SUPPRESSED_KINDS) {
+  const attempt = await begin(`sess-vocabulary-${kind}`, 'rustvy', MODEL)
+  await tick()
+  await failInBand(attempt, failure)
 }
-const afterHistogram = await summary()
-const kinds = Object.keys(afterHistogram.ignoredByKind ?? {})
-check('the histogram grew while there was room', kinds.length > kindsBefore, `${kindsBefore} → ${kinds.length}`)
-check('the histogram stops at its cap plus the overflow bucket', kinds.length === 25, `${kinds.length} keys`)
-check('what did not fit is folded into one overflow bucket', Number.isInteger(afterHistogram.ignoredByKind?.other) && afterHistogram.ignoredByKind.other >= 1, String(afterHistogram.ignoredByKind?.other))
-check('every drop was still counted', afterHistogram.ignoredNonInfra === beforeHistogram.ignoredNonInfra + 30, `${beforeHistogram.ignoredNonInfra} → ${afterHistogram.ignoredNonInfra}`)
-check('the histogram totals the drops even past the cap', sumOf(afterHistogram.ignoredByKind) === afterHistogram.ignoredNonInfra, `${sumOf(afterHistogram.ignoredByKind)} vs ${afterHistogram.ignoredNonInfra}`)
-check('a rare kind survived the cap rather than being evicted', kinds.some(kind => /^http_4/u.test(kind)), JSON.stringify(kinds.slice(0, 6)))
-check('none of the capped failures reached the collector', (await drain()).reports.length === 0)
+const vocabularyDrain = await drain()
+const afterVocabulary = await summary()
+// A delta rather than an absolute: most of these kinds were already on the map from
+// earlier phases, and an absolute count would silently turn into a claim about which
+// phases ran before this one.
+const vocabularyMoved = Object.fromEntries(SUPPRESSED_KINDS.map(([kind]) => [
+  kind,
+  (afterVocabulary.ignoredByKind?.[kind] ?? 0) - (beforeVocabulary.ignoredByKind?.[kind] ?? 0),
+]))
+const notReachable = Object.entries(vocabularyMoved).filter(([, moved]) => moved !== 1).map(([kind]) => kind)
+check('every kind the drop gate can suppress is still reachable, once per failure driven', notReachable.length === 0,
+  JSON.stringify({ moved: vocabularyMoved, notReachable }))
+check('and the drops are counted once each, in no other bucket either',
+  afterVocabulary.ignoredNonInfra - beforeVocabulary.ignoredNonInfra === SUPPRESSED_KINDS.length,
+  `${beforeVocabulary.ignoredNonInfra} → ${afterVocabulary.ignoredNonInfra} for ${SUPPRESSED_KINDS.length} failures`)
+check('no kind outside that vocabulary is ever counted on the map',
+  Object.keys(afterVocabulary.ignoredByKind ?? {}).every(kind => SUPPRESSED_SET.has(kind)),
+  JSON.stringify(Object.keys(afterVocabulary.ignoredByKind ?? {})))
+check('the map still totals the drops', sumOf(afterVocabulary.ignoredByKind) === afterVocabulary.ignoredNonInfra,
+  `${sumOf(afterVocabulary.ignoredByKind)} vs ${afterVocabulary.ignoredNonInfra}`)
+check('none of the suppressed failures reached the collector', vocabularyDrain.reports.length === 0,
+  JSON.stringify(vocabularyDrain.reports.map(one => one?.code)))
 
 // --- an outer listener that vetoes the chain ---------------------------------
 // The regression a second machine hit: a harness built-in (`dsh-llm-retry`) loads
@@ -1469,6 +1539,12 @@ const wholeSum = whole.reported + whole.unattributed + whole.ignoredNonInfra + w
 check('every failure this revision saw is accounted for', whole.seen === wholeSum, `seen ${whole.seen} vs ${wholeSum}: ${JSON.stringify({ reported: whole.reported, unattributed: whole.unattributed, ignoredNonInfra: whole.ignoredNonInfra, ignoredRoute: whole.ignoredRoute, ignoredCollect: whole.ignoredCollect, duplicates: whole.duplicates, ignoredInternal: whole.ignoredInternal })}`)
 check('nothing fell through the buckets all run', whole.ignoredInternal === 0, String(whole.ignoredInternal))
 check('the histogram totals the non-infra drops all run', sumOf(whole.ignoredByKind) === whole.ignoredNonInfra, `${sumOf(whole.ignoredByKind)} vs ${whole.ignoredNonInfra}`)
+// The vocabulary claim again, over every phase of this revision rather than over the block
+// that drives the enumeration: a kind can be on this map only if it is on that list, so a
+// classifier branch added without an entry there reds here rather than on a dashboard.
+check('no suppressed kind outside the enumerated vocabulary appeared all run',
+  Object.keys(whole.ignoredByKind ?? {}).every(kind => SUPPRESSED_SET.has(kind)),
+  JSON.stringify(Object.keys(whole.ignoredByKind ?? {})))
 check('the drop counters are on the summary the page reads', ['seen', 'reported', 'ignoredNonInfra', 'ignoredRoute', 'ignoredCollect', 'duplicates', 'ignoredByKind', 'lastCode', 'lastKind'].every(key => key in whole), JSON.stringify(Object.keys(whole)))
 
 // --- a reload keeps the identity -------------------------------------------
@@ -1517,6 +1593,89 @@ check('it is printed as text rather than translated', junkLine.includes('{"code"
 check('a non-string element is printed too', junkLine.includes('42'), junkLine)
 check('an unrecognized warning still counts as sent', junkWarning.answer.json?.sent === beforeJunk.sent + 1, `${beforeJunk.sent} → ${junkWarning.answer.json?.sent}`)
 answerMode = 'auto'
+
+// Task-71: a 4xx the provider made against the request — not against the caller — is
+// reported, under its own document kind so it cannot be counted as an outage. This is the
+// error the user actually hit: two models refused content on a safety check while every
+// other model answered, and it reached nobody.
+//
+// It belongs here, inside a mounted revision, and not at the foot of the file where it was
+// first written: the harness is disposed and the collector closed a few lines below, so the
+// same block there died on a null route before its first assertion and took every check
+// after it down with it. A block that cannot run is not coverage, which is the same lesson
+// as a guard that cannot fire.
+{
+  const REFUSAL_BODY = '400: {"message":"The provider rejected the request content during its safety check","type":"invalid_request_error","code":null}'
+  const refusal = await reportOf({ message: REFUSAL_BODY, code: 'UNKNOWN' })
+  check('a 400 safety refusal reaches the wire at all', refusal.drained.reports.length === 1,
+    JSON.stringify(refusal.drained.reports))
+  check('and it carries its own kind, so it is not counted as an outage',
+    refusal.drained.reports[0]?.kind === 'refusal', JSON.stringify(refusal.drained.reports[0]?.kind))
+  check('and the provider sentence is visible beside it',
+    typeof refusal.drained.reports[0]?.message === 'string' && refusal.drained.reports[0].message.includes('safety check'),
+    String(refusal.drained.reports[0]?.message))
+  check('and its status travels, with the most specific identifier as the code',
+    refusal.drained.reports[0]?.status === 400 && refusal.drained.reports[0]?.code === 'invalid_request_error',
+    JSON.stringify({ status: refusal.drained.reports[0]?.status, code: refusal.drained.reports[0]?.code }))
+  // The collector's block leads with `code`, so `null` must never reach it — the provider's
+  // own `type` is the better answer, and the status as text is the floor.
+  check('and the code is never empty, because the block leads with it',
+    typeof refusal.drained.reports[0]?.code === 'string' && refusal.drained.reports[0].code !== '',
+    String(refusal.drained.reports[0]?.code))
+  check('and it is not a success window in any reading',
+    refusal.drained.reports[0]?.kind !== 'ok' && refusal.drained.reports[0]?.c === undefined,
+    JSON.stringify(refusal.drained.reports[0]))
+
+  // An ordinary infrastructure failure still travels the way it always did: no `kind`, so
+  // the collector's own identification of a failure document does not change under it.
+  const outage = await reportOf(UPSTREAM_502)
+  check('an infrastructure 502 still travels without a kind',
+    outage.drained.reports.length === 1 && outage.drained.reports[0]?.kind === undefined,
+    JSON.stringify({ reported: outage.drained.reports.length, kind: outage.drained.reports[0]?.kind }))
+
+  // The door the previous gate closed must stay closed, and the new one must not reopen it.
+  const clientSide = await reportOf({ message: 'fetch failed', code: 'UNKNOWN' })
+  check('a client-side instant refusal still reaches nothing', clientSide.drained.reports.length === 0,
+    JSON.stringify(clientSide.drained.reports))
+
+  // 429 is invisible by decision, not by classification: it is the one 4xx that is
+  // definitionally about the caller's own volume.
+  const limited = await reportOf({ message: '429 rate limit exceeded', code: 'UNKNOWN' })
+  check('a 429 is not shown as a service refusal', limited.drained.reports.length === 0,
+    JSON.stringify(limited.drained.reports))
+
+  // An account failure is the caller's own money, and it stays invisible. What separates it
+  // from a refusal is a word the classifier recognises, not the status: the fixture below is
+  // the message the account table actually reads as `billing`. The one that stood here —
+  // `402: account credit balance is too low` — names nothing on that table and therefore
+  // classifies as a bare `http_402`. The label was right and its fixture was not, which
+  // nobody could see while the block was dead.
+  const billing = await reportOf({ message: '402: the subscription for this account has expired', code: 'UNKNOWN' })
+  check('a billing refusal is the caller own problem and stays invisible',
+    billing.drained.reports.length === 0, JSON.stringify(billing.drained.reports))
+
+  // The other side of that same line, and the decision it took: a 402 whose prose names
+  // nothing is attributed to the status alone, and `NOT_A_REFUSAL_STATUS` excludes it anyway.
+  // A bare 401, 402 or 403 is the caller's — a credential, a balance, and a verdict that is
+  // just as likely to be a ban for that account's own conduct — and relying on prose to catch
+  // them would let a body we could not read turn a client fault into a public report.
+  // Asserts both halves of the answer: nothing leaves, and the failure was still seen.
+  const beforeBare = await summary()
+  const bare402 = await reportOf({ message: '402: account credit balance is too low', code: 'UNKNOWN' })
+  const afterBare = await summary()
+  check('a status-only 402 stays invisible, because the status alone names the caller',
+    bare402.drained.reports.length === 0, JSON.stringify(bare402.drained.reports))
+  check('and it is counted as a drop rather than lost',
+    (afterBare.ignoredByKind?.http_402 ?? 0) === (beforeBare.ignoredByKind?.http_402 ?? 0) + 1
+      && afterBare.ignoredNonInfra === beforeBare.ignoredNonInfra + 1,
+    JSON.stringify({ kind: afterBare.ignoredByKind?.http_402, drops: `${beforeBare.ignoredNonInfra} → ${afterBare.ignoredNonInfra}` }))
+
+  // And nothing the block drove left a kind outside the enumerated vocabulary in this
+  // revision either — the three statuses the exclusion took back are on that list now.
+  check('the refusal cases left no kind outside the enumerated vocabulary',
+    Object.keys(afterBare.ignoredByKind ?? {}).every(kind => SUPPRESSED_SET.has(kind)),
+    JSON.stringify(Object.keys(afterBare.ignoredByKind ?? {})))
+}
 await handle.dispose()
 
 collector.close()
