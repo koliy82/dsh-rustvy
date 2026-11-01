@@ -2339,6 +2339,76 @@ function windowReporter(overrides = {}) {
   quiet.reporter.dispose()
 }
 
+{
+  // Task-66: the hourly ceiling stops SENDING for the rest of the hour; it does not forget
+  // what is queued. An error report is the durable half — the queue exists for it — so a
+  // spent allowance must delay it, not discard it. This was data loss rather than a tuning
+  // question: `queue.length = 0` took every error report with it.
+  //
+  // The two ceilings must also agree, and the way to make them agree is to derive one from
+  // the other rather than to restate it. Two numbers in one object that have to agree is the
+  // shape that put the window width in two places until task-64.
+  check('the hourly ceiling is derived from the per-minute one, not restated',
+    FOLD_LIMITS.MAX_PER_HOUR === FOLD_LIMITS.MAX_PER_MINUTE * 60,
+    JSON.stringify({ minute: FOLD_LIMITS.MAX_PER_MINUTE, hour: FOLD_LIMITS.MAX_PER_HOUR }))
+
+  let ceilingClock = 1_700_000_000_000
+  const ceilingPosts = []
+  // The per-minute ceiling is raised out of the way so the hourly one is what bites.
+  const ceiling = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { ceilingPosts.push(body); return { status: 200 } },
+    now: () => ceilingClock,
+    limits: { MAX_PER_MINUTE: 100, MAX_PER_HOUR: 2, SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  const ceilingFail = n => ceiling.noteFailure({
+    model: `m${n}`, route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: `boom ${n}`, ms: 4, at: ceilingClock,
+  })
+  ceilingFail(1)
+  ceilingFail(2)
+  await ceiling.flush({ settle: true })
+  check('two reports spend an hourly allowance of two', ceilingPosts.length === 2, String(ceilingPosts.length))
+  ceilingFail(3)
+  await ceiling.flush({ settle: true })
+  check('a report queued after the allowance is spent does not leave', ceilingPosts.length === 2,
+    String(ceilingPosts.length))
+  check('but it is kept rather than discarded', ceiling.summary().queued === 1,
+    JSON.stringify({ queued: ceiling.summary().queued, dropped: ceiling.summary().dropped }))
+  check('and it is not counted as dropped, because it was not', ceiling.summary().dropped === 0,
+    String(ceiling.summary().dropped))
+  ceilingClock += 3_600_000
+  await ceiling.flush()
+  check('it leaves once the hour refreshes, which is what its durability is for',
+    ceilingPosts.length === 3, String(ceilingPosts.length))
+  check('and the queue is then empty', ceiling.summary().queued === 0, String(ceiling.summary().queued))
+  ceiling.dispose()
+
+  // The disposable half is still dropped and counted at the ceiling rather than held,
+  // because there is nowhere to hold it: success windows are not persisted.
+  let windowClock = 1_700_000_000_000
+  const windowPosts = []
+  const atCeiling = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { windowPosts.push(body); return { status: 200 } },
+    now: () => windowClock,
+    limits: { MAX_PER_MINUTE: 100, MAX_PER_HOUR: 1, SUCCESS_WINDOW_MS: TEST_WINDOW },
+  })
+  atCeiling.noteFailure({ model: 'm', route: 'rustvy', kind: 'upstream_503', status: 503, code: 'PI_AI_ERROR', err: 'spends the allowance', ms: 4, at: windowClock })
+  await atCeiling.flush({ settle: true })
+  check('the single hourly slot is spent by the error report', windowPosts.length === 1, String(windowPosts.length))
+  atCeiling.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  windowClock += TEST_WINDOW + 1
+  await atCeiling.flush()
+  check('a success window at the ceiling is dropped, not held for an hour',
+    windowPosts.length === 1 && atCeiling.summary().successWindowsLost === 1,
+    JSON.stringify({ posts: windowPosts.length, lost: atCeiling.summary().successWindowsLost }))
+  check('and it does not stay in the queue either', atCeiling.summary().queued === 0,
+    String(atCeiling.summary().queued))
+  atCeiling.dispose()
+}
+
 // The serialiser on its own, for the inputs a hostile or truncated backlog can hold.
 check('successPayload survives a record with nothing in it', successPayload(undefined).kind === 'ok' && Array.isArray(successPayload(undefined).c),
   JSON.stringify(successPayload(undefined)))
@@ -2348,8 +2418,42 @@ check('successPayload drops a count with no model to attribute it to',
 check('successPayload never lets the window run backwards',
   successPayload({ t: 500, to: 100 }).window.to >= successPayload({ t: 500, to: 100 }).window.from,
   JSON.stringify(successPayload({ t: 500, to: 100 }).window))
-check('the exported window default is the contract default', SUCCESS_WINDOW_MS === 900_000 && FOLD_LIMITS.SUCCESS_WINDOW_MS === SUCCESS_WINDOW_MS,
+// Task-64 changed the default from fifteen minutes to one. The value is pinned here, and
+// the equality with the failure window is pinned beside it rather than left to coincidence:
+// a success settles a folded failure of the same model, so while the two widths differed a
+// success could close a failure window long after that window had expired on its own.
+check('the exported window default is the contract default', SUCCESS_WINDOW_MS === 60_000 && FOLD_LIMITS.SUCCESS_WINDOW_MS === SUCCESS_WINDOW_MS,
   String(SUCCESS_WINDOW_MS))
+check('and the success window is now the same width as the failure window',
+  SUCCESS_WINDOW_MS === FOLD_LIMITS.FAILURE_WINDOW_MS,
+  JSON.stringify({ success: SUCCESS_WINDOW_MS, failure: FOLD_LIMITS.FAILURE_WINDOW_MS }))
+
+{
+  // The two pins above assert the exported constant. These assert the consequence, with
+  // the shipped defaults rather than an injected `SUCCESS_WINDOW_MS`, which is what every
+  // other window test in this file does. A constant exported correctly and wired
+  // incorrectly passes the pins and fails this, and it is the only place in the suite where
+  // the real width is load-bearing rather than a parameter.
+  let realNow = 1_700_000_000_000
+  const realPosts = []
+  const real = createReporter({
+    endpoint: 'https://collector.test/api/report',
+    identity: { id: 'install-under-test' },
+    send: async body => { realPosts.push(body); return { status: 200 } },
+    now: () => realNow,
+  })
+  real.noteSuccess({ model: 'm', route: 'rustvy', ms: 100 })
+  realNow += 59_000
+  await real.flush()
+  check('with the shipped defaults the window is still open at 59 s', realPosts.length === 0, String(realPosts.length))
+  realNow += 2_000
+  await real.flush()
+  check('and it closes at 61 s rather than waiting fifteen minutes', realPosts.length === 1, String(realPosts.length))
+  check('the document it sends spans exactly one minute',
+    realPosts[0]?.window?.to - realPosts[0]?.window?.from === 60_000,
+    JSON.stringify(realPosts[0]?.window))
+  real.dispose()
+}
 
 const failed = results.filter(result => !result.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)

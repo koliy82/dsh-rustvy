@@ -151,7 +151,7 @@ for (const variant of VARIANTS) {
   console.log(`  one entry looks like: ${JSON.stringify(twelveDoc.c[0])}`)
   console.log(`  12 models:      ${String(size).padStart(4)} bytes   (current ${BASELINE}, delta +${size - BASELINE}, +${(100 * (size - BASELINE) / BASELINE).toFixed(1)}%)`)
   console.log(`  constant part:  ${String(constant).padStart(4)} bytes   per model: ${perModel} bytes   (both as a delta of two real documents)`)
-  console.log(`  8 h day, 32 windows:  body ${(dayBody / 1024).toFixed(1)} KiB   with HTTP headers ${(dayWire / 1024).toFixed(1)} KiB`)
+  console.log(`  ${HOURS} h day, ${windowsPerDay} windows:  body ${(dayBody / 1024).toFixed(1)} KiB   with HTTP headers ${(dayWire / 1024).toFixed(1)} KiB`)
   if (base) {
     console.log(`  growth over current:  body +${(100 * (dayBody - base.dayBody) / base.dayBody).toFixed(1)}%   on the wire +${(100 * (dayWire - base.dayWire) / base.dayWire).toFixed(1)}%  (the on-screen number is the one with headers)`)
   }
@@ -236,4 +236,75 @@ console.log(`  one entry looks like: ${JSON.stringify(realDoc?.c?.[0])}`)
 console.log(`  12 models: ${realSize} bytes   priced at ${PRICED_B}   ${realSize === PRICED_B ? 'MATCH — what ships is what was priced' : 'MISMATCH — what ships is not what the user agreed to'}`)
 console.log(`  documents for twelve models in one window: ${realBodies.length} (one, as priced)`)
 console.log(`  on the wire: ${(((realSize + HEADERS) * windowsPerDay) / 1024).toFixed(1)} KiB/day with headers`)
+
+console.log('')
+console.log('########## task-64: what the one-minute window actually costs ##########')
+console.log('')
+// Two corrections to the arithmetic that preceded this measurement.
+//
+// First, a one-minute window does not hold eight samples per model, it holds about one,
+// and a one-digit `n` beside a four-digit sum is a shorter entry than a one-digit `n`
+// beside a five-digit one. So the shipped document at a one-minute window is not the 774
+// that was priced at fifteen minutes; pricing it at 774 overstates the cost.
+//
+// Second, "requests avoided" was computed against every window in the day, but a window
+// only exists if a success landed in it. With 231 successes a day spread over 480 minutes
+// most minutes are empty and send nothing, so the report count is the number of OCCUPIED
+// windows, which is what the formula below computes rather than assumes.
+const shippedAt = (models, n, sum, max) => bytes(successPayload({
+  t: 1_761_763_200_000, to: 1_761_763_200_000 + SUCCESS_WINDOW_MS, route: 'rustvy',
+  id: ID, c: MODELS.slice(0, models).map(m => [m, { n, s: sum, x: max }]),
+}))
+const control = shippedAt(12, 8, 20140, 31204)
+console.log(`=== the shipped shape, priced at the sample counts each window really holds ===`)
+console.log(`  control, 12 models x 8 samples:  ${control} bytes   (must be 774: ${control === 774 ? 'MATCH' : 'MISMATCH - the numbers below are not comparable'})`)
+for (const [models, n, sum, max, label] of [
+  [1, 1, 2500, 2500, 'one model, one sample - a quiet minute'],
+  [3, 1, 2500, 2500, 'three models, one sample each'],
+  [12, 1, 2500, 2500, 'twelve models, one sample each'],
+  [3, 3, 7500, 3100, 'three models, three samples each - a busy minute'],
+]) {
+  const size = shippedAt(models, n, sum, max)
+  console.log(`  ${label.padEnd(44)} ${String(size).padStart(4)} bytes   ${(size + HEADERS)} on the wire`)
+}
+
+console.log('')
+console.log('=== occupied windows, not all windows ===')
+const SUCCESSES = 231
+const occupied = (windows, successes) => windows * (1 - Math.pow(1 - 1 / windows, successes))
+const MINUTE_WINDOWS = (HOURS * 3_600_000) / 60_000
+const QUARTER_WINDOWS = (HOURS * 3_600_000) / 900_000
+for (const [label, windows] of [['15-minute window', QUARTER_WINDOWS], ['1-minute window', MINUTE_WINDOWS]]) {
+  const active = occupied(windows, SUCCESSES)
+  console.log(`  ${label.padEnd(17)} ${String(windows).padStart(4)} windows in ${HOURS} h, ${SUCCESSES} successes -> ${active.toFixed(0)} occupied`)
+  console.log(`  ${''.padEnd(17)} reports ${active.toFixed(0)} instead of ${SUCCESSES}, so aggregation avoids ${(100 * (1 - active / SUCCESSES)).toFixed(0)}% of requests`)
+}
+console.log(`  the documented "86% of requests avoided" was measured at fifteen minutes;`)
+console.log(`  at one minute the window is comparable to the gap between successes and the saving collapses`)
+
+console.log('')
+console.log('=== the day, at the shipped shape and the occupied-window count ===')
+const minuteActive = occupied(MINUTE_WINDOWS, SUCCESSES)
+for (const [models, n, sum, max, label] of [[1, 1, 2500, 2500, '1 model'], [3, 1, 2500, 2500, '3 models'], [12, 1, 2500, 2500, '12 models']]) {
+  const size = shippedAt(models, n, sum, max)
+  const body = size * minuteActive
+  const wire = (size + HEADERS) * minuteActive
+  console.log(`  ${label.padEnd(9)} ${String(size).padStart(4)} B/doc x ${minuteActive.toFixed(0)} occupied = body ${(body / 1024).toFixed(1)} KiB/day, with headers ${(wire / 1024).toFixed(1)} KiB/day`)
+}
+console.log(`  and the ceiling case lead priced, twelve models with eight samples each:`)
+console.log(`    774 B x ${minuteActive.toFixed(0)} occupied = body ${(774 * minuteActive / 1024).toFixed(1)} KiB/day, with headers ${((774 + HEADERS) * minuteActive / 1024).toFixed(1)} KiB/day`)
+console.log(`    774 B x ${MINUTE_WINDOWS} if every minute is busy = body ${(774 * MINUTE_WINDOWS / 1024).toFixed(1)} KiB/day, with headers ${((774 + HEADERS) * MINUTE_WINDOWS / 1024).toFixed(1)} KiB/day`)
+
+console.log('')
+console.log('=== the send ceilings, because the request rate rose fifteenfold ===')
+const MAX_PER_MINUTE = 20
+const MAX_PER_HOUR = 240
+console.log(`  FOLD_LIMITS: MAX_PER_MINUTE ${MAX_PER_MINUTE}, MAX_PER_HOUR ${MAX_PER_HOUR}`)
+console.log(`  one continuously active route produces 60 success windows an hour`)
+for (const routes of [1, 2, 3, 4, 5]) {
+  const perHour = 60 * routes
+  const verdict = perHour > MAX_PER_HOUR ? `OVER the hourly ceiling by ${perHour - MAX_PER_HOUR} - windows are dropped` : `under it, ${MAX_PER_HOUR - perHour} left for error reports`
+  console.log(`  ${routes} route(s): ${String(perHour).padStart(3)}/hour, ${routes}/minute -> ${verdict}`)
+}
+console.log(`  at fifteen minutes the same ceiling allowed ${Math.floor(MAX_PER_HOUR / 4)} continuously active routes`)
 if (realSize !== PRICED_B) process.exit(1)

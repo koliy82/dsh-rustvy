@@ -320,7 +320,7 @@ Error collection:
 
 | Control | Default | Meaning |
 |---|---|---|
-| Отправлять успешные запросы | on | the denominator of the uptime percentage. Successes are aggregated into a window (15 minutes by default) and leave as one report rather than one per request: aggregation removes 86% of the requests compared with sending each. An empty window is never sent at all, so an idle machine pays nothing — a real zero, not a rounding. Switching it off stops sending but not counting: the counter keeps closing folded failures and keeps answering whether the observer is alive |
+| Отправлять успешные запросы | on | the denominator of the uptime percentage. Successes are aggregated into a window (1 minute by default) and leave as one report rather than one per request: aggregation removes 21% of the requests compared with sending each, where the former 15-minute window removed 86% — the window became comparable to the gap between successes, and the delay in the percentage was the price of that saving. An empty window is never sent at all, so an idle machine pays nothing — a real zero, not a rounding. Switching it off stops sending but not counting: the counter keeps closing folded failures and keeps answering whether the observer is alive |
 | Собирать ошибки rustvy | on | master switch for the collector: one line per infrastructure fault of the provider goes to the uptime collector. Off sends nothing, and the queue already on disk stays on disk |
 
 Both switches live in the **«Сбор данных Rustvy»** block — successes above errors, as the user
@@ -786,7 +786,7 @@ about one and the same outage:
 | Failure folding window | 60 seconds per model-and-kind pair: `ts` stays at the first failure, `meta.ms` is taken from the last, and the number of events grows in `meta.n` |
 | Queue delivery | every 15 seconds, up to 10 reports per flush — each in a request of its own, because that is what the collector asks for |
 | Per-minute ceiling | 20 reports per install — the direct counterpart of the collector's own 60 reports a minute per IP |
-| Per-install allowance | 240 reports an hour; beyond it they are dropped rather than accumulated |
+| Per-install allowance | 1200 reports an hour, derived from the per-minute one (20 × 60); beyond it sending **stops** until the next hour and the queue is kept and leaves after it — only success windows are dropped, because there is nowhere to keep them |
 | Queue ceiling | 500 reports; on overflow the oldest are dropped |
 | Retry after a refusal | 15 seconds, doubling up to 10 minutes |
 | One send's timeout | 10 seconds |
@@ -807,7 +807,7 @@ report dropped on somebody else's rate limit would be a real failure lost. That 
 60 reports a minute per IP, and this plugin's own stream stays below it by construction
 rather than by agreement: identical failures of one model fold into a single report per 60
 seconds, one flush carries at most 10 reports, the per-minute ceiling is 20 against their
-60, the hourly allowance is 240, and the queue does not grow past 500. This plugin is not
+60, the hourly allowance is 1200, and the queue does not grow past 500. This plugin is not
 why anybody gets a `429`.
 
 Every install shares one collector address, which is what the per-minute ceiling is

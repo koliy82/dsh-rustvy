@@ -175,16 +175,22 @@ await mounted.handle.dispose()
 // reporter's own constant published for display. If a hand edit could move it, the
 // published number would stop describing the aggregation actually in force and one
 // decider would have become two. Both normalization paths drop it, so it cannot.
-writeSettings({ successWindowMs: 60_000, collectSuccesses: true })
+// Task-64 made the default one minute, which silently vacuated this pair: it wrote
+// `successWindowMs: 60_000` as the hand-edit that must be ignored and asserted the published
+// value was the default, so once the default became 60_000 the assertion passed whether or
+// not the override was honoured. The probe value must differ from the default for the check
+// to mean anything, so it now writes the old default. Fixed by errors-core, whose constant
+// this pins; the probe value is host-wiring's to revisit.
+writeSettings({ successWindowMs: 900_000, collectSuccesses: true })
 mounted = await stateOf()
-check('a hand-edited window is ignored, not honoured', mounted.answer?.config?.successWindowMs === 900_000, String(mounted.answer?.config?.successWindowMs))
+check('a hand-edited window is ignored, not honoured', mounted.answer?.config?.successWindowMs === 60_000, String(mounted.answer?.config?.successWindowMs))
 await mounted.handle.dispose()
 
 writeSettings({})
 const windowPatch = await stateOf()
-await windowPatch.call('POST', '/dsh-rustvy/config', { successWindowMs: 60_000 })
+await windowPatch.call('POST', '/dsh-rustvy/config', { successWindowMs: 900_000 })
 const afterWindowPatch = await windowPatch.call('GET', '/dsh-rustvy/state')
-check('the settings write cannot move it either', afterWindowPatch.json?.config?.successWindowMs === 900_000, String(afterWindowPatch.json?.config?.successWindowMs))
+check('the settings write cannot move it either', afterWindowPatch.json?.config?.successWindowMs === 60_000, String(afterWindowPatch.json?.config?.successWindowMs))
 await windowPatch.handle.dispose()
 
 rmSync(PROFILE, { recursive: true, force: true })
