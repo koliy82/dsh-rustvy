@@ -264,6 +264,42 @@ because it is the only block that answers the question the page is opened with �
 model about to be picked alive — and the mirror comes last, next to the warning about a
 failed catalog read that only it is the subject of.
 
+Inside the **«Зеркало каталога»** box, beside the other network facts, lives the plugin's proxy:
+a family selector **«Тип прокси»** with two positions — **HTTP(S)** and **SOCKS** — an address
+field, a switch, «Записать» and «Проверить прокси». The address carries no scheme: the field
+takes `login:password@host:port` and the family is chosen only by the selector, so the string and
+the selector cannot disagree. `HTTP(S)` means "a proxy that speaks HTTP", and in this release the
+connection to it is always plaintext: automatic transport discovery is not implemented. The client is
+already written to print the transport sentence the moment the host half starts publishing it — until
+then that sentence says nothing rather than drawing a dash. `SOCKS` means SOCKS5, and SOCKS4 is refused
+loudly with text pointing at the selector. The family is never inferred from the address: a
+password says nothing about encryption of the connection to the proxy — an authenticated HTTP
+proxy is the common case in the wild — and nothing about the SOCKS handshake version, where a
+SOCKS5 server without auth still rejects a SOCKS4 greeting. Changing position rebuilds the
+transport even with the same `host:port`, so the selector writes immediately rather than waiting
+for «Записать». The status line above them says
+one of four things — an installed proxy is shown **masked**, a switched-off one reads «выключен»,
+an enabled one that failed to install carries the host's own words in the warning colour, and a
+host that publishes no proxy at all gets a dash. The field is the only place on the page where
+the address is visible in full, password included: it has to show exactly what is stored even
+when the string cannot be parsed, because a field that quietly corrected the value would
+disagree with the file invisibly.
+
+Unlike every other field on the page, this one does not save when it loses focus, and that is
+not an inconsistency: «Проверить прокси» is a button beside the field, pressing a button blurs
+it, and saving on blur would mean the probe first wrote the address and then reported that it
+had written nothing. Only «Записать» writes. The probe answers with three different sentences
+rather than two states: **any** provider response, 502 and 503 included, means the proxy works,
+because the request went through it and the status is information rather than failure; only no
+response at all counts as not carrying it — refused, timeout, DNS; and when the string could not
+be parsed, no request was sent at all, which is a mistake in the text and not in the proxy. A
+failure of the probe itself is reported separately, as the fourth case, because it sends the
+user to his network or to the plugin rather than to his text. The sentence names which address
+was probed — the typed one, not yet written, or the stored one — since "the proxy works" about a
+string the user never applied needs a visible subject. The probe saves nothing and switches
+nothing on, and the page says so when the switch is off: "the test passed" beside a proxy that
+is off is exactly the confusion that gets reported as a bug.
+
 Marks:
 
 | Control | Default | Meaning |

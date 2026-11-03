@@ -292,8 +292,13 @@ try {
     now: () => gateClock,
     limits: { MAX_PER_MINUTE: 1, MAX_BATCH: 5 },
   })
-  gate.noteFailure({ model: 'a', kind: 'dns', err: 'ENOTFOUND', at: gateClock })
-  gate.noteFailure({ model: 'b', kind: 'dns', err: 'ENOTFOUND', at: gateClock + 10 })
+  // Both fixtures carry a status on purpose. A status-less failure is suppressed as
+  // unanswered and never reaches the queue, so with the old `dns` fixtures this block would
+  // have measured nothing at all and reported `sent 0, queued 0` — a green-looking zero.
+  // What is under test here is the ceiling, not the classification, so the failure has to be
+  // one that the suppression rule lets through.
+  gate.noteFailure({ model: 'a', kind: 'http_503', status: 503, err: 'the origin is down', at: gateClock })
+  gate.noteFailure({ model: 'b', kind: 'http_503', status: 503, err: 'the origin is down', at: gateClock + 10 })
   gate.start()
   await gate.flush({ settle: true })
   const throttled = gate.summary()

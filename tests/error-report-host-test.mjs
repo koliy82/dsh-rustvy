@@ -139,7 +139,7 @@ writeFileSync(join(STATE, 'catalog.json'), `${JSON.stringify({
 }, null, 2)}\n`)
 
 const { start, build } = await import('../lib/host.js')
-const { classifyFailure, FOLD_LIMITS, createReporter, successPayload, SUCCESS_WINDOW_MS } = await import('../lib/errors.js')
+const { classifyFailure, FOLD_LIMITS, createReporter, successPayload, reportPayload, SUCCESS_WINDOW_MS } = await import('../lib/errors.js')
 
 /**
  * A clock the test moves.
@@ -632,7 +632,8 @@ check('a connect timeout is named as one', timeout.kind === 'connect_timeout', S
 const IDLE_TIMEOUT = 'LLM stream idle timeout after 300000 ms (LLM_STREAM_IDLE_TIMEOUT)'
 const idle = classifyFailure({ message: IDLE_TIMEOUT, code: 'TIMEOUT' })
 check('an idle stream watchdog is infrastructure', idle.infra === true, JSON.stringify(idle))
-check('an idle stream watchdog is a timeout, not a connect timeout', idle.kind === 'timeout', String(idle.kind))
+check('an idle stream watchdog is its own kind, not a connect timeout and not a request timeout',
+  idle.kind === 'idle_timeout', String(idle.kind))
 
 // Each row names the kind it must be classified as, so the table pins both halves
 // of the verdict: that it is not infrastructure, and what it is instead. The kind
@@ -754,9 +755,18 @@ check('an accepted report is the last answer the summary keeps', first.answer.js
 
 // A connect timeout has no HTTP status at all, and the API takes `status` only
 // when there is one — so the field must be absent, not zero.
+// A connect timeout has no HTTP status at all, so under the unanswered-failure rule it is
+// suppressed and never reaches the wire. The property this block used to prove through the
+// reporter — that the API takes `status` only when there is one, so the field must be absent
+// rather than zero — therefore has to be proved where it actually lives now, the serialiser.
+// Both halves are asserted, because losing either would hide a different thing: the first
+// that the suppression really covers a slow status-less failure, the second that a record
+// with no status does not go out carrying `status: 0`.
 const timed = await reportOf({ message: CONNECT_TIMEOUT, code: 'TRANSPORT' })
-check('a connect timeout is reported', timed.drained.reports.length === 1, JSON.stringify(timed.drained.reports))
-check('a connect timeout is reported as one', timed.drained.reports[0]?.code === 'connect_timeout', String(timed.drained.reports[0]?.code))
+check('a status-less connect timeout is suppressed rather than reported', timed.drained.reports.length === 0, JSON.stringify(timed.drained.reports))
+const noStatusDoc = reportPayload({ t: 1, model: 'm', ok: false, status: 0, err: CONNECT_TIMEOUT, code: 'TRANSPORT', kind: 'connect_timeout', route: 'rustvy', id: 'install-under-test' })
+check('and a record with no status still carries no status field, rather than a zero one',
+  !('status' in noStatusDoc) && noStatusDoc.code === 'connect_timeout', JSON.stringify(noStatusDoc))
 check('a connect timeout carries no status field', !('status' in (timed.drained.reports[0] ?? {})), JSON.stringify(timed.drained.reports[0]))
 
 // --- the watcher's own counters --------------------------------------------
@@ -845,10 +855,14 @@ check("a key's route is reported under the clone, not the base", ringDrain.repor
 // --- the thrown seam -------------------------------------------------------
 const thrown = await begin('sess-thrown', 'rustvy', MODEL)
 await tick()
-endTurn(thrown, { kind: 'error', error: { message: IDLE_TIMEOUT, code: 'TIMEOUT' } })
+// The fixture carries a status on purpose. What this block tests is the thrown seam, not
+// the classification of an idle timeout, and a status-less fixture would now be suppressed
+// before the seam could be observed at all. `code` becomes `http_504` for the same reason:
+// any status makes the classifier name the status, which is asserted elsewhere.
+endTurn(thrown, { kind: 'error', error: { message: IDLE_TIMEOUT, code: 'TIMEOUT', status: 504 } })
 const thrownDrain = await drain()
 check('a thrown fault is reported once', thrownDrain.reports.length === 1, JSON.stringify(thrownDrain.reports))
-check('a thrown fault is reported as a timeout', thrownDrain.reports[0]?.code === 'timeout', String(thrownDrain.reports[0]?.code))
+check('a thrown fault is reported under the status it carried', thrownDrain.reports[0]?.code === 'http_504', String(thrownDrain.reports[0]?.code))
 check('a thrown fault keeps the harness code beside it', thrownDrain.reports[0]?.meta?.harnessCode === 'TIMEOUT', String(thrownDrain.reports[0]?.meta?.harnessCode))
 check('a thrown fault carries its duration', Number.isInteger(thrownDrain.reports[0]?.meta?.ms) && thrownDrain.reports[0].meta.ms > 0, String(thrownDrain.reports[0]?.meta?.ms))
 
@@ -931,7 +945,10 @@ check('the status is still parsed out of the message', topDrain.reports[0]?.stat
 // level: the merge has to work in both directions.
 const splitShape = await begin('sess-split', 'rustvy', MODEL)
 await tick()
-await failEvent(splitShape, { code: 'TRANSPORT' }, { message: 'fetch failed: other side closed' })
+// The message carries a status so the merge is observable: what this block tests is that the
+// code comes from `failure` and the message from the top level, and a status-less fixture
+// would now be suppressed before either could be checked.
+await failEvent(splitShape, { code: 'TRANSPORT' }, { message: '502: fetch failed: other side closed' })
 const splitDrain = await drain()
 check('a split payload still classifies', splitDrain.reports.length === 1, JSON.stringify(splitDrain.reports))
 check('the top-level message is used', String(splitDrain.reports[0]?.message ?? '').includes('other side closed'), String(splitDrain.reports[0]?.message))
@@ -1013,8 +1030,11 @@ check('a folded report counts both', foldedDrain.reports[0]?.meta?.n === 2, Stri
 check('a folded report keeps the kind', foldedDrain.reports[0]?.code === 'upstream_502', String(foldedDrain.reports[0]?.code))
 
 // --- a message that carries a secret and a path ----------------------------
+// The status prefix is there so the scrubbing is observable at all: a status-less failure is
+// now suppressed and would never be serialised, so there would be nothing to scrub and the
+// three assertions below would pass vacuously against `undefined`.
 const leaky = await reportOf({
-  message: `Connect Timeout Error for key ${SECRET} reading ${WINDOWS_PATH}`,
+  message: `502: Connect Timeout Error for key ${SECRET} reading ${WINDOWS_PATH}`,
   code: 'TRANSPORT',
 }, 'rustvy', 'sess-leak')
 const scrubbed = leaky.drained.reports[0]
@@ -1035,8 +1055,10 @@ check('the queue file carries no secret either', !existsSync(join(STATE, 'errors
 
 // Scrubbing must keep the one thing a monitor needs: which endpoint failed. A rule
 // that blanked paths by reading `s:/` in `https://` as a drive letter would eat it.
+// Status prefix for the same reason as the leaky fixture above: this tests that scrubbing
+// keeps the endpoint, and a suppressed failure has no message to keep it in.
 const located = await reportOf({
-  message: 'fetch failed for https://rustvy.xyz/v1/chat/completions: other side closed',
+  message: '502: fetch failed for https://rustvy.xyz/v1/chat/completions: other side closed',
   code: 'TRANSPORT',
 }, 'rustvy', 'sess-where')
 check('a transport reset is reported', located.drained.reports.length === 1, JSON.stringify(located.drained.reports))
@@ -1484,7 +1506,7 @@ const orphanSession = {
 const beforeOrphan = await summary()
 emit('session/event', orphanSession, {
   type: 'turn/end',
-  data: { turn: 3, reason: { kind: 'error', error: { message: 'pi-ai stream idle timeout after 300000ms', code: 'TIMEOUT' } } },
+  data: { turn: 3, reason: { kind: 'error', error: { message: 'pi-ai stream idle timeout after 300000ms', code: 'TIMEOUT', status: 504 } } },
 })
 await tick()
 const orphanDrain = await drain()
@@ -2417,49 +2439,207 @@ function windowReporter(overrides = {}) {
     instant.reporter.dispose()
   }
 
-  // The kinds that need an established connection, or that name the provider, are not in
-  // the local set — so «terminated» on a live network is NOT suppressed, and the threshold
-  // is not what protects it. The kind is.
-  for (const [kind, label] of [['connect_timeout', 'a connect timeout, which carries no status and is asserted reported above'], ['reset', 'the server aborting a live connection'], ['timeout', 'stream silence'], ['tls', 'a certificate failure'], ['server', 'the provider naming its own failure'], ['unknown', 'an unclassified failure']]) {
-    const remote = suppressionReporter()
-    note(remote.reporter, { kind, status: 0, ms: 18, err: 'whatever the wording was' })
-    await remote.reporter.flush({ settle: true })
-    check(`a status-less ${kind} at 18 ms still leaves, because it is ${label}`,
-      remote.state.posts.length === 1 && remote.reporter.summary().suppressedNetworkErrors === 0,
-      JSON.stringify({ posts: sent(remote.state), suppressed: remote.reporter.summary().suppressedNetworkErrors }))
-    remote.reporter.dispose()
+  // The never-answered family: a connection that never opened. Suppressed at any duration and
+  // with no status, which is the part of the earlier instruction that was right — a 62-second
+  // VPN-off hang walked through a gate whose proxy for «local» was «instant».
+  for (const kind of ['dns', 'refused', 'unreachable', 'transport', 'connect_timeout']) {
+    const neverAnswered = suppressionReporter()
+    note(neverAnswered.reporter, { kind, status: 0, ms: 62_457, err: 'Connection error.' })
+    await neverAnswered.reporter.flush({ settle: true })
+    check(`a status-less ${kind} at 62457 ms is suppressed: nothing on the path ever answered`,
+      neverAnswered.state.posts.length === 0 && neverAnswered.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(neverAnswered.state), suppressed: neverAnswered.reporter.summary().suppressedNetworkErrors }))
+    neverAnswered.reporter.dispose()
   }
 
-  // Stream silence, three orders of magnitude above the local signature.
-  const silence = suppressionReporter()
-  note(silence.reporter, { kind: 'transport', status: 0, ms: 300_000, err: 'body stream error' })
-  await silence.reporter.flush({ settle: true })
-  check('stream silence at 300000 ms is not suppressed even under a transport kind',
-    silence.state.posts.length === 1 && silence.reporter.summary().suppressedNetworkErrors === 0,
-    JSON.stringify(sent(silence.state)))
-  silence.reporter.dispose()
-
-  // The threshold is a bound: at it and above it, the error leaves.
-  for (const ms of [500, 501, 5000]) {
-    const atThreshold = suppressionReporter()
-    note(atThreshold.reporter, { kind: 'transport', status: 0, ms, err: 'slow enough to be something else' })
-    await atThreshold.reporter.flush({ settle: true })
-    check(`a transport failure at ${ms} ms is at or above the threshold and leaves`,
-      atThreshold.state.posts.length === 1, JSON.stringify(sent(atThreshold.state)))
-    atThreshold.reporter.dispose()
+  // The family that started answering and then stopped. These arrive **without a status too**,
+  // which is precisely why the status cannot be the discriminator: a stream that stopped
+  // mid-answer and a connection that never opened look identical on that one field. The first
+  // case is the record wrongly deleted from production — `pi-ai stream idle timeout after
+  // 300000ms` is rustvy's long-poll giving up, server-side conduct the user wants to see, with
+  // its message and its 300 011 ms.
+  // Both loops below are driven through the real `classifyFailure`: the message and the harness
+  // code go in and the kind comes out, and the suppression decision is asserted on that kind.
+  // Passing a kind literal instead would let these rows keep asserting a decision the classifier
+  // no longer makes — which is exactly how collapsing `idle_timeout` back into `timeout` reddened
+  // one assertion rather than these. The distinction between "the server went silent mid-answer"
+  // and "nothing ever answered" is guarded where it is made, not where it is restated.
+  for (const [expectedKind, ms, err, label] of [
+    ['idle_timeout', 300_011, 'pi-ai stream idle timeout after 300000ms', "rustvy's long-poll giving up, the record that was wrongly deleted"],
+    ['reset', 88_803, 'terminated', 'a terminated stream at its production figure'],
+    ['reset', 232_000, 'premature close', 'a premature close, which needs a connection the other side opened'],
+    ['tls', 62_457, 'TLS handshake failed: certificate has expired', 'a certificate failure'],
+    ['server', 62_457, 'bad gateway', 'the provider naming its own failure'],
+    ['unknown', 62_457, 'something nobody classified', 'an unclassified failure'],
+  ]) {
+    const stopped = suppressionReporter()
+    const classified = classifyFailure({ message: err, code: 'UNKNOWN' })
+    check(`${label} classifies as ${expectedKind} with no status`,
+      classified.kind === expectedKind && classified.status === 0,
+      JSON.stringify({ kind: classified.kind, status: classified.status }))
+    note(stopped.reporter, { kind: classified.kind, status: classified.status, ms, code: classified.code, err })
+    await stopped.reporter.flush({ settle: true })
+    check(`${label} is sent even though it carries no status`,
+      stopped.state.posts.length === 1 && stopped.reporter.summary().suppressedNetworkErrors === 0,
+      JSON.stringify({ posts: sent(stopped.state), suppressed: stopped.reporter.summary().suppressedNetworkErrors }))
+    check(`and it carries its own message and its ${ms} ms`,
+      String(stopped.state.posts[0]?.message ?? '').includes(err.slice(0, 20)) && stopped.state.posts[0]?.meta?.ms === ms,
+      JSON.stringify({ message: stopped.state.posts[0]?.message, ms: stopped.state.posts[0]?.meta?.ms }))
+    stopped.reporter.dispose()
   }
 
-  // An unmeasured duration is not an instant one. `lib/host.js` reports `ms: 0` when no
-  // attempt matched, and zero there means "unknown". Suppressing on it would discard a
-  // real failure whose duration nobody measured.
-  for (const ms of [0, undefined, null, -5, Number.NaN]) {
-    const unmeasured = suppressionReporter()
-    note(unmeasured.reporter, { kind: 'transport', status: 0, ms, err: 'no attempt matched this one' })
-    await unmeasured.reporter.flush({ settle: true })
-    check(`an unmeasured duration (${String(ms)}) is not read as instant, so the error leaves`,
-      unmeasured.state.posts.length === 1 && unmeasured.reporter.summary().suppressedNetworkErrors === 0,
-      JSON.stringify({ posts: sent(unmeasured.state), suppressed: unmeasured.reporter.summary().suppressedNetworkErrors }))
-    unmeasured.reporter.dispose()
+  // The duration is no longer the discriminator. A status-less connectivity failure is this
+  // machine's path to the provider, and the standing decision is that those are the client's
+  // and stay invisible — however long the hang lasted. The production record that proved the
+  // duration rule wrong: `code: 'transport'`, `message: 'Connection error.'`, `meta.ms`
+  // 62457, shipped from 1.3.1. Sixty-two seconds of a VPN being off, which sailed through a
+  // gate whose proxy for "local" was "instant".
+  const production = suppressionReporter()
+  note(production.reporter, { kind: 'transport', status: 0, ms: 62_457, err: 'Connection error.' })
+  await production.reporter.flush({ settle: true })
+  check('the production record — a 62 s status-less transport failure — is suppressed and counted',
+    production.state.posts.length === 0 && production.reporter.summary().suppressedNetworkErrors === 1,
+    JSON.stringify({ posts: sent(production.state), suppressed: production.reporter.summary().suppressedNetworkErrors }))
+  production.reporter.dispose()
+
+  // Suppressed at every duration, including one nobody measured. A slow block is still a
+  // block: a TSPU reset or a dead route is slow, so "instant means local" let through
+  // exactly the case the user reported.
+  for (const [ms, label] of [[3, '3 ms, instant'], [79, '79 ms, the local blip'], [500, '500 ms, the old bound'], [5000, '5 s'], [62_457, '62457 ms, the production record'], [300_000, '300 s, a long hang'], [0, '0, which lib/host.js reports when no attempt matched'], [undefined, 'absent'], [null, 'null'], [-5, 'negative'], [Number.NaN, 'not a number']]) {
+    const anyDuration = suppressionReporter()
+    note(anyDuration.reporter, { kind: 'transport', status: 0, ms, err: 'Connection error.' })
+    await anyDuration.reporter.flush({ settle: true })
+    check(`a status-less transport failure is suppressed at ${label}`,
+      anyDuration.state.posts.length === 0 && anyDuration.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(anyDuration.state), suppressed: anyDuration.reporter.summary().suppressedNetworkErrors }))
+    anyDuration.reporter.dispose()
+  }
+
+  // The whole connectivity family, at the duration that used to escape the gate.
+  for (const kind of ['dns', 'refused', 'unreachable', 'transport']) {
+    const slow = suppressionReporter()
+    note(slow.reporter, { kind, status: 0, ms: 62_457, err: 'the path to the provider is down' })
+    await slow.reporter.flush({ settle: true })
+    check(`a slow status-less ${kind} is suppressed too`,
+      slow.state.posts.length === 0 && slow.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(slow.state), suppressed: slow.reporter.summary().suppressedNetworkErrors }))
+    slow.reporter.dispose()
+  }
+
+  // What still leaves is decided by one thing only: whether anything answered. A status —
+  // any status, including a 4xx — proves the gateway spoke, and the refusal path is what
+  // reports a provider saying no. Duration no longer appears in the rule at all, so these
+  // fixtures all use the production record's 62 s and the stream-silence 300 s.
+  for (const [kind, status, ms, label] of [
+    ['http_502', 502, 62_457, 'a 502 that hung for a minute'],
+    ['http_503', 503, 300_000, 'a 503 after five minutes of silence'],
+    ['http_400', 400, 62_457, 'a 400, which the refusal path reports'],
+    ['http_429', 429, 62_457, 'a 429 the gateway itself answered'],
+  ]) {
+    const answered = suppressionReporter()
+    note(answered.reporter, { kind, status, ms, err: 'the gateway spoke' })
+    await answered.reporter.flush({ settle: true })
+    check(`${label} leaves, because something answered`,
+      answered.state.posts.length === 1 && answered.reporter.summary().suppressedNetworkErrors === 0,
+      JSON.stringify({ posts: sent(answered.state), suppressed: answered.reporter.summary().suppressedNetworkErrors }))
+    answered.reporter.dispose()
+  }
+
+  // The pair that matters most: the same kind, at the same duration, decided by the family and
+  // not by the presence or absence of a status. A `transport` failure never opened a connection;
+  // anything the gateway answered did.
+  for (const [kind, status, ms, label, shouldSend] of [
+    ['transport', 0, 62_457, 'a transport failure with no status', false],
+    ['connect_timeout', 0, 62_457, 'a connect timeout with no status', false],
+    ['transport', 502, 62_457, 'a transport-worded failure the gateway answered with a 502', true],
+    ['http_502', 502, 62_457, 'a 502 that hung for a minute', true],
+    ['http_503', 503, 300_000, 'a 503 after five minutes of silence', true],
+  ]) {
+    const decided = suppressionReporter()
+    note(decided.reporter, { kind, status, ms, err: 'the discriminator is the family' })
+    await decided.reporter.flush({ settle: true })
+    check(`${label} ${shouldSend ? 'is sent' : 'is suppressed'}`,
+      shouldSend
+        ? decided.state.posts.length === 1 && decided.reporter.summary().suppressedNetworkErrors === 0
+        : decided.state.posts.length === 0 && decided.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(decided.state), suppressed: decided.reporter.summary().suppressedNetworkErrors }))
+    decided.reporter.dispose()
+  }
+
+  // The second route to suppression: the harness's own verdict. A `reset` reading «terminated»
+  // is not in the never-answered family, so the family alone would send it — but `TRANSPORT`
+  // says no response was ever received, and that is a verdict from the layer that made the
+  // request rather than prose this module infers from a message. The production record is the
+  // `reset` at 191 164 ms from the 18:40 window.
+  // The production `reset` carries `harnessCode: 'TRANSPORT'` and is **sent**. A stream that
+  // existed is evidence something answered, and that outranks the harness code: «terminated»
+  // needs a response that began, so it is not the same fact as a connection that never opened.
+  const productionReset = suppressionReporter()
+  note(productionReset.reporter, { kind: 'reset', status: 0, ms: 191_164, code: 'TRANSPORT', err: 'terminated' })
+  await productionReset.reporter.flush({ settle: true })
+  check('the production reset — harnessCode TRANSPORT, "terminated", 191164 ms — is sent, because a stream existed',
+    productionReset.state.posts.length === 1 && productionReset.reporter.summary().suppressedNetworkErrors === 0,
+    JSON.stringify({ posts: sent(productionReset.state), suppressed: productionReset.reporter.summary().suppressedNetworkErrors }))
+  check('and it carries its own message and its 191164 ms',
+    String(productionReset.state.posts[0]?.message ?? '').includes('terminated') && productionReset.state.posts[0]?.meta?.ms === 191_164,
+    JSON.stringify({ message: productionReset.state.posts[0]?.message, ms: productionReset.state.posts[0]?.meta?.ms }))
+  productionReset.reporter.dispose()
+
+  // The same reset without the harness verdict travels. «terminated» on its own is prose, and
+  // nothing here claims to know whether a response began before it stopped.
+  const unverifiedReset = suppressionReporter()
+  note(unverifiedReset.reporter, { kind: 'reset', status: 0, ms: 191_164, code: 'UNKNOWN', err: 'terminated' })
+  await unverifiedReset.reporter.flush({ settle: true })
+  check('the same reset without a TRANSPORT verdict is sent, because nothing says no response came',
+    unverifiedReset.state.posts.length === 1 && unverifiedReset.reporter.summary().suppressedNetworkErrors === 0,
+    JSON.stringify({ posts: sent(unverifiedReset.state), suppressed: unverifiedReset.reporter.summary().suppressedNetworkErrors }))
+  unverifiedReset.reporter.dispose()
+
+  // The two harness codes, separated by whether a response began. «Request timed out.» is a
+  // request deadline with nothing behind it — the user proved it by switching his proxy off and
+  // watching these three go to the server — so it is suppressed. The stream idle timeout is the
+  // server going quiet mid-answer, so it is sent with its message and its duration. The kind
+  // carries the distinction; the harness code alone cannot, because both read `TIMEOUT`.
+  for (const [expectedKind, code, ms, err, shouldSend, label] of [
+    ['timeout', 'TIMEOUT', 10_487, 'Request timed out.', false, 'a request timeout at its production figure'],
+    ['timeout', 'TIMEOUT', 10_381, 'Request timed out.', false, 'a second one from the same window, on another model'],
+    ['timeout', 'TIMEOUT', 10_556, 'Request timed out.', false, 'a third one from the same window'],
+    ['idle_timeout', 'TIMEOUT', 300_011, 'pi-ai stream idle timeout after 300000ms', true, 'the stream idle timeout the user insisted must stay visible'],
+    ['reset', 'TRANSPORT', 191_164, 'terminated', true, 'a terminated stream, which is evidence a response began'],
+  ]) {
+    const coded = suppressionReporter()
+    const classified = classifyFailure({ message: err, code })
+    check(`${label} classifies as ${expectedKind} and not as its neighbour`,
+      classified.kind === expectedKind && classified.status === 0,
+      JSON.stringify({ kind: classified.kind, status: classified.status, harnessCode: classified.code }))
+    note(coded.reporter, { kind: classified.kind, status: classified.status, ms, code: classified.code, err })
+    await coded.reporter.flush({ settle: true })
+    check(`${label} is ${shouldSend ? 'sent' : 'suppressed'}`,
+      shouldSend
+        ? coded.state.posts.length === 1 && coded.reporter.summary().suppressedNetworkErrors === 0
+        : coded.state.posts.length === 0 && coded.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(coded.state), suppressed: coded.reporter.summary().suppressedNetworkErrors }))
+    if (shouldSend) {
+      check(`and it carries its own message and its ${ms} ms`,
+        String(coded.state.posts[0]?.message ?? '').includes(err.slice(0, 20)) && coded.state.posts[0]?.meta?.ms === ms,
+        JSON.stringify({ message: coded.state.posts[0]?.message, ms: coded.state.posts[0]?.meta?.ms }))
+    }
+    coded.reporter.dispose()
+  }
+
+  // Both routes are live. If either were dead the rule would look identical from outside, and
+  // a mutant removing one would leave the suite green.
+  for (const [kind, code, label] of [
+    ['transport', 'UNKNOWN', 'the family, with no harness verdict'],
+    ['unknown', 'TRANSPORT', 'the harness verdict, with a kind in neither set'],
+  ]) {
+    const routed = suppressionReporter()
+    note(routed.reporter, { kind, status: 0, ms: 62_457, code, err: 'Connection error.' })
+    await routed.reporter.flush({ settle: true })
+    check(`suppression reached through ${label}`,
+      routed.state.posts.length === 0 && routed.reporter.summary().suppressedNetworkErrors === 1,
+      JSON.stringify({ posts: sent(routed.state), suppressed: routed.reporter.summary().suppressedNetworkErrors }))
+    routed.reporter.dispose()
   }
 
   // A suppressed error is not a success: it settles no folded failure of the same model,

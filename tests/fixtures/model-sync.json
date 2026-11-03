@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Hand-captured fixture for tests/model-sync-host-test.mjs. Captured once from the live",
+    "provider and collector on 2026-11-02 and then edited by hand, deliberately: a test that",
+    "reads the live world tests the provider rather than the code. On 2026-11-02 the provider",
+    "dropped five models in the morning and re-enabled them in the afternoon, reddening this",
+    "suite twice inside prepublishOnly for reasons that were not defects.",
+    "",
+    "Nothing here is 'the current truth'. The live enabled count was 9, then 14, and it will",
+    "oscillate again. These ids exist to express transitions the code must handle, and the",
+    "fixture is free to hold states the live provider does not offer today.",
+    "",
+    "Every id below is named in _roles so a reader can see what each one is for. An id with no",
+    "role is decoration and proves nothing."
+  ],
+  "_roles": {
+    "glm-5.3": "served, installed, and stays served: the stable case, and the only model whose output cap differs from the others, so a capacity read is distinguishable from a default",
+    "claude-opus-5-5": "served and installed with a full description and a hand-written compat: proves both survive regeneration rather than being rebuilt from the catalogue",
+    "fable-ultra-promax": "installed but NOT served: the plan must retire it, and its compat must not be carried onto anything else",
+    "deepseek-v4.1-flash": "installed but NOT served: a second retirement, so the assertion is not about one lucky id",
+    "kimi-k3": "served and in the catalogue but NOT installed: the plan must add it — the re-addition direction, which is what a retirement-only fixture would have missed",
+    "qwen3.8-max": "served, in the catalogue under its canonical id AND under a zonal twin: the badge bug, where two catalogues disagreed about an id and the model the user picks lost its mark",
+    "abyss/qwen3.8-max": "the zonal twin of qwen3.8-max: same name, same icon, must not shadow the canonical id",
+    "no-icon-model": "served and in the catalogue with an empty icon name: an icon absence is an ordinary answer and must not drop the record",
+    "no-capacity-model": "served and in the catalogue with no contextK and no maxOutputTokens: the plan must say the window is unpublished rather than inventing one",
+    "fixture-only-sentinel": "present in the catalogue but never served and never installed. Its only job is provenance: if it reaches the mirror, the mirror came from this file and not from the network"
+  },
+  "catalog": {
+    "version": 9001,
+    "fetchedAt": 1793600000000,
+    "source": "fixture",
+    "folded": 2,
+    "disabled": 3,
+    "lastError": "",
+    "lastAttempt": 1793600000000,
+    "models": [
+      { "id": "glm-5.3", "name": "GLM 5.3", "vendor": "zhipu", "vendorLabel": "Zhipu", "icon": "zhipu.svg", "hot": false, "free": false, "contextK": 1000, "maxOutputTokens": 8192, "modalities": ["text"], "reasoningLevels": ["low", "medium", "high", "max"] },
+      { "id": "claude-opus-5-5", "name": "OPUS 5.5", "vendor": "anthropic", "vendorLabel": "Anthropic", "icon": "anthropic.svg", "hot": true, "free": false, "contextK": 1000, "maxOutputTokens": 128000, "modalities": ["text", "image"], "reasoningLevels": ["low", "medium", "high", "max"] },
+      { "id": "kimi-k3", "name": "Kimi K3", "vendor": "moonshot", "vendorLabel": "Moonshot", "icon": "kimi.svg", "hot": false, "free": false, "contextK": 256, "maxOutputTokens": 65536, "modalities": ["text"], "reasoningLevels": ["low", "high"] },
+      { "id": "qwen3.8-max", "name": "Qwen3.8 Max", "vendor": "qwen", "vendorLabel": "Qwen", "icon": "qwen.svg", "hot": false, "free": false, "contextK": 1000, "maxOutputTokens": 128000, "modalities": ["text", "image"], "reasoningLevels": ["low", "high"] },
+      { "id": "abyss/qwen3.8-max", "name": "Qwen3.8 Max", "vendor": "qwen", "vendorLabel": "Qwen", "icon": "qwen.svg", "hot": false, "free": false, "contextK": 1000, "maxOutputTokens": 128000, "modalities": ["text", "image"], "reasoningLevels": ["low", "high"] },
+      { "id": "no-icon-model", "name": "No Icon", "vendor": "generic", "vendorLabel": "Generic", "icon": "", "hot": false, "free": true, "contextK": 32, "maxOutputTokens": 4096, "modalities": ["text"], "reasoningLevels": [] },
+      { "id": "no-capacity-model", "name": "No Capacities", "vendor": "generic", "vendorLabel": "Generic", "icon": "generic.svg", "hot": false, "free": false, "modalities": ["text"], "reasoningLevels": [] },
+      { "id": "fixture-only-sentinel", "name": "Fixture Sentinel", "vendor": "generic", "vendorLabel": "Generic", "icon": "", "hot": false, "free": false, "contextK": 8, "maxOutputTokens": 1024, "modalities": ["text"], "reasoningLevels": [] }
+    ]
+  },
+  "served": [
+    "glm-5.3",
+    "claude-opus-5-5",
+    "kimi-k3",
+    "qwen3.8-max",
+    "no-icon-model",
+    "no-capacity-model"
+  ],
+  "installed": [
+    { "id": "claude-opus-5-5", "name": "OPUS 5.5", "contextWindow": 1000000, "maxTokens": 128000, "input": ["text", "image"], "reasoningEfforts": { "off": null, "low": "low", "medium": "medium", "high": "high", "max": "max" }, "compat": { "supportsDeveloperRole": true } },
+    { "id": "glm-5.3", "name": "glm-5.3", "maxTokens": 8192 },
+    { "id": "deepseek-v4.1-flash", "name": "deepseek-v4.1-flash", "maxTokens": 128000 },
+    { "id": "fable-ultra-promax", "name": "fable-ultra-promax", "maxTokens": 128000, "compat": { "supportsStore": true } }
+  ]
+}

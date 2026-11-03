@@ -2049,10 +2049,19 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       // Follow the host's answer whenever nobody is typing in the field, so a
       // change made elsewhere does not leave a stale value on screen.
       React.useEffect(() => {
-        if (!focused) setValue(props.value ?? '')
+        // A draft field keeps its draft: re-syncing it from the host on blur would erase what
+        // the user typed at the moment he pressed a button beside it, which is the same focus
+        // problem `saveOnBlur: false` exists to solve, seen from the other side.
+        if (!focused && props.saveOnBlur !== false) setValue(props.value ?? '')
       }, [props.value, focused])
       const commit = () => {
         setFocused(false)
+        // Optional and off by default. A field whose value is only a draft until something
+        // explicitly applies it must not save when focus happens to leave, and focus leaves
+        // when the user presses a button beside it — so without this a «Проверить» button would
+        // save the text it then claims not to have saved. The seven other fields on this page
+        // pass no `saveOnBlur`, so they take the identical path and still commit on blur.
+        if (props.saveOnBlur === false) return
         const next = String(value).trim()
         if (next !== '' && next !== String(props.value ?? '')) props.onSave(next)
       }
@@ -2063,7 +2072,14 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         ...(props.min === undefined ? {} : { min: props.min }),
         ...(props.max === undefined ? {} : { max: props.max }),
         ...(props.step === undefined ? {} : { step: props.step }),
-        onChange: event => setValue(event.target.value),
+        onChange: event => {
+          setValue(event.target.value)
+          // Optional, and nothing happens when it is not supplied: no default, and no change to
+          // what `onSave` receives, so a field rendered without it is unchanged by construction
+          // rather than by care. It exists so a control beside the field can act on the text the
+          // user is looking at rather than on the value that was last saved.
+          if (props.onDraft !== undefined) props.onDraft(event.target.value)
+        },
         onFocus: () => setFocused(true),
         onBlur: commit,
         onKeyDown: event => {
@@ -3665,6 +3681,143 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         ? report.suppressedNetworkErrors
         : null
 
+      /**
+       * The plugin's proxy, as one sentence rather than as a dumped value.
+       *
+       * `/state` publishes `proxy` as an object — `{ installed, reason, masked, scheme }` when
+       * installed and `{ installed, reason }` when not — where it used to publish no key at all
+       * and the Row's `?? 'none'` fallback fired. Rendering the object into a string template is
+       * how the page came to print `[object Object]`: a status field changed type underneath a
+       * template that assumed a string. The sentence is built from the object's parts instead.
+       *
+       * `reason` carries two cases that must not read as one: the empty string means the switch
+       * is off, which is a choice and renders calm, while a non-empty one means an enabled
+       * switch failed to install, which is a fault and renders in the warning colour with the
+       * host's own words. `masked` is the spec with the password replaced and is the only form
+       * of it that may be displayed or logged; the raw `config.proxySpec` appears in the editable
+       * field alone, because a field that quietly corrected an unparsable value would disagree
+       * with the file invisibly. `scheme` stays off the page: nothing is ever defaulted, so
+       * there is no warning for it to carry.
+       */
+      const proxy = typeof status?.proxy === 'object' && status?.proxy !== null ? status.proxy : null
+      const proxyState = proxy === null
+        ? { tone: C.label, text: '—' }
+        : proxy.installed === true
+          ? { tone: C.label, text: typeof proxy.masked === 'string' && proxy.masked !== '' ? proxy.masked : 'установлен' }
+          : proxy.reason === ''
+            ? { tone: C.label, text: 'выключен' }
+            : { tone: C.warn, text: String(proxy.reason) }
+
+      /**
+       * The proxy field's draft, its probe answer, and whether a probe is running.
+       *
+       * The draft starts as `undefined` rather than as a copy of the stored value, so "the user
+       * has typed something" is distinguishable from "the user has typed the same thing again" —
+       * which decides whether the probe sends the field's text or lets the host fall back to the
+       * stored spec, and therefore which of `tested: 'typed' | 'stored'` comes back.
+       */
+      const [proxyDraft, setProxyDraft] = React.useState(undefined)
+      const [proxyTest, setProxyTest] = React.useState(undefined)
+      const [proxyBusy, setProxyBusy] = React.useState(false)
+      const proxyStored = String(config.proxySpec ?? '')
+      /**
+       * The proxy family, as one of two values and never as a scheme in the address.
+       *
+       * Anything absent or unrecognised reads as `'http'`, which is both the documented default
+       * and the safe one: a host half older than the key publishes nothing, and a value the page
+       * does not know must not render the selector in a position that was never chosen.
+       */
+      const proxyMode = config.proxyMode === 'socks' ? 'socks' : 'http'
+      const proxyTyped = typeof proxyDraft === 'string' && proxyDraft.trim() !== proxyStored.trim()
+
+      /**
+       * Probe the provider's catalogue endpoint through the proxy.
+       *
+       * Its own fetch path rather than `post()`, because `post()` derives a notice via
+       * `noticeFor` and then calls `reload()` and `refresh()`: this changes no config, and the
+       * page needs the response body to tell four outcomes apart.
+       *
+       * Four, not three, and the fourth is the one that would otherwise be misfiled. `status` is
+       * a number whenever any HTTP response came back, so **any status is a working proxy** — a
+       * 502 or 503 means the proxy carried the request and the provider is having a day, and
+       * painting that red would tell the user his proxy is broken when it is fine. `status` null
+       * with a numeric `elapsedMs` is the proxy failing to carry it: refused, timeout, DNS.
+       * `elapsedMs` null means it never dialled at all, so the address is unparsable — a typo,
+       * with a different remedy from a broken proxy. And a failure of the probe request itself is
+       * none of those three: it sends the user to his network or to the plugin, not to his text,
+       * so it gets its own sentence rather than borrowing the unparsable one.
+       */
+      const testProxy = async () => {
+        setProxyBusy(true)
+        setProxyTest(undefined)
+        try {
+          const response = await fetch(`${API}/test-proxy`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify(proxyTyped ? { proxySpec: proxyDraft } : {}),
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`)
+          setProxyTest(payload)
+        } catch (error) {
+          setProxyTest({ probeFailed: error.message })
+        } finally {
+          setProxyBusy(false)
+        }
+      }
+
+      /**
+       * What one probe answer says, and in which colour.
+       *
+       * The subject of the sentence is named — the typed address or the stored one — because
+       * "the proxy works" about a string the user has not applied is a claim whose subject has
+       * to be visible, and `tested` is what the host publishes for exactly that. A successful
+       * probe of a typed address also says out loud that it saved nothing and switched nothing
+       * on, since "test passed" beside an off switch is the confusion that gets reported as a
+       * bug. Only the masked spec is ever printed; the raw one lives in the editable field and
+       * nowhere else.
+       */
+      const proxyOutcome = result => {
+        if (result === undefined || result === null) return null
+        if (typeof result.probeFailed === 'string') {
+          return { tone: C.warn, text: `Проверка не выполнилась: ${result.probeFailed}` }
+        }
+        const subject = result.tested === 'typed' ? 'введённый адрес' : 'сохранённый адрес'
+        const spec = typeof result.masked === 'string' && result.masked !== '' ? result.masked : '—'
+        const notApplied = result.tested === 'typed' || config.proxyEnabled !== true
+          ? ' Проверка ничего не сохраняет и не включает: адрес записывает «Записать», а используется он только при включённом выключателе.'
+          : ''
+        if (Number.isFinite(result.status)) {
+          // Which transport won the discovery, and conditional on the field's *presence* rather
+          // than on the mode: `transport` is an absent key for `socks`, where there is nothing to
+          // discover, and also absent for an `http` probe from a build that has not run discovery
+          // yet. Absent therefore means "nothing was discovered", and drawing a dash for it would
+          // claim a measurement nobody made — so the clause simply does not appear, and the page
+          // is correct today and gains the better sentence the moment the host starts publishing
+          // it, with no change here. This sentence is the user's only window into a choice made
+          // for him, so when it can be said it is said rather than folded into «работает».
+          const transportClause = result.transport === 'https'
+            ? ' Работает как HTTPS-прокси: соединение с ним зашифровано.'
+            : result.transport === 'http'
+              ? ' Работает как HTTP-прокси: соединение с ним не зашифровано.'
+              : ''
+          return {
+            tone: C.label,
+            text: `Прокси работает: ${subject} (${spec}) доставил запрос, провайдер ответил ${result.status}`
+              + `${Number.isFinite(result.elapsedMs) ? ` за ${result.elapsedMs} мс` : ''}.${transportClause}`
+              + ` Любой ответ, включая 502, означает, что запрос прошёл через прокси.${notApplied}`,
+          }
+        }
+        if (!Number.isFinite(result.elapsedMs)) {
+          return { tone: C.warn, text: `Адрес не разобран (${subject}): ${String(result.error ?? 'причина не сообщена')}` }
+        }
+        return {
+          tone: C.warn,
+          text: `Прокси не доставил запрос (${subject}, ${result.elapsedMs} мс): ${String(result.error ?? 'причина не сообщена')}`,
+        }
+      }
+      const proxyOutcomeNow = proxyOutcome(proxyTest)
+
       return h('div', { style: { font, color: C.label, padding: '4px 2px 24px', maxWidth: '760px' } },
         // The heading carries the gap to the first toggle itself: the paragraph that
         // used to supply it is gone, and 6px would put a checkbox under the title.
@@ -3950,7 +4103,77 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           h(Row, { name: 'иконок в кэше' }, String(status?.logos ?? 0)),
           h(Row, { name: 'обновлён' }, fetched),
           h(Row, { name: 'маршрут' }, status?.route ?? '—'),
-          h(Row, { name: 'прокси процесса' }, status?.proxy ?? 'none'),
+          h(Row, { name: 'прокси плагина', tone: proxyState.tone }, proxyState.text),
+
+          // The controls live here rather than in a box of their own, so the setting sits beside
+          // the other network facts and the pinned section order does not move. `saveOnBlur:
+          // false` is what makes «Проверить» honest: without it, pressing the button would blur
+          // the field, the field would save, and the probe would report on a stored value it had
+          // just created while the sentence claimed it saved nothing. Apply is the only path
+          // that writes, so the field stays a draft until the user says so.
+          h('div', { style: { margin: '10px 0 0' } },
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer' } },
+              h('input', {
+                type: 'checkbox',
+                checked: config.proxyEnabled === true,
+                onChange: event => { void post('/config', { proxyEnabled: event.target.checked }, 'save') },
+              }),
+              h('span', { style: { fontSize: '12.5px' } }, 'Работать через прокси')),
+            // Two positions, not four. `http` means "an HTTP-speaking proxy; whether the
+            // connection to it is encrypted is discovered, not declared", and `socks` means
+            // SOCKS5 with SOCKS4 refused loudly by the host. The scheme therefore has nowhere
+            // to be typed, which is the point: one place chooses the family, so the selector
+            // and the address string cannot disagree. It posts on change like the switch does,
+            // because the mode participates in the dispatcher signature — flipping it rebuilds
+            // the transport even when `host:port` is identical, so a change that does something
+            // must not render as though it did nothing.
+            //
+            // Deliberately NOT inferred from the address. Whether a password is present says
+            // nothing about either family: HTTP versus HTTPS for a proxy is whether the
+            // connection to the proxy is encrypted and an authenticated HTTP proxy is the
+            // common case in the wild, and SOCKS4 versus SOCKS5 is a handshake version where a
+            // SOCKS5 server without auth still rejects a SOCKS4 greeting. Inferring it would
+            // publish a guess as a setting.
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' } },
+              h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Тип прокси'),
+              h(Select, {
+                value: proxyMode,
+                options: [['http', 'HTTP(S)'], ['socks', 'SOCKS']],
+                onChange: value => { void post('/config', { proxyMode: value }, 'save') },
+              })),
+            h(TextField, {
+              value: proxyStored,
+              width: '100%',
+              saveOnBlur: false,
+              onDraft: setProxyDraft,
+              onSave: next => { void post('/config', { proxySpec: next }, 'save') },
+            }),
+            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' } },
+              h(Button, {
+                variant: 'primary',
+                disabled: busy !== '' || proxyBusy,
+                onClick: () => {
+                  // Clearing the draft once the write is accepted is what keeps `tested` honest
+                  // afterwards: with the draft still held, a probe of what is now the stored
+                  // value would keep reporting that it tested a typed one.
+                  void post('/config', { proxySpec: proxyTyped ? proxyDraft.trim() : proxyStored, proxyEnabled: config.proxyEnabled === true }, 'save')
+                    .then(() => setProxyDraft(undefined))
+                },
+              }, busy === 'save' ? 'Запись…' : 'Записать'),
+              h(Button, {
+                disabled: busy !== '' || proxyBusy,
+                onClick: () => { void testProxy() },
+              }, proxyBusy ? 'Проверка…' : 'Проверить прокси')),
+            proxyOutcomeNow === null
+              ? null
+              : h('div', { style: { color: proxyOutcomeNow.tone, fontSize: '11.5px', lineHeight: 1.6, marginTop: '8px' } },
+                  proxyOutcomeNow.text),
+            h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+              'Формат адреса: [логин:пароль@]хост:порт, без схемы — семейство выбирает «Тип прокси» выше, '
+              + 'поэтому строка и переключатель не могут разойтись. Для HTTP(S) шифрование соединения с прокси '
+              + 'определяется само, а не объявляется. '
+              + '«Проверить прокси» отправляет один запрос к каталогу провайдера через прокси и ничего не сохраняет; '
+              + 'любой ответ провайдера, включая 502, означает, что прокси работает, а сбоем считается только отсутствие ответа.')),
           h(Row, { name: 'сборка' }, `${status?.build ?? '—'} (ревизия ${status?.revision ?? '—'})`),
           status?.error === undefined
             ? null

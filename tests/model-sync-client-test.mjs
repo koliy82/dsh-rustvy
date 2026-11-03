@@ -229,6 +229,10 @@ const STATE = {
     // shape an older host half answers with, and both switches have to read it as "on"
     // rather than as a refusal.
     successWindowMs: 900_000,
+    // A stored proxy spec with a password in it, so the raw-versus-masked split is checkable:
+    // the editable field must show exactly this, and nothing else on the page may.
+    proxyEnabled: false,
+    proxySpec: 'https://user:secret@proxy.example:8080',
   },
   version: 130,
   fetchedAt: '2026-10-18T21:00:00.000Z',
@@ -673,11 +677,28 @@ globalThis.window = {
   },
   __ModuleLoader__: { load: descriptor => { globalThis.__descriptor = descriptor } },
 }
+/**
+ * What `/test-proxy` answers, so the four outcomes can be driven one at a time. `null` makes
+ * the probe itself fail, which is the case that must not be mistaken for an unparsable address.
+ */
+let PROXY_ANSWER = { ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080' }
+let PROXY_HTTP = 200
+
 globalThis.fetch = async (url, init = {}) => {
   const path = String(url)
   const method = (init.method ?? 'GET').toUpperCase()
   requests.push({ path, method, body: init.body })
   if (path.includes('/models.yaml')) return { ok: true, status: 200, text: async () => YAML_TEXT }
+  if (path.endsWith('/test-proxy') && method === 'POST') {
+    if (PROXY_ANSWER === null) throw new Error('Failed to fetch')
+    // `tested` is derived from the request the way the host derives it — a non-empty `proxySpec`
+    // in the body means the typed text was probed, anything else means the stored one — so the
+    // stub cannot report a subject the client did not send, and the page's sentence is checked
+    // against what it actually asked for rather than against a value the test wrote by hand.
+    const sent = JSON.parse(init.body ?? '{}')
+    const tested = typeof sent.proxySpec === 'string' && sent.proxySpec !== '' ? 'typed' : 'stored'
+    return { ok: PROXY_HTTP === 200, status: PROXY_HTTP, json: async () => ({ ...PROXY_ANSWER, tested }) }
+  }
   if (/^\/dsh-rustvy\/(keys|session-key)/u.test(path) && KEYS_MODE === 'missing') {
     return { ok: false, status: 404, json: async () => { throw new Error('no body') } }
   }
@@ -962,12 +983,14 @@ check('the route is editable', texts.some(item => item.props.value === 'rustvy')
 check('the profile row is editable', texts.some(item => item.props.value === 'llm-pi-ai'))
 check('the origin is editable', texts.some(item => item.props.value === 'https://rustvy.xyz'))
 check('the mark size is editable', numbers.length === 1 && numbers[0].props.value === '16', JSON.stringify(numbers.map(i => i.props.value)))
-check('all three dropdowns render', selects.length === 3, String(selects.length))
+// Four, not three: the proxy family selector is the fourth, and it is a select rather than two
+// buttons so that it shares the page's dropdown idiom and its disabled state.
+check('four dropdowns render', selects.length === 4, String(selects.length))
 check('auto-apply defaults to explicit', selectWith(tree, 'explicit')?.props.value === 'explicit',
   String(selectWith(tree, 'explicit')?.props.value))
 check('the name source defaults to the provider label', selectWith(tree, 'displayName')?.props.value === 'displayName',
   String(selectWith(tree, 'displayName')?.props.value))
-check('ten switches render', boxes.length === 10, String(boxes.length))
+check('eleven switches render', boxes.length === 11, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -1205,12 +1228,13 @@ check('the key list comes back with the host route',
 
 // --- the fields the host half added on top of the contract ----------------
 text = allText(tree)
-// Ten, not eight: the page's own display switches — now including the uptime one — plus
-// the ring's master switch and, in the «Сбор данных Rustvy» box, the success-reporting
-// switch above the error-collection one. Found by label rather than by index, so a switch
-// added above it cannot silently retarget this block at some other checkbox.
+// Eleven, not eight: the page's own display switches — now including the uptime one — plus the
+// ring's master switch, the success-reporting switch above the error-collection one in the
+// «Сбор данных Rustvy» box, and the proxy switch in «Зеркало каталога». Found by label rather
+// than by index, so a switch added above it cannot silently retarget this block at some other
+// checkbox.
 check('the master switch for the ring is offered',
-  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 10
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 11
   && text.includes('Ключи на несколько чатов'))
 check('the key count is shown against the limit', text.includes('2 из 12'))
 check('each key reports how many models its route serves', text.includes('моделей: 12'))
@@ -2833,6 +2857,242 @@ check('while the collector own percentages are untouched by this install setting
   [uptimeOf(uptimeRow(tree, 'OPUS 5.5')), uptimeOf(uptimeRow(tree, 'GLM 5.3'))].join(' | '))
 delete STATE.config.collectSuccesses
 STATE.errorReport.successes = 5
+
+/* --------------------------- the plugin proxy line ------------------------- */
+
+// The general form of the bug, and the check that earns its place: `/state` grew a `proxy`
+// object where it used to publish no key at all, and a Row whose template assumed a string
+// printed `[object Object]` on the settings page. A status field changing type underneath a
+// template will happen again somewhere else, so this asserts over the whole rendered page
+// rather than over the Row that broke — one general check catches the class, the row-specific
+// ones below catch the instance.
+UPTIME_MODE = 'populated'
+STATE.proxy = { installed: false, reason: '' }
+tree = await view()
+text = allText(tree)
+check('no text the page produces is a stringified object',
+  !text.includes('[object Object]'),
+  text.slice(Math.max(0, text.indexOf('[object Object]') - 60), text.indexOf('[object Object]') + 60))
+check('a proxy switch that is off says so, as a choice rather than a fault',
+  text.includes('прокси плагина') && text.includes('выключен'),
+  text.slice(text.indexOf('прокси плагина'), text.indexOf('прокси плагина') + 60))
+STATE.proxy = { installed: false, reason: 'строка не разобрана: адрес без схемы' }
+tree = await view()
+text = allText(tree)
+check('an enabled switch that failed to install says why, in the host own words',
+  text.includes('строка не разобрана: адрес без схемы') && !text.includes('[object Object]'),
+  text.slice(text.indexOf('прокси плагина'), text.indexOf('прокси плагина') + 80))
+STATE.proxy = { installed: true, reason: '', masked: 'https://user:***@proxy.example:8080', scheme: 'https' }
+tree = await view()
+text = allText(tree)
+check('an installed proxy shows the masked spec rather than an object',
+  text.includes('https://user:***@proxy.example:8080') && !text.includes('[object Object]'),
+  text.slice(text.indexOf('прокси плагина'), text.indexOf('прокси плагина') + 80))
+delete STATE.proxy
+tree = await view()
+text = allText(tree)
+check('and a host that publishes no proxy at all draws a dash rather than an object',
+  text.includes('прокси плагина') && !text.includes('[object Object]'),
+  text.slice(text.indexOf('прокси плагина'), text.indexOf('прокси плагина') + 40))
+
+/* ---------------------------- the proxy controls --------------------------- */
+
+const RAW_SPEC = 'https://user:secret@proxy.example:8080'
+const proxyFieldOf = node => collect(node, 'input').filter(item => item.props.type === 'text')
+  .find(item => typeof item.props.value === 'string' && (item.props.value === RAW_SPEC || item.props.value.startsWith('http://draft')))
+const testProxyButton = node => buttonsNamed(node, 'Проверить прокси')[0]
+// Matched by exact label rather than by variant: `buttonsNamed` returns rendered nodes, whose
+// props carry no `variant`, and the models box has a «Записать список моделей» button that an
+// `includes` match would also pick up.
+const applyProxyButton = node => buttonsNamed(node, 'Записать')[0]
+
+// The shared-component guard, and deliberately ONE check naming both new props: a `TextField`
+// rendered with neither `onDraft` nor `saveOnBlur` still commits on blur and still hands
+// `onSave` the typed value. Two separate checks would each redden only for their own prop; one
+// check over the untouched component reddens if either becomes non-optional, which is the
+// regression an optional-prop change invites.
+tree = await view()
+const guardField = collect(tree, 'input').filter(item => item.props.type === 'text').find(item => item.props.value === 'rustvy')
+guardField.props.onFocus()
+guardField.props.onChange({ target: { value: 'rustvy-guard' } })
+tree = await view()
+requests.length = 0
+collect(tree, 'input').filter(item => item.props.type === 'text').find(item => item.props.value === 'rustvy-guard').props.onBlur()
+await settle()
+check('a field with neither new prop still commits on blur and saves what was typed',
+  requests.some(item => item.path.endsWith('/config') && String(item.body).includes('rustvy-guard')),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+STATE.config.modelRoute = 'rustvy'
+tree = await view()
+
+check('the proxy field shows exactly what is stored, password and all',
+  proxyFieldOf(tree)?.props.value === RAW_SPEC, String(proxyFieldOf(tree)?.props.value))
+check('and nothing else on the page prints the raw password',
+  !allText(tree).includes('secret@proxy.example'), allText(tree).slice(Math.max(0, allText(tree).indexOf('proxy.example') - 40), allText(tree).indexOf('proxy.example') + 40))
+
+// `saveOnBlur: false` has to be honoured, not merely present: a prop that is silently ignored
+// leaves a control that exists and does nothing while the page still looks right.
+proxyFieldOf(tree).props.onFocus()
+proxyFieldOf(tree).props.onChange({ target: { value: 'http://draft.example:3128' } })
+tree = await view()
+requests.length = 0
+proxyFieldOf(tree).props.onBlur()
+await settle()
+// Re-rendered before asserting, and that is not ceremony: the blur triggers two state changes
+// and the draft's survival is a property of the render *after* them. Reading the tree captured
+// before the blur asserts against a snapshot in which nothing has happened yet, which is how a
+// check passes for the wrong reason — it was green against a mutation that wipes the draft.
+tree = await view()
+check('and blurring it saves nothing, because only Apply writes',
+  !requests.some(item => item.path.endsWith('/config')),
+  JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
+check('the draft survives the blur that pressing a button beside it causes',
+  proxyFieldOf(tree)?.props.value === 'http://draft.example:3128', String(proxyFieldOf(tree)?.props.value))
+
+// Test probes the text the user is looking at, and says which one it probed — «the proxy works»
+// about a string that has not been applied is a claim whose subject has to be visible. This runs
+// *before* Apply on purpose: once the draft is applied it is the stored value, and a probe of it
+// correctly reports `tested: 'stored'`, so the typed case only exists while the draft is unapplied.
+tree = await view()
+requests.length = 0
+testProxyButton(tree).props.onClick()
+await settle()
+check('Test sends the typed address and saves nothing',
+  requests.some(item => item.path.endsWith('/test-proxy') && String(item.body).includes('draft.example:3128'))
+  && !requests.some(item => item.path.endsWith('/config')),
+  JSON.stringify(requests.map(item => `${item.method} ${item.path} ${item.body ?? ''}`)))
+tree = await view()
+text = allText(tree)
+check('and names the typed address as its subject',
+  text.includes('введённый адрес') && text.includes('ничего не сохраняет'),
+  text.slice(text.indexOf('Прокси работает'), text.indexOf('Прокси работает') + 220))
+
+requests.length = 0
+applyProxyButton(tree).props.onClick()
+await settle()
+check('Apply saves the draft that blurring it left alone',
+  requests.some(item => item.path.endsWith('/config') && String(item.body).includes('draft.example:3128')),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+STATE.config.proxySpec = 'http://draft.example:3128'
+tree = await view()
+
+// The four outcomes, driven one at a time through the stub rather than reasoned about.
+PROXY_ANSWER = { ok: true, tested: 'stored', connected: true, status: 502, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080' }
+STATE.config.proxySpec = RAW_SPEC
+tree = await view()
+testProxyButton(tree).props.onClick()
+await settle()
+tree = await view()
+text = allText(tree)
+check('any HTTP status is a working proxy, 502 included, and renders calmly',
+  text.includes('Прокси работает') && text.includes('ответил 502') && text.includes('за 340 мс')
+  && text.includes('сохранённый адрес'),
+  text.slice(text.indexOf('Прокси работает'), text.indexOf('Прокси работает') + 200))
+
+PROXY_ANSWER = { ok: true, tested: 'stored', connected: false, status: null, elapsedMs: 512, masked: 'https://user:***@proxy.example:8080', error: 'ECONNREFUSED' }
+tree = await view()
+testProxyButton(tree).props.onClick()
+await settle()
+tree = await view()
+text = allText(tree)
+check('no response at all is the proxy failing to carry it, and says so',
+  text.includes('Прокси не доставил запрос') && text.includes('ECONNREFUSED'),
+  text.slice(text.indexOf('Прокси не доставил'), text.indexOf('Прокси не доставил') + 160))
+
+PROXY_ANSWER = { ok: true, tested: 'typed', connected: false, status: null, elapsedMs: null, masked: '—', error: 'строка не разобрана: адрес без схемы' }
+tree = await view()
+testProxyButton(tree).props.onClick()
+await settle()
+tree = await view()
+text = allText(tree)
+check('never dialled means the address is wrong, not the proxy',
+  text.includes('Адрес не разобран') && !text.includes('Прокси не доставил'),
+  text.slice(text.indexOf('Адрес не разобран'), text.indexOf('Адрес не разобран') + 160))
+
+// The fourth case, which would otherwise be misfiled as the third: a probe that never reached
+// the host is about the network or the plugin, not about the user's text, so it must not borrow
+// the unparsable sentence.
+PROXY_ANSWER = null
+tree = await view()
+testProxyButton(tree).props.onClick()
+await settle()
+tree = await view()
+text = allText(tree)
+check('and a probe that could not run is none of the three above',
+  text.includes('Проверка не выполнилась') && !text.includes('Адрес не разобран'),
+  text.slice(text.indexOf('Проверка не выполнилась'), text.indexOf('Проверка не выполнилась') + 120))
+
+PROXY_ANSWER = { ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080' }
+PROXY_HTTP = 200
+STATE.config.proxySpec = RAW_SPEC
+tree = await view()
+
+/* ------------------------- the proxy family selector ----------------------- */
+
+// Matched on the rendered node, which carries `value` and the option children but not the
+// `options` prop the component was called with — finding it by `props.options` finds nothing.
+const proxySelectOf = node => collect(node, 'select').find(item =>
+  (item.children ?? []).some(child => child.props?.value === 'socks'))
+delete STATE.config.proxyMode
+tree = await view()
+const proxyOptions = () => (proxySelectOf(tree)?.children ?? []).map(child => child.props.value).join(',')
+const proxyLabels = () => (proxySelectOf(tree)?.children ?? []).map(child => allText(child)).join(',')
+check('the family selector offers exactly two positions, and no scheme is one of them',
+  proxyOptions() === 'http,socks' && proxyLabels() === 'HTTP(S),SOCKS',
+  `${proxyOptions()} | ${proxyLabels()}`)
+// A host half older than the key publishes no `proxyMode`, and the default is `http`: an absent
+// value must not leave the selector in a position nobody chose.
+check('an absent proxyMode renders as the documented default',
+  proxySelectOf(tree)?.props.value === 'http', String(proxySelectOf(tree)?.props.value))
+STATE.config.proxyMode = 'socks5'
+tree = await view()
+check('and a value the page does not know renders as the default rather than as a guess',
+  proxySelectOf(tree)?.props.value === 'http', String(proxySelectOf(tree)?.props.value))
+STATE.config.proxyMode = 'socks'
+tree = await view()
+check('a stored socks mode renders as SOCKS', proxySelectOf(tree)?.props.value === 'socks',
+  String(proxySelectOf(tree)?.props.value))
+requests.length = 0
+proxySelectOf(tree).props.onChange({ target: { value: 'http' } })
+await settle()
+check('and flipping it posts proxyMode immediately, because it rebuilds the transport',
+  requests.some(item => item.path.endsWith('/config') && JSON.parse(item.body).proxyMode === 'http'),
+  JSON.stringify(requests.filter(item => item.path.endsWith('/config')).map(item => item.body)))
+STATE.config.proxyMode = 'http'
+tree = await view()
+text = allText(tree)
+check('the format line says the address carries no scheme and names the selector',
+  text.includes('[логин:пароль@]хост:порт, без схемы') && text.includes('«Тип прокси»'),
+  text.slice(text.indexOf('Формат адреса'), text.indexOf('Формат адреса') + 150))
+check('and nothing on the page invites typing a scheme',
+  !text.includes('[схема://]'), text.slice(Math.max(0, text.indexOf('схема') - 60), text.indexOf('схема') + 60))
+
+// The discovery clause, conditional on the field's presence rather than on the mode: `transport`
+// is an absent key for socks, where there is nothing to discover, and also absent for an `http`
+// probe from a build that has not run discovery yet. Absent means "nothing was discovered", so
+// no clause is drawn — a dash there would claim a measurement nobody made.
+const probeOutcome = async answer => {
+  PROXY_ANSWER = answer
+  tree = await view()
+  testProxyButton(tree).props.onClick()
+  await settle()
+  tree = await view()
+  return allText(tree)
+}
+text = await probeOutcome({ ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080', transport: 'https' })
+check('a discovered TLS transport is named, because it is a choice made for the user',
+  text.includes('Работает как HTTPS-прокси') && text.includes('зашифровано'),
+  text.slice(text.indexOf('Прокси работает'), text.indexOf('Прокси работает') + 220))
+text = await probeOutcome({ ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080', transport: 'http' })
+check('and a plaintext one is named as plainly, rather than left implicit',
+  text.includes('Работает как HTTP-прокси') && text.includes('не зашифровано'),
+  text.slice(text.indexOf('Прокси работает'), text.indexOf('Прокси работает') + 220))
+text = await probeOutcome({ ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080' })
+check('while an absent transport still reports a working proxy and claims nothing about it',
+  text.includes('Прокси работает') && !text.includes('как HTTPS-прокси') && !text.includes('как HTTP-прокси')
+  && !text.includes('транспорт —'),
+  text.slice(text.indexOf('Прокси работает'), text.indexOf('Прокси работает') + 220))
+PROXY_ANSWER = { ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080' }
 
 for (const dispose of disposers) { try { dispose() } catch { /* already gone */ } }
 check('unload ran without throwing', true)

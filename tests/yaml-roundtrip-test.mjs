@@ -11,13 +11,28 @@
 //   - the row. The profile's own cordis.patch.yml is parsed when there is one,
 //     which proves the emitter reproduces a document a real deployment carries,
 //     comments and all. Without one, a synthetic row of the same shape is used.
+//
+// A third thing used to be borrowed and was NOT documented: the model list. This file
+// fetched https://rustvy.xyz/v1/models and /models on every run, which made the suite's
+// outcome a fact about the network rather than about the emitter — the last suite in the
+// tree that did so, and `prepublishOnly` runs every suite, so a provider hiccup could block
+// a publish at an arbitrary moment. Both halves now come from a committed fixture, captured
+// once from the real endpoint. The live path survives behind a flag, because it covers what
+// a fixture cannot: that the provider's two answers still parse.
+//
+//     $env:DSH_RUSTVY_LIVE_YAML_ROUNDTRIP = '1'; node tests/yaml-roundtrip-test.mjs
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const { routePatchYaml, yamlScalar, buildModelEntries, normalizeServedList, mirrorRecord } =
   await import('../lib/models.js')
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const FIXTURE = JSON.parse(readFileSync(join(HERE, 'fixtures/yaml-roundtrip.json'), 'utf8'))
+const LIVE = process.env.DSH_RUSTVY_LIVE_YAML_ROUNDTRIP === '1'
 
 const results = []
 const skipped = []
@@ -116,17 +131,39 @@ if (jsYaml === undefined) {
   const provider = row.config.providers.rustvy
 
   // Emit exactly what the plugin would hand a profile author: the installed
-  // provider fields plus the models the origin serves right now.
-  const served = normalizeServedList(
-    await (await fetch('https://rustvy.xyz/v1/models', { headers: { accept: 'application/json' } })).json(),
-  )
-  const html = await (await fetch('https://rustvy.xyz/models', { headers: { accept: 'text/html' } })).text()
-  const island = JSON.parse(/<script[^>]*\bid=["']?rustvy-catalog["']?[^>]*>([\s\S]*?)<\/script>/iu.exec(html)[1])
-  const records = island.records.map(mirrorRecord).filter(Boolean)
+  // provider fields plus the models the origin serves.
+  //
+  // No local server stands in for the origin here, unlike model-sync-host-test and
+  // models-check: nothing under test fetches. This suite's subject is the emitter and the
+  // two parsers that read its output, so the served list and the island are inputs, and a
+  // server would be scaffolding with nothing to stand in for.
+  let served
+  let records
+  if (LIVE) {
+    served = normalizeServedList(
+      await (await fetch('https://rustvy.xyz/v1/models', { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) })).json(),
+    )
+    const html = await (await fetch('https://rustvy.xyz/models', { headers: { accept: 'text/html' }, signal: AbortSignal.timeout(20_000) })).text()
+    const islandMatch = /<script[^>]*\bid=["']?rustvy-catalog["']?[^>]*>([\s\S]*?)<\/script>/iu.exec(html)
+    // Loud rather than an empty list: an empty island would generate zero models and every
+    // assertion below about the emitted document would pass vacuously.
+    if (islandMatch === null) throw new Error('live mode: no rustvy-catalog island on /models')
+    records = JSON.parse(islandMatch[1]).records.map(mirrorRecord).filter(Boolean)
+  } else {
+    served = normalizeServedList({ data: FIXTURE.served.map(id => ({ id })) })
+    records = FIXTURE.island.records.map(mirrorRecord).filter(Boolean)
+  }
+  // Shape, not count: the provider's enabled list oscillates (nine one morning, fourteen by
+  // evening, same island version), so nothing below may pin a number the fixture happens to
+  // hold today. What must be true is that there IS something to emit.
+  check('the fixture yields models to emit, so the round-trip is not vacuous',
+    served.length > 0 && records.length > 0,
+    JSON.stringify({ served: served.length, records: records.length }))
   const { entries } = buildModelEntries(served, records, provider.models, {
     nameSource: 'displayName',
     offerOff: true,
   })
+  check('and it yields generated entries from both halves', entries.length > 0, String(entries.length))
 
   const text = routePatchYaml({
     entryId: row.id,

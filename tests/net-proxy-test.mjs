@@ -30,6 +30,7 @@
 // which is the branch this plugin's own traffic takes, since the default collector
 // endpoint is `http://…:8249/api/report`.
 import { request as httpRequest, createServer } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
 import { exit, env } from 'node:process'
 
 /** The body the origin answers with, so a response can be recognised as its own. */
@@ -217,6 +218,46 @@ const unreachable = await attempt(() => getUrl(TARGET_URL, { timeoutMs: TIMEOUT_
 check('a dead proxy is a transport failure, not a result', unreachable.ok === false, String(unreachable.value?.status))
 check('the failure names both routes it tried', typeof unreachable.message === 'string' && unreachable.message.includes('and through the environment proxy'), unreachable.message)
 env.HTTP_PROXY = savedProxy
+
+// --- a socks4 environment proxy is refused by name, before any byte is sent ----
+// The mode selector in `lib/proxy.js` cannot produce a socks4 scheme — `parseProxySpec`
+// answers a null scheme for a `socks4://` string under every mode — so the refusal in
+// `requestViaEnvironmentProxy` is reachable only from here: an environment that names
+// `socks4://`, which arrives through `proxyForTarget` and bypasses the selector entirely.
+// It is a real production path, and until this block nothing covered it.
+//
+// Both halves are asserted, because "it failed" and "it failed saying why" are different
+// guarantees and only the second is worth having. The history is concrete: the test in
+// `lib/net.js` used to match `/^socks[45]h?:$/` and hand socks4 to `connectSocks5`, so the
+// caller received a SOCKS5 greeting the proxy would reject and an error that read as a
+// broken proxy rather than as the wrong protocol. The last assertion is the one that
+// separates the two — a refusal has to happen before anything is written, so the peer sees
+// no connection at all. A wrong handshake that was rejected also fails, and also names a
+// proxy, and would pass every check above it.
+const socksPeerSaw = []
+const socks4Peer = createNetServer(socket => {
+  socksPeerSaw.push('a connection was opened')
+  socket.destroy()
+})
+await new Promise(resolve => socks4Peer.listen(0, '127.0.0.1', resolve))
+const savedSocksProxy = env.HTTP_PROXY
+env.HTTP_PROXY = `socks4://127.0.0.1:${socks4Peer.address().port}`
+check('the environment really does name a socks4 proxy for the target',
+  proxyForTarget(new URL(TARGET_URL))?.protocol === 'socks4:',
+  String(proxyForTarget(new URL(TARGET_URL))?.protocol))
+const socks4 = await attempt(() => getUrl(TARGET_URL, { timeoutMs: TIMEOUT_MS }))
+check('a socks4 environment proxy fails rather than being guessed at',
+  socks4.ok === false, socks4.ok ? `resolved with status ${socks4.value?.status}` : undefined)
+check('and the failure is the refusal, naming the version',
+  typeof socks4.message === 'string' && socks4.message.includes('socks4 is not supported'),
+  socks4.message)
+check('and it says what happens instead, so the message is actionable',
+  typeof socks4.message === 'string' && socks4.message.includes('refusing rather than sending a SOCKS5 handshake'),
+  socks4.message)
+check('and nothing was ever written to the peer, so no wrong handshake was sent',
+  socksPeerSaw.length === 0, JSON.stringify(socksPeerSaw))
+env.HTTP_PROXY = savedSocksProxy
+socks4Peer.close()
 
 // --- tear down ---------------------------------------------------------------
 for (const [name, value] of savedEnv) {

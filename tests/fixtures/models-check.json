@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "Hand-written fixture for tests/models-check.mjs. Nothing in it was captured from the live",
+    "provider at test time: models-check used to fetch https://rustvy.xyz/v1/models and",
+    "https://rustvy.xyz/models on every run, which made the suite's outcome a fact about the",
+    "network rather than about the code. host-wiring saw it time out at 21.8 s and lead saw it",
+    "pass forty minutes later with nothing in the repository changed between.",
+    "",
+    "This file is separate from model-sync.json on purpose. That fixture's island and wire",
+    "halves DISAGREE by design — it holds a zonal twin and a catalogue-only sentinel to prove",
+    "the plan retires and re-adds correctly. models-check asserts the opposite property, that",
+    "the two sources agree, so it needs a fixture built for agreement and one built for",
+    "disagreement. Reusing model-sync.json would have made the agreement assertion false on",
+    "arrival and somebody would have weakened it to get green.",
+    "",
+    "The live path survives as an opt-in mode, because it covers something a fixture cannot:",
+    "that the real provider's two answers still parse and still agree.",
+    "",
+    "    $env:DSH_RUSTVY_LIVE_MODELS_CHECK = '1'; node tests/models-check.mjs",
+    "",
+    "Every id is named in _roles. An id with no role is decoration and proves nothing."
+  ],
+  "_roles": {
+    "claude-opus-5-5": "full record: a display name that differs from the id, a vendor, both modalities and four reasoning levels. Proves a hand-written description survives regeneration rather than being rebuilt from the catalogue",
+    "glm-5.3": "the only record whose output cap is 8192 rather than 128000, so a capacity actually read from the catalogue is distinguishable from a default that happens to match",
+    "gpt-6.1-sol": "an ordinary enabled record, present in both halves",
+    "ahmia-v7-pro": "an ordinary enabled record, present in both halves; models-check has always printed this id, so keeping it means the generated output is still comparable to earlier runs",
+    "kimi-k3": "only two reasoning levels, so a model that does not offer the full ladder is exercised. It is also the id the disagreeing half drops, which is what makes that half disagree",
+    "no-capacity-model": "no contextK and no maxOutputTokens: the plan must say the window is unpublished rather than inventing one, and the schema check must accept an entry with neither field",
+    "retired-model": "enabled: false. Excluded from the island fallback and absent from the wire, so the two halves still agree — the property under test is agreement, not inclusion",
+    "abyss/qwen3.8-max": "zone: abyss. A zonal record is not standard-zone membership, so the fallback excludes it and the wire does not serve it. Its presence is what proves the fallback filters on zone rather than on enabled alone",
+    "phantom-model": "appears ONLY in the disagreeing wire half. If it reaches the generated entries in agreeing mode, the suite read the wrong half of this file"
+  },
+  "island": {
+    "version": 9101,
+    "records": [
+      { "id": "claude-opus-5-5", "displayName": "OPUS 5.5", "name": "OPUS 5.5", "vendor": "anthropic", "vendorLabel": "Anthropic", "icon": "anthropic.svg", "contextK": 1000, "maxOutputTokens": 128000, "modalities": ["text", "image"], "reasoningLevels": ["low", "medium", "high", "max"] },
+      { "id": "glm-5.3", "displayName": "GLM 5.3", "name": "GLM 5.3", "vendor": "zhipu", "vendorLabel": "Zhipu", "icon": "zhipu.svg", "contextK": 1000, "maxOutputTokens": 8192, "modalities": ["text"], "reasoningLevels": ["low", "medium", "high", "max"] },
+      { "id": "gpt-6.1-sol", "displayName": "GPT 6.1 Sol", "name": "GPT 6.1 Sol", "vendor": "openai", "vendorLabel": "OpenAI", "icon": "openai.svg", "contextK": 256, "maxOutputTokens": 128000, "modalities": ["text"], "reasoningLevels": ["low", "high"] },
+      { "id": "ahmia-v7-pro", "displayName": "Ahmia V7 Pro", "name": "Ahmia V7 Pro", "vendor": "ahmia", "vendorLabel": "Ahmia", "icon": "ahmia.svg", "contextK": 128, "maxOutputTokens": 128000, "modalities": ["text"], "reasoningLevels": [] },
+      { "id": "kimi-k3", "displayName": "Kimi K3", "name": "Kimi K3", "vendor": "moonshot", "vendorLabel": "Moonshot", "icon": "kimi.svg", "contextK": 256, "maxOutputTokens": 65536, "modalities": ["text"], "reasoningLevels": ["low", "high"] },
+      { "id": "no-capacity-model", "displayName": "No Capacities", "name": "No Capacities", "vendor": "generic", "vendorLabel": "Generic", "icon": "generic.svg", "modalities": ["text"], "reasoningLevels": [] },
+      { "id": "retired-model", "displayName": "Retired", "name": "Retired", "vendor": "generic", "vendorLabel": "Generic", "icon": "", "enabled": false, "contextK": 8, "maxOutputTokens": 1024, "modalities": ["text"], "reasoningLevels": [] },
+      { "id": "abyss/qwen3.8-max", "displayName": "Qwen3.8 Max", "name": "Qwen3.8 Max", "vendor": "qwen", "vendorLabel": "Qwen", "icon": "qwen.svg", "zone": "abyss", "contextK": 1000, "maxOutputTokens": 128000, "modalities": ["text", "image"], "reasoningLevels": ["low", "high"] }
+    ]
+  },
+  "served": [
+    "claude-opus-5-5",
+    "glm-5.3",
+    "gpt-6.1-sol",
+    "ahmia-v7-pro",
+    "kimi-k3",
+    "no-capacity-model"
+  ],
+  "disagreeing": {
+    "_comment": [
+      "The same island with a wire answer that does not match it: kimi-k3 is missing and a",
+      "phantom id is present. The suite asserts that this half does NOT agree, which is what",
+      "makes the agreement assertion mean something — a check that cannot fail is not a check.",
+      "This is the shape the live provider produced on 2026-11-02, when it dropped five models",
+      "in the morning and re-enabled them in the afternoon."
+    ],
+    "served": [
+      "claude-opus-5-5",
+      "glm-5.3",
+      "gpt-6.1-sol",
+      "ahmia-v7-pro",
+      "no-capacity-model",
+      "phantom-model"
+    ]
+  },
+  "installed": [
+    { "id": "claude-opus-5-5", "name": "OPUS 5.5", "contextWindow": 1000000, "maxTokens": 128000, "input": ["text", "image"], "reasoningEfforts": { "off": null, "low": "low", "medium": "medium", "high": "high", "max": "max" }, "compat": { "supportsDeveloperRole": true } },
+    { "id": "glm-5.3", "name": "glm-5.3", "maxTokens": 8192 },
+    { "id": "fable-ultra-promax", "name": "fable-ultra-promax", "maxTokens": 128000 }
+  ]
+}
