@@ -274,6 +274,49 @@ check('with a proxy installed, the proxy wins over fragmentation for the same or
   && fake.log.some(entry => entry.kind === 'Pool' && entry.connect === 'function') === false,
   JSON.stringify(fake.log))
 
+// --- composition: fragmentation *inside* the CONNECT tunnel ------------------
+// A tunnel frames the connection without encrypting it, so a DPI on the user's own link still
+// sees the ClientHello to the origin inside it. Without this branch the two defences were
+// mutually exclusive — turning a proxy on switched fragmentation off for the same origin, so a
+// user who fell back to a proxy during a block lost both at once. `fragmentSocket` is what turns
+// «прокси или фрагментация» into «прокси и фрагментация».
+const composeSocket = () => {}
+const composing = await createOriginFactory({
+  loadUndici: async () => fake.module,
+  spec: fragSpec,
+  enabled: true,
+  proxiedHosts: HOSTS,
+  fragment: fragConnect,
+  fragmentSocket: composeSocket,
+  fragmentBytes: 16,
+  fragmentDelayMs: 3,
+  delegate: () => ({ delegated: true }),
+})
+fake.log.length = 0
+composing.factory(RUSTVY)
+const composedEntry = fake.log.find(entry => entry.kind === 'Pool')
+check('with a plaintext proxy and fragmentSocket, the origin gets a composed Pool rather than a ProxyAgent',
+  composedEntry !== undefined && composedEntry.connect === 'function'
+  && fake.log.some(entry => entry.kind === 'ProxyAgent') === false, JSON.stringify(fake.log))
+check('and the composed Pool is tracked, so switching off closes it',
+  composing.created.length === 1, `created=${composing.created.length}`)
+
+// An https proxy is deliberately NOT composed: TLS to the proxy plus TLS through it is a
+// different connector, and quietly falling back while the page says fragmentation is on would be
+// the silent no-op this feature keeps having to defend against.
+const httpsProxy = await createOriginFactory({
+  loadUndici: async () => fake.module,
+  spec: { ok: true, mode: 'http', scheme: 'https', host: 'proxy.example', port: 8080, hasCredentials: false },
+  enabled: true,
+  proxiedHosts: HOSTS,
+  fragmentSocket: composeSocket,
+  delegate: () => ({ delegated: true }),
+})
+fake.log.length = 0
+httpsProxy.factory(RUSTVY)
+check('an https proxy falls back to ProxyAgent rather than pretending to compose',
+  fake.log.some(entry => entry.kind === 'ProxyAgent'), JSON.stringify(fake.log))
+
 // --- close-on-disable: a privacy property, not tidiness ----------------------
 const closable = await createOriginFactory({
   loadUndici: async () => fake.module,

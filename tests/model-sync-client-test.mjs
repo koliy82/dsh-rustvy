@@ -687,12 +687,47 @@ let PROXY_HTTP = 200
 let TIMEOUT_VALUE = null
 let TIMEOUT_ROUTES = 2
 let TIMEOUT_ANSWER = { ok: true, applied: true, value: 3600000, routes: ['rustvy', 'rustvy-k2'], available: true, current: 3600000, routeCount: 2 }
+/**
+ * What `/diagnose` answers with.
+ *
+ * Deliberately a *partial* shape: the probe is still being built, so an answer with keys absent
+ * and values null is what the page will really receive, and rendering that as an absence rather
+ * than as a zero is the property under test. It also carries a password and an api key that no
+ * layer should ever surface.
+ */
+let DIAG_ANSWER = {
+  ok: true,
+  at: '2026-11-04T21:55:02.114Z',
+  // With userinfo in it, on purpose: the recording side scrubs the origin, and the page must
+  // not depend on that having happened.
+  origin: 'https://user:pass-must-not-render@rustvy.xyz',
+  host: 'rustvy.xyz',
+  port: 443,
+  secure: true,
+  verdict: 'tls',
+  dns: { ok: true, ms: 12, addresses: ['91.108.56.1', '91.108.56.2', '91.108.56.3', '91.108.56.4', '91.108.56.5'] },
+  tcp: { ok: true, ms: 76 },
+  tls: { ok: false, ms: 30005, code: 'ETIMEDOUT', message: 'handshake timed out', protocol: 'TLSv1.3', authorized: false },
+  // `frag` is an explicit null and `httpFrag` is absent entirely: the two shapes of "no
+  // measurement", which must render identically rather than one of them becoming a zero.
+  frag: null,
+  http: {
+    ok: true, ms: 163, status: 200, bytes: 4213,
+    // Neither of these is on the layer's allowlist, so neither may be rendered: an unexpected
+    // scalar and an unexpected nested object both fail closed.
+    attempts: 8,
+    password: 'hunter2-must-not-render',
+    nested: { apiKey: 'sk-must-not-render' },
+  },
+  history: [{ ok: false, ms: 30005, error: 'ECONNRESET', token: 'token-must-not-render' }],
+}
 
 globalThis.fetch = async (url, init = {}) => {
   const path = String(url)
   const method = (init.method ?? 'GET').toUpperCase()
   requests.push({ path, method, body: init.body })
   if (path.includes('/models.yaml')) return { ok: true, status: 200, text: async () => YAML_TEXT }
+  if (path.endsWith('/diagnose')) return json(DIAG_ANSWER)
   if (path.endsWith('/timeout')) {
     if (method === 'GET') return json({ ok: true, available: true, value: TIMEOUT_VALUE, routes: TIMEOUT_ROUTES })
     return json(TIMEOUT_ANSWER)
@@ -1035,7 +1070,11 @@ check('auto-apply defaults to explicit', selectWith(tree, 'explicit')?.props.val
 check('the name source defaults to the provider label', selectWith(tree, 'displayName')?.props.value === 'displayName',
   String(selectWith(tree, 'displayName')?.props.value))
 // Twelve, not eleven: the fragmentation block adds the switch that extends it to model traffic.
-check('twelve switches render', boxes.length === 12, String(boxes.length))
+// Thirteen, not twelve: the fragmentation block adds the switch that extends it to model
+// traffic and the one that governs automatic promotion. This count has now moved three times,
+// which is the cost of asserting a page-wide total; it is left as-is because it is client-ui's
+// structure and the count does catch a control silently failing to render.
+check('thirteen switches render', boxes.length === 13, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -1279,7 +1318,7 @@ text = allText(tree)
 // than by index, so a switch added above it cannot silently retarget this block at some other
 // checkbox.
 check('the master switch for the ring is offered',
-  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 12
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 13
   && text.includes('Ключи на несколько чатов'))
 check('the key count is shown against the limit', text.includes('2 из 12'))
 check('each key reports how many models its route serves', text.includes('моделей: 12'))
@@ -3300,10 +3339,176 @@ STATE.config.tlsFragmentGlobal = false
     x.includes('ничего не стоит, пока не понадобится') && x.includes('двух подряд сбоев транспорта'), 'missing')
   check('and that an HTTP 4xx/5xx is not a transport failure',
     x.includes('4xx') && x.includes('не считается') && x.includes('доставивший 502, работает'), 'missing')
-  check('the copy says the global switch is what reaches model traffic, and that it is experimental',
-    x.includes('единственный, который дотягивается до запросов модели') && x.includes('экспериментально'), 'missing')
-  check('and that it composes with the proxy rather than replacing it',
-    x.includes('сочетается, а не заменяет') && x.includes('прокси важнее'), 'missing')
+  // The coverage wording has to be *at the control*: the user hit a real block with `auto` on
+  // and the global switch off, and model traffic was never fragmented. A reader who can leave
+  // this page believing the model is covered when it is not has been misled by the wording.
+  check('the mode control says what it covers, at the control',
+    x.includes('действует только на запросы самого плагина') && x.includes('каталог, логотипы')
+    && x.includes('Запросы модели он не затрагивает'), 'missing')
+  check('and the global switch says it is experimental and reaches the whole process',
+    x.includes('экспериментальный') && x.includes('глобальный fetch') && x.includes('всего процесса'), 'missing')
+  // The promotion contract. This switch used to be described as the only way in, which was true
+  // and then stopped being true. Each check below is a way a reader would otherwise draw the
+  // wrong conclusion about who fragments model traffic, and when.
+  check('the page says promotion happens by default, once measurement earns it',
+    x.includes('По умолчанию плагин повышает фрагментацию до запросов модели сам')
+    && x.includes('обычное рукопожатие не проходит, а фрагментированное проходит'), 'missing')
+  check('and that it stands down when the channel recovers', x.includes('повышение снимается обратно'), 'missing')
+  check('the switch reads as an override, not as the only way in',
+    x.includes('принудительное включение для случая, когда ждать замера не нужно'), 'missing')
+  check('promotion does not fire under always, and the page says what that would have cost',
+    x.includes('в положении «always» его не происходит') && x.includes('1658 мс')
+    && x.includes('цену, которую вы уже заплатили'), 'missing')
+  check('the signal comes from the plugin\'s own requests, so a working proxy means no promotion',
+    x.includes('сигнал дают собственные запросы плагина') && x.includes('Если прокси включён и работает'), 'missing')
+  check('and plain transport with unfragmented model traffic is named as a correct state, not a failure',
+    x.includes('может показывать plain') && x.includes('верное состояние, а не поломка'), 'missing')
+
+  // --- the `always` cost warning, at `always` and only there ------------------
+  check('auto carries no standing-cost warning, because it has no standing cost',
+    !x.includes('в 4,7 раза дороже'), 'the always warning rendered while the mode is auto')
+  STATE.config.tlsFragment = 'always'
+  const alwaysText = allText(render())
+  check('always warns with the measured numbers rather than an adjective',
+    alwaysText.includes('353 мс') && alwaysText.includes('1658 мс')
+    && alwaysText.includes('в 4,7 раза дороже') && alwaysText.includes('30005 мс'), 'missing')
+  check('and it says auto gives the same protection without the standing cost',
+    alwaysText.includes('ту же защиту без этой постоянной платы'), 'missing')
+  check('and that always has no plain fallback, which is why the cost is standing',
+    alwaysText.includes('не имеет запасного обычного пути'), 'missing')
+
+  // --- the channel diagnosis --------------------------------------------------
+  STATE.config.tlsFragment = 'auto'
+  const diagButton = findButton(render(), 'Диагностика канала')
+  check('the diagnosis button is in the same block as the switch it diagnoses', diagButton !== undefined, 'missing')
+  requests.length = 0
+  diagButton.props.onClick()
+  await flush()
+  const diagPost = requests.find(item => item.path === '/dsh-rustvy/diagnose')
+  check('it posts to /diagnose', diagPost !== undefined && diagPost.method === 'POST',
+    JSON.stringify(requests.map(item => `${item.method} ${item.path}`)))
+  const diagText = allText(render())
+  check('every layer renders under its own name',
+    ['DNS', 'TCP-соединение', 'TLS-рукопожатие обычное', 'TLS-рукопожатие фрагментированное',
+      'HTTP-запрос обычный', 'HTTP-запрос фрагментированный'].every(name => diagText.includes(name)),
+    'a layer is missing')
+  check('a measured layer shows its timing and its outcome',
+    diagText.includes('12 мс') && diagText.includes('успех') && diagText.includes('ETIMEDOUT'), 'missing')
+  check('a layer the probe answered null renders as absent',
+    diagText.includes('нет замера'), 'missing')
+  // Two absences, from the two shapes: `tlsFrag` is null and `httpFrag` is a missing key. Both
+  // must say the same thing, and neither may become a zero or a dash — a dash in a column of
+  // timings reads as a measurement that came out empty.
+  check('and a missing key renders as the same absence as an explicit null',
+    diagText.split('нет замера').length - 1 === 2, String(diagText.split('нет замера').length - 1))
+  // Scoped to the two rows rather than to the page text: a page-wide search for a fabricated
+  // zero also matches the timeout block's «300000 мс», which contains «0 мс». Asserting the
+  // exact value of each absent row is both precise and stronger.
+  const diagRows = render()
+  check('the null layer says exactly «нет замера» and nothing else',
+    rowValue(diagRows, 'TLS-рукопожатие фрагментированное') === 'нет замера',
+    String(rowValue(diagRows, 'TLS-рукопожатие фрагментированное')))
+  check('and the missing-key layer says exactly the same',
+    rowValue(diagRows, 'HTTP-запрос фрагментированный') === 'нет замера',
+    String(rowValue(diagRows, 'HTTP-запрос фрагментированный')))
+  // The allowlist, in both directions. A layer's known extras are rendered in the page's own
+  // words; anything the probe emits beyond them is dropped, because a field nobody screened
+  // must fail closed rather than appear on a page the user will screenshot into a bug report.
+  check('a layer\'s known extras render, in the page\'s words rather than the probe\'s',
+    diagText.includes('адреса: 91.108.56.1') && diagText.includes('и ещё 1')
+    && diagText.includes('протокол: TLSv1.3') && diagText.includes('сертификат НЕ проверен')
+    && diagText.includes('HTTP: 200') && diagText.includes('байт: 4213'), 'a known extra did not render')
+  check('an unexpected scalar field on a layer is not rendered',
+    !diagText.includes('attempts'), 'an unscreened field reached the page')
+  check('and an unexpected nested object is not rendered either',
+    !diagText.includes('nested'), 'an unscreened object reached the page')
+  check('the verdict is a sentence of its own, not a row',
+    diagText.includes('обычное TLS-рукопожатие не проходит'), diagText.slice(0, 200))
+  check('and the origin is shown scrubbed of userinfo',
+    diagText.includes('rustvy.xyz') && !diagText.includes('pass-must-not-render'), 'the origin leaked credentials')
+  check('the recent-failure history renders when the route returns it',
+    diagText.includes('Недавние сбои') && diagText.includes('ECONNRESET'), 'missing')
+  check('no password inside a layer reaches the page', !diagText.includes('must-not-render'), 'a hidden value rendered')
+  check('nor an api key, an authorization header, or a history token',
+    !diagText.includes('sk-must-not-render') && !diagText.includes('Bearer') && !diagText.includes('token-must-not-render'),
+    'a credential rendered')
+  check('and the hidden keys are not named on the page either',
+    !diagText.includes('password:') && !diagText.includes('apiKey:') && !diagText.includes('authorization:'),
+    'a hidden key name rendered')
+  // The third case: a layer that was never attempted because one above it already explained the
+  // outcome. It must read differently from both a measured failure and an absence, since "we did
+  // not try" and "we tried and it failed" have different remedies.
+  DIAG_ANSWER = {
+    ...DIAG_ANSWER,
+    verdict: 'tls-plain-blocked',
+    frag: { ok: true, ms: 1628, protocol: 'TLSv1.3', authorized: true, pieces: 100 },
+    http: { ok: false, skipped: 'tls failed' },
+  }
+  findButton(render(), 'Диагностика канала').props.onClick()
+  await flush()
+  const skipped = render()
+  const skippedText = allText(skipped)
+  check('a skipped layer says it was not attempted, and names what stopped it',
+    rowValue(skipped, 'HTTP-запрос обычный') === 'не проверялось — tls failed',
+    String(rowValue(skipped, 'HTTP-запрос обычный')))
+  check('a skip is not rendered as an absence',
+    skippedText.split('нет замера').length - 1 === 1, String(skippedText.split('нет замера').length - 1))
+  check('and not as a measured failure either',
+    !String(rowValue(skipped, 'HTTP-запрос обычный')).includes('отказ'), String(rowValue(skipped, 'HTTP-запрос обычный')))
+  check('a measured fragment layer reports its piece count',
+    String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')).includes('фрагментов: 100'),
+    String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')))
+  check('the TSPU signature verdict is named as such, because it is the informative one during a block',
+    skippedText.includes('подпись блокировки ТСПУ'), skippedText.slice(0, 200))
+  DIAG_ANSWER = { ok: false, error: 'probe unavailable' }
+  findButton(render(), 'Диагностика канала').props.onClick()
+  await flush()
+  const diagFailedText = allText(render())
+  check('a diagnosis that fails as a whole says so rather than rendering six absences',
+    diagFailedText.includes('Диагностика не выполнилась'), diagFailedText.slice(0, 200))
+
+  // --- the automatic-promotion control, and the copy that turns with it -------
+  // An automatic behaviour that cannot be turned off is not a default but an imposition, and
+  // this one installs a dispatcher over the whole process's outbound traffic. Both halves are
+  // asserted: the control exists and posts the right field, and the copy stops promising
+  // promotion when the control is off — unconditional text here would describe a machine that
+  // is no longer running.
+  STATE.config.tlsFragmentGlobalAuto = true
+  STATE.config.tlsFragmentGlobal = false
+  const autoOn = render()
+  const autoBox = collect(autoOn, 'label')
+    .filter(item => allText(item).includes('автоматически, по замеру'))
+    .map(item => collect(item, 'input').find(input => input.props.type === 'checkbox'))
+    .find(item => item !== undefined)
+  check('the automatic-promotion switch renders, and defaults to on',
+    autoBox !== undefined && autoBox.props.checked === true, String(autoBox?.props.checked))
+  check('the copy promises promotion while it is on',
+    allText(autoOn).includes('По умолчанию плагин повышает фрагментацию до запросов модели сам'), 'missing')
+  requests.length = 0
+  autoBox.props.onChange({ target: { checked: false } })
+  await flush()
+  const autoPost = requests.find(item => item.path === '/dsh-rustvy/config' && String(item.body).includes('tlsFragmentGlobalAuto'))
+  check('turning it off posts only that field',
+    autoPost !== undefined && autoPost.body === '{"tlsFragmentGlobalAuto":false}', String(autoPost?.body))
+
+  STATE.config.tlsFragmentGlobalAuto = false
+  const autoOff = allText(render())
+  check('the copy stops promising promotion once it is off',
+    !autoOff.includes('По умолчанию плагин повышает фрагментацию до запросов модели сам')
+    && autoOff.includes('Автоматическое повышение выключено'), 'the copy still promised an automatic that is off')
+  check('and it says what that leaves covering the plugin\'s own requests only',
+    autoOff.includes('фрагментация остаётся только на собственных запросах плагина'), 'missing')
+  STATE.config.tlsFragmentGlobalAuto = true
+  // Was "the proxy outranks fragmentation for the same host", which was true in 1.5.0 and false
+  // now: a plaintext proxy and fragmentation compose, and the ClientHello is fragmented inside
+  // the tunnel. The negative half is asserted too, because the stale phrase surviving in the copy
+  // is the defect this check exists to catch — and it hid from a line-based grep by wrapping
+  // across two source lines, which is the failure mode AGENTS.md warns about.
+  check('the copy says a plaintext proxy now composes with fragmentation, and names what does not',
+    x.includes('фрагментируется внутри туннеля') && x.includes('Сочетается только plaintext-прокси')
+    && x.includes('SOCKS5'), 'missing')
+  check('and no longer claims the proxy outranks fragmentation',
+    !x.includes('важнее фрагментации'), 'the superseded claim is still on the page')
   check('the copy says 16 bytes is not a speed knob and bigger can silently stop working',
     x.includes('не регулятор скорости') && x.includes('тихо перестать работать') && x.includes('больше не значит лучше'), 'missing')
   check('and it states the Windows cost, which is not the Linux figure in the task document',

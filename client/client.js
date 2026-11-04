@@ -3902,6 +3902,187 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       const fragBytes = String(config.tlsFragmentBytes ?? 16)
       const fragDelay = String(config.tlsFragmentDelayMs ?? 3)
       const fragGlobal = config.tlsFragmentGlobal === true
+      // Absent reads as `true`, matching `DEFAULT_CONFIG`: an older host half publishes no such
+      // key, and the behaviour it has is the automatic one.
+      const fragGlobalAuto = config.tlsFragmentGlobalAuto !== false
+
+      /**
+       * The channel diagnosis, and why the button exists.
+       *
+       * While the channel is blocked nobody can reach the origin — not the user, and not a
+       * developer reading the report afterwards — so there is nothing left to measure once the
+       * window closes. The button is how evidence gets captured *during* the block and handed
+       * over later. That is also why the rendering is layered rather than a single verdict: a
+       * failure at TCP and a failure at the fragmented handshake are different faults with
+       * different remedies, and collapsing them loses the only useful part.
+       */
+      const [diagBusy, setDiagBusy] = React.useState(false)
+      const [diagResult, setDiagResult] = React.useState(undefined)
+
+      /**
+       * Run the channel diagnosis.
+       *
+       * Its own fetch path rather than `post()`, for the same reason the proxy probe has one:
+       * the page needs the response body, and this changes no setting, so `post()`'s
+       * notice-and-reload would be the wrong aftermath.
+       *
+       * @returns a promise that settles once the outcome is rendered.
+       */
+      const runDiagnose = async () => {
+        setDiagBusy(true)
+        setDiagResult(undefined)
+        try {
+          const response = await fetch(`${API}/diagnose`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: '{}',
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`)
+          setDiagResult(payload)
+        } catch (error) {
+          setDiagResult({ failed: error.message })
+        } finally {
+          setDiagBusy(false)
+        }
+      }
+
+      /**
+       * Keys that never reach the page, whatever the probe learns to return.
+       *
+       * Compared in lower case, and the list is deliberately wider than what today's probe
+       * emits: the contract is not final, and a new field carrying a credential must fail
+       * closed rather than be rendered because nobody thought to add it here.
+       */
+      const DIAG_HIDDEN = new Set(['password', 'passwd', 'secret', 'apikey', 'api_key', 'key', 'token', 'authorization', 'auth', 'credential', 'value', 'ref'])
+
+      /**
+       * The layers, in the order the connection is built, with the extra fields each is allowed
+       * to carry.
+       *
+       * The names are the probe's own — `tls`, `frag`, `http`, `httpFrag` — and getting them
+       * wrong is not cosmetic: a renderer keyed on names the probe does not emit reports six
+       * absences for a probe that measured everything, which is the same "nothing was measured"
+       * lie the whole-probe failure used to tell, one level down.
+       *
+       * The third element is an allowlist, and it is the reason the walk below stays safe. Each
+       * layer is a nested object, so "drop nested objects rather than walk them" had to become
+       * "walk the six known layers, and only their known scalar fields" — an *unexpected* nested
+       * object anywhere else still fails closed.
+       */
+      const DIAG_LAYERS = [
+        ['dns', 'DNS', ['addresses']],
+        ['tcp', 'TCP-соединение', []],
+        ['tls', 'TLS-рукопожатие обычное', ['protocol', 'authorized']],
+        ['frag', 'TLS-рукопожатие фрагментированное', ['protocol', 'authorized', 'pieces']],
+        ['http', 'HTTP-запрос обычный', ['status', 'bytes']],
+        ['httpFrag', 'HTTP-запрос фрагментированный', ['status', 'bytes']],
+      ]
+
+      /** The extra fields, in the page's language rather than the probe's. */
+      const DIAG_FIELDS = {
+        addresses: 'адреса',
+        protocol: 'протокол',
+        pieces: 'фрагментов',
+        status: 'HTTP',
+        bytes: 'байт',
+      }
+
+      /**
+       * What one verdict means, as a sentence.
+       *
+       * `tls-plain-blocked` is first among equals: it is the TSPU signature, and during a block
+       * it is the most informative thing on the page — it says the ordinary handshake is being
+       * dropped while the fragmented one gets through, which is the whole reason this feature
+       * exists. Anything the page does not know is rendered as itself rather than dropped.
+       */
+      const DIAG_VERDICTS = {
+        ok: 'канал проходит целиком: и обычное, и фрагментированное рукопожатие работают',
+        dns: 'имя провайдера не разрешается — сбой на DNS, до соединения дело не доходит',
+        tcp: 'DNS отвечает, но TCP-соединение не устанавливается',
+        tls: 'обычное TLS-рукопожатие не проходит',
+        'tls-plain-blocked': 'обычное TLS-рукопожатие блокируется, а фрагментированное проходит — это подпись блокировки ТСПУ',
+        'frag-unavailable': 'фрагментированный транспорт недоступен',
+        http: 'рукопожатие проходит, но HTTP-запрос не удаётся',
+        'bad-origin': 'адрес провайдера в настройках неверен — измерять нечего',
+      }
+
+      /**
+       * One layer as a line of text, or `null` when it was never measured.
+       *
+       * Three outcomes, kept apart because they have different remedies: a measurement
+       * (`успех` or `отказ` with its timing and detail), a **skip** (`skipped` — a layer above
+       * already explained the outcome, so this one was never attempted), and an **absence**
+       * (`null`, or the key missing entirely). Collapsing a skip into a failure blames a layer
+       * that was never reached; collapsing either into an absence reports "nothing was measured"
+       * for a probe that measured plenty. That distinction is the whole reason the view is
+       * layered, so it is carried in the return value rather than flattened into the string.
+       *
+       * Absence renders as «нет замера», never as a zero or a dash: a dash in a column of
+       * timings reads as a measurement that came out empty.
+       *
+       * Only the fields named in `allowed` are read off a layer. Everything else — including any
+       * unexpected nested object — is dropped, so a field the probe starts emitting tomorrow
+       * fails closed instead of being rendered because nobody screened it.
+       *
+       * @param entry - one layer's measurement, `null`, or a `{ skipped }` marker.
+       * @param allowed - the extra field names this layer may carry.
+       * @returns `{ text, skipped }`, or `null` when there is nothing measured to show.
+       */
+      const diagLine = (entry, allowed = []) => {
+        if (entry === null || entry === undefined) return null
+        if (typeof entry !== 'object') return { text: String(entry), skipped: false }
+        if (typeof entry.skipped === 'string' && entry.skipped !== '') {
+          return { text: `не проверялось — ${entry.skipped}`, skipped: true }
+        }
+        const parts = []
+        if (typeof entry.ok === 'boolean') parts.push(entry.ok ? 'успех' : 'отказ')
+        if (Number.isFinite(entry.ms)) parts.push(`${Math.round(entry.ms)} мс`)
+        if (entry.code !== undefined && entry.code !== null) parts.push(`код ${String(entry.code)}`)
+        if (typeof entry.message === 'string' && entry.message !== '') parts.push(entry.message)
+        if (typeof entry.error === 'string' && entry.error !== '') parts.push(entry.error)
+        for (const field of allowed) {
+          if (DIAG_HIDDEN.has(String(field).toLowerCase())) continue
+          const value = entry[field]
+          if (value === null || value === undefined) continue
+          // A nested object that is not a list is not screened and therefore not rendered.
+          if (typeof value === 'object' && !Array.isArray(value)) continue
+          const label = DIAG_FIELDS[field] ?? field
+          if (field === 'authorized') {
+            parts.push(value === true ? 'сертификат проверен' : 'сертификат НЕ проверен')
+          } else if (Array.isArray(value)) {
+            const shown = value.slice(0, 4).map(item => String(item)).join(', ')
+            parts.push(`${label}: ${shown}${value.length > 4 ? ` и ещё ${value.length - 4}` : ''}`)
+          } else {
+            parts.push(`${label}: ${String(value)}`)
+          }
+        }
+        return parts.length === 0 ? null : { text: parts.join(', '), skipped: false }
+      }
+
+      /**
+       * The origin the probe measured, with any userinfo stripped.
+       *
+       * The recording side already scrubs it, and the page does not depend on that: an address
+       * with credentials in it would otherwise be rendered into a screenshot the user pastes
+       * into a bug report, which is exactly how a password escapes.
+       *
+       * @param result - the diagnosis answer.
+       * @returns the origin to show, or `null` when there is none.
+       */
+      const diagOrigin = result => {
+        const raw = result?.origin
+        if (typeof raw !== 'string' || raw === '') return null
+        try {
+          const url = new URL(raw)
+          url.username = ''
+          url.password = ''
+          return url.toString().replace(/\/$/u, '')
+        } catch {
+          // Not a URL: show it only if it carries no credential shape at all.
+          return raw.includes('@') ? null : raw
+        }
+      }
 
       /**
        * The live transport, and the one sentence that has to be derived rather than read.
@@ -4396,6 +4577,30 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
               options: [['off', 'выключена'], ['auto', 'auto — только при сбоях транспорта'], ['always', 'always — всегда']],
               onChange: value => { void post('/config', { tlsFragment: value }, 'save') },
             })),
+          // What this control covers, stated at the control rather than in a footnote. The user
+          // hit a real block with `auto` and the global switch off, and model traffic was never
+          // fragmented — the setting read as «обход блокировки» while covering only the plugin's
+          // own requests. A reader who can leave this page believing the model is covered when
+          // it is not has been misled by the wording, so the scope is a line of its own.
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '4px' } },
+            'Этот переключатель действует только на запросы самого плагина: каталог, логотипы, '
+            + 'отчёты аптайма, проверки ключей. Запросы модели он не затрагивает — для них отдельный '
+            + 'переключатель ниже.'),
+          // The cost warning belongs beside `always` and appears when `always` is chosen, because
+          // that is the moment the decision is being made. The numbers are measured on this
+          // machine, not estimated: plain 8/8 at a 353 ms average against fragmented 8/8 at
+          // 1658 ms — 4.7x — with one fragmented attempt timing out at 30005 ms while plain kept
+          // succeeding. `always` has no plain fallback at all, so that cost is standing.
+          fragMode === 'always'
+            ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+                '«always» фрагментирует каждое новое соединение сразу и не имеет запасного обычного пути. '
+                + 'Замер на этой машине: обычный транспорт 8 из 8, в среднем 353 мс; фрагментированный '
+                + '8 из 8, в среднем 1658 мс — в 4,7 раза дороже, и одна попытка ушла в таймаут на '
+                + '30005 мс, пока обычный транспорт продолжал отвечать. Причина в арифметике: при 16 байтах '
+                + 'ClientHello занимает 1587 байт, то есть распадается на сто частей. '
+                + '«auto» даёт ту же защиту без этой постоянной платы — оно переключается только после сбоев '
+                + 'транспорта. «always» стоит выбирать тогда, когда вы замерили, что обычный транспорт не работает.')
+            : null,
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' } },
             h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Размер фрагмента, байт'),
             h(TextField, {
@@ -4418,26 +4623,119 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
               onChange: event => { void post('/config', { tlsFragmentGlobal: event.target.checked }, 'save') },
             }),
             h('span', { style: { fontSize: '12.5px' } }, 'Включить фрагментацию ClientHello и для запросов модели')),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '4px' } },
+            // This paragraph describes the DEFAULT (`tlsFragmentGlobalAuto: true`). It is
+            // unconditional copy, not driven off a field the page does not read yet: the host
+            // half is still landing, and text that depends on an unpublished setting is text
+            // that can be wrong in a way nothing tests. If that setting ever becomes a control
+            // on this page, this sentence has to become conditional with it.
+            'Запросы модели идут через глобальный fetch процесса, который трогает лишь второй уровень — '
+            + 'он ставит фабрику маршрутов плагина глобальным диспетчером undici. Уровень экспериментальный: '
+            + 'он влияет на исходящий трафик всего процесса, а не только плагина. '
+            + (fragGlobalAuto
+              ? 'По умолчанию плагин повышает фрагментацию до запросов модели сам: как только его собственные '
+            + 'запросы замерили, что обычное рукопожатие не проходит, а фрагментированное проходит. Когда '
+            + 'канал снова отвечает обычным способом, повышение снимается обратно. '
+              : 'Автоматическое повышение выключено переключателем ниже, поэтому сам плагин запросы модели '
+              + 'не трогает: фрагментация остаётся только на собственных запросах плагина. ')
+            + 'Этот переключатель — принудительное включение для случая, когда ждать замера не нужно. '
+            + 'Повышение срабатывает только по замеру, поэтому в положении «always» его не происходит: '
+            + 'иначе рукопожатие в 1658 мс встало бы на каждый запрос модели только потому, что вы щёлкнули '
+            + 'выключателем, — цену, которую вы уже заплатили один раз. '
+            + 'Важное следствие: сигнал дают собственные запросы плагина. Если прокси включён и работает, они '
+            + 'проходят и повышения не происходит — это правильно, значит ничего не заблокировано. Поэтому '
+            + 'строка «транспорт сейчас» может показывать plain, а трафик модели при этом не фрагментируется, '
+            + 'и это верное состояние, а не поломка.'),
+          // The automatic behaviour gets its own switch. An automatic that cannot be turned off
+          // is not a default but an imposition, and this one installs a dispatcher over the whole
+          // process's outbound traffic — so a user who does not want the plugin doing that on a
+          // measurement of its own has to be able to say so.
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '10px', cursor: 'pointer' } },
+            h('input', {
+              type: 'checkbox',
+              checked: fragGlobalAuto,
+              onChange: event => { void post('/config', { tlsFragmentGlobalAuto: event.target.checked }, 'save') },
+            }),
+            h('span', { style: { fontSize: '12.5px' } }, 'Повышать фрагментацию до запросов модели автоматически, по замеру')),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '4px' } },
+            'Действует, когда принудительное включение выше выключено. Плагин повышает фрагментацию до запросов '
+            + 'модели только тогда, когда собственные его запросы замерили, что обычное рукопожатие не проходит, '
+            + 'а фрагментированное проходит, — и снимает повышение, когда канал снова отвечает обычным способом.'),
+          // The diagnosis button lives in this block because it answers the question the block
+          // raises — "is my channel actually blocked, and where does it break" — and because the
+          // answer cannot be reconstructed later: while the block is on, nobody can reach the
+          // origin to measure it.
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '10px' } },
+            h(Button, {
+              disabled: busy !== '' || diagBusy,
+              onClick: () => { void runDiagnose() },
+            }, diagBusy ? 'Диагностика…' : 'Диагностика канала')),
+          diagResult === undefined
+            ? null
+            // A probe that failed as a whole is not six absent layers. Rendering it that way
+            // would report "nothing was measured" — which reads as "the channel gave nothing
+            // back" — when the truth is the diagnosis itself did not run, and those two have
+            // different remedies. So the failure gets its own sentence.
+            : diagResult.failed !== undefined || diagResult.ok === false
+              ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+                  `Диагностика не выполнилась: ${String(diagResult.failed ?? diagResult.error ?? 'причина не сообщена')}`)
+              : h('div', { style: { marginTop: '8px' } },
+                  // The verdict gets a sentence of its own. During a block `tls-plain-blocked`
+                  // is the most informative thing on the page — it says the ordinary handshake
+                  // is being dropped while the fragmented one gets through — and burying it in
+                  // a row would lose it. An unknown verdict is shown as itself, not dropped.
+                  diagResult.verdict === undefined || diagResult.verdict === null
+                    ? null
+                    : h('div', {
+                        style: {
+                          color: diagResult.verdict === 'ok' ? C.ok : C.warn,
+                          fontSize: '12px', lineHeight: 1.6, marginBottom: '6px',
+                        },
+                      }, DIAG_VERDICTS[diagResult.verdict] ?? `вердикт: ${String(diagResult.verdict)}`),
+                  // What was measured, and when: this evidence gets handed over after the block
+                  // is over, so it has to say for itself which origin it describes.
+                  diagOrigin(diagResult) === null
+                    ? null
+                    : h('div', { style: { color: C.labelSecondary, fontSize: '11px', lineHeight: 1.6, marginBottom: '4px' } },
+                        `замер ${diagResult.at === undefined || diagResult.at === null ? 'без отметки времени' : String(diagResult.at)} · ${diagOrigin(diagResult)}`),
+                  ...DIAG_LAYERS.map(layer => {
+                    const line = diagLine(diagResult[layer[0]], layer[2])
+                    // Three cases, three renderings: measured, skipped, and absent. Absent is
+                    // «нет замера» and never a dash, because a dash in a column of timings reads
+                    // as a measurement that came out empty; a skip is coloured apart from a
+                    // failure, because "we did not try" and "we tried and it failed" have
+                    // different remedies and the layered view exists to keep them apart.
+                    if (line === null) return h(Row, { key: layer[0], name: layer[1] }, 'нет замера')
+                    return h(Row, {
+                      key: layer[0],
+                      name: layer[1],
+                      tone: line.skipped ? C.labelSecondary : line.text.startsWith('отказ') ? C.warn : undefined,
+                    }, line.text)
+                  }),
+                  Array.isArray(diagResult.history) && diagResult.history.length > 0
+                    ? h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+                        `Недавние сбои: ${diagResult.history.map(item => diagLine(item)?.text ?? 'нет замера').join('; ')}`)
+                    : null),
           h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '8px' } },
             'Разбивает ClientHello на части, чтобы имя хоста не читалось целиком в одном пакете. '
             + '«auto» ничего не стоит, пока не понадобится: транспорт начинается обычным (plain) и переключается '
             + 'только после двух подряд сбоев транспорта, поэтому дорогие ~1,5 с платятся внутри окна блокировки, '
             + 'а не заранее. Сбой транспорта — это отказ соединения или таймаут; HTTP-ответ 4xx или 5xx им не '
             + 'считается, потому что транспорт, доставивший 502, работает. '
-            + '«always» фрагментирует сразу и всегда. '
-            + 'Переключатель выше — единственный, который дотягивается до запросов модели, и он выключен не '
-            + 'случайно: без него правило касается только собственных запросов плагина (каталог, значки, отчёты '
-            + 'аптайма, проверка ключей), а запросы модели идут через глобальный fetch процесса, который трогает '
-            + 'только второй уровень — он ставит нашу фабрику маршрутов глобальным диспетчером. Это экспериментально. '
-            + 'Со прокси оно сочетается, а не заменяет его: для одного и того же хоста настроенный прокси важнее '
-            + 'фрагментации. '
+            + 'С прокси фрагментация теперь сочетается: plaintext-прокси туннелирует запрос, а ClientHello '
+            + 'фрагментируется внутри туннеля — туннель CONNECT не шифрует то, что по нему передают, поэтому DPI '
+            + 'видит ClientHello там же, где увидел бы его без прокси. Сочетается только plaintext-прокси: прокси '
+            + 'с https:// и SOCKS5 по-прежнему идут на собственных агентах undici, и фрагментации внутри них нет. '
             + '16 байт — не регулятор скорости, а размер, при котором имя хоста гарантированно разрывается между '
             + 'пакетами: подняв его до 64, можно оставить имя целым внутри одного пакета и тихо перестать работать, '
             + 'поэтому больше не значит лучше. '
             + 'Замеренная цена на Windows — около 1,5 с на каждое новое соединение при 16 байт и паузе 3 мс: '
             + 'ClientHello здесь 1587 байт (TLS 1.3 с постквантовым ключевым материалом), то есть 100 фрагментов, '
             + 'а гранулярность setTimeout на Windows около 15,6 мс. Keep-alive означает, что это раз на соединение, '
-            + 'а не раз на запрос.'),
+            + 'а не раз на запрос. '
+            + '«Диагностика канала» измеряет канал по слоям — DNS, TCP, обычное и фрагментированное TLS-рукопожатие, '
+            + 'HTTP по каждому из них — и полезна именно во время блокировки: после неё измерять уже нечего, '
+            + 'происходящее недоступно ни вам, ни тому, кто будет разбирать жалобу.'),
           h(Row, { name: 'сборка' }, `${status?.build ?? '—'} (ревизия ${status?.revision ?? '—'})`),
           status?.error === undefined
             ? null

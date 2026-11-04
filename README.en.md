@@ -1189,15 +1189,72 @@ delay: the ClientHello is 1587 bytes here (TLS 1.3 with a post-quantum key share
 fragments, and `setTimeout` granularity on Windows is about 15.6 ms. Keep-alive means this is
 paid once per connection, not once per request.
 
-The **"Also fragment ClientHello for model requests"** switch is off by default, and that is a
-substantive decision rather than caution for its own sake. Without it the rule covers only the
-plugin's own requests: catalogue, logos, uptime reports, key checks. Model requests go through
-the process's global `fetch`, which only the second level touches — it installs the plugin's
-origin factory as the global undici dispatcher. The second level is **experimental**: it affects
-the outbound traffic of the whole process, not just the plugin's.
+### How fragmentation reaches model requests
 
-Fragmentation **composes with** a proxy rather than replacing it: for the same host, a configured
-proxy outranks fragmentation.
+Model requests go through the process's global `fetch`, not through the plugin's own requests, so
+fragmentation reaches them only via the second level — it installs the plugin's origin factory as the
+global undici dispatcher. That level is **experimental**: it affects the outbound traffic of the whole
+process, not just the plugin's.
+
+By default the second level turns itself on (`tlsFragmentGlobalAuto`, default `true`). The plugin
+promotes fragmentation to model traffic once its own requests have **measured** that the ordinary
+handshake does not get through and the fragmented one does, and stands the promotion back down when
+the channel answers ordinarily again. No switch has to be touched for that to happen.
+
+Promotion fires only on a measurement, which is why it does **not** fire under `always`. That is a
+deliberate rule rather than a caveat: a switch flicked by hand is not evidence that the ordinary
+transport fails, and acting on it would cost ~1.66 s on every model request — the price the user
+already paid once, charged again on every request after it.
+
+The **"Also fragment ClientHello for model requests"** switch is now a **forced** enable: the way to
+not wait for a measurement. It is still off by default and still there for when you want fragmentation
+immediately.
+
+The promotion signal comes from the **plugin's own** requests. Two consequences follow, and both are
+worth getting right. If a proxy is enabled and working, those requests succeed and no promotion
+happens — correctly, since nothing is blocked. And "transport now" can read `plain` while model
+traffic is unfragmented: that is a **correct state, not a fault**, and it is not a bug worth filing.
+
+### Fragmentation and a proxy compose
+
+They did not use to: enabling a proxy switched fragmentation off for the same host. A plaintext HTTP
+proxy and fragmentation now work together, and the ClientHello is fragmented **inside** the tunnel.
+The reason this is possible at all is that a CONNECT tunnel does not encrypt what it carries, so a DPI
+sees the ClientHello inside the tunnel exactly as it would without a proxy — and the hostname can be
+split in the same place.
+
+Measured cost: **285 ms** for the tunnel alone against **1812 ms** for the tunnel plus fragmentation.
+Hosts outside the plugin's scope are not touched at all; their tunnel stays an ordinary one.
+
+The limitation not to miss: **only a plaintext proxy composes**. An `https://` proxy and SOCKS5 still
+run on undici's own agents, with no fragmentation inside them. If your proxy is `https://`, do not
+believe you have composition — you do not.
+
+### "Channel diagnosis"
+
+The "Channel diagnosis" button in the same block measures the channel in layers — DNS, TCP, the
+ordinary and the fragmented TLS handshake, an HTTP request over each — and returns a verdict. The
+layers matter because a failure at different storeys means different things: "not attempted" (a layer
+above already explained the outcome), "failed" (it was tried and did not work) and "no measurement"
+(the layer was not reported at all) are three distinct states with three distinct remedies.
+
+The verdicts:
+
+- `ok` — the channel gets through end to end;
+- `dns`, `tcp` — it breaks before the handshake;
+- `tls` — the ordinary handshake does not complete;
+- **`tls-plain-blocked` — this is the TSPU signature**: the ordinary handshake is dropped while the
+  fragmented one gets through. The most informative verdict during a block;
+- **`frag-unavailable` — evidence *against* fragmenting**: the fragmented handshake did not complete.
+  Turning fragmentation on under this verdict achieves nothing;
+- `http`, `bad-origin` — the handshake completed but the request failed, or the provider address in
+  the settings is wrong and there was nothing to measure.
+
+And the part that breaks the vicious circle of "while it is blocked you cannot measure it, and once
+it lets go there is nothing left to measure": on a transport failure the plugin **writes the layered
+sample itself** into its state directory. The write is throttled to one per 120 seconds and bounded at
+the last 40 entries. Evidence from a blocking window therefore survives the window and can be shown
+afterwards — which is exactly why the button is most useful during a block rather than after one.
 
 The "transport now" row reports the live transport rather than the setting: `plain` or `frag`. In
 `auto`, before the first transport failure, it honestly says "on, but currently plain" — that is

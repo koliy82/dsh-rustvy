@@ -401,6 +401,112 @@ async function bench(options) {
   net.setFragmentTransport(undefined)
 }
 
+// --- promoted: earned by measurement, not by a switch ------------------------
+// The host installs the global fragmented dispatcher only when plain was *observed* to fail and
+// frag to work. Promoting on `always` would mean a 1.66 s handshake on every model request
+// because a user flicked a switch, which is the mistake he has already paid for once.
+net.setTlsFragment({ mode: 'always' })
+check('always puts the transport in frag but does not claim it was earned',
+  net.getTransportState().mode === 'frag' && net.getTransportState().promoted === false,
+  JSON.stringify(net.getTransportState()))
+net.setTlsFragment({ mode: 'off' })
+check('and plain never reports a promotion',
+  net.getTransportState().mode === 'plain' && net.getTransportState().promoted === false,
+  JSON.stringify(net.getTransportState()))
+
+{
+  const earned = await bench({ plain: () => ({ error: 'fetch failed' }) })
+  await earned.call()
+  check('one failure is not yet a promotion', net.getTransportState().promoted === false,
+    JSON.stringify(net.getTransportState()))
+  await earned.call()
+  check('two failures promote the mode and mark it earned',
+    net.getTransportState().mode === 'frag' && net.getTransportState().promoted === true,
+    JSON.stringify(net.getTransportState()))
+  earned.restore()
+}
+
+// --- the layered probe ------------------------------------------------------
+{
+  // A closed local port: DNS resolves, TCP refuses, and the verdict says which. Fast and
+  // hermetic, and the skipped layers below TCP are the separability being tested.
+  const closed = await net.probeChannel('http://127.0.0.1:1/probe', { timeoutMs: 1500 })
+  check('a probe against a closed port resolves DNS and fails at TCP',
+    closed.dns?.ok === true && closed.tcp?.ok === false,
+    JSON.stringify({ dns: closed.dns?.ok, tcp: closed.tcp?.ok }))
+  check('and the verdict names the layer that failed', closed.verdict === 'tcp', closed.verdict)
+  check('and the layers below are skipped rather than run to repeat the same fact',
+    closed.tls?.skipped === 'tcp failed' && closed.http?.skipped === 'tcp failed',
+    JSON.stringify({ tls: closed.tls, http: closed.http }))
+  check('and every layer that ran carries a duration',
+    Number.isFinite(closed.dns?.ms) && Number.isFinite(closed.tcp?.ms),
+    JSON.stringify({ dns: closed.dns?.ms, tcp: closed.tcp?.ms }))
+
+  const bad = await net.probeChannel('not a url', {})
+  check('an unparseable origin is a verdict rather than a throw', bad.verdict === 'bad-origin', bad.verdict)
+}
+
+// --- the recorder -----------------------------------------------------------
+{
+  const { mkdtempSync, existsSync, readFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = mkdtempSync(join(tmpdir(), 'frag-probe-'))
+  let clock = 1_700_000_000_000
+
+  check('the history is empty before anything is recorded',
+    net.setChannelRecorder({ dir, now: () => clock }) === true && net.readChannelHistory().length === 0,
+    String(net.readChannelHistory().length))
+
+  const first = await net.recordChannelFailure('http://127.0.0.1:1/a', { timeoutMs: 500 })
+  check('a recorded failure returns the probe result and stores one entry',
+    first?.verdict === 'tcp' && net.readChannelHistory().length === 1,
+    JSON.stringify({ verdict: first?.verdict, entries: net.readChannelHistory().length }))
+  check('and the history really reached the disk', existsSync(join(dir, 'channel-probe.json')),
+    join(dir, 'channel-probe.json'))
+
+  // Throttled: the probe is expensive and it runs during an outage, so a second call inside the
+  // interval must not run. The clock is injected, so proving this costs nothing.
+  const throttled = await net.recordChannelFailure('http://127.0.0.1:1/b', { timeoutMs: 500 })
+  check('a second call inside the interval is throttled rather than run',
+    throttled === null && net.readChannelHistory().length === 1,
+    JSON.stringify({ result: throttled, entries: net.readChannelHistory().length }))
+
+  clock += 120_000
+  const later = await net.recordChannelFailure('http://127.0.0.1:1/c', { timeoutMs: 500 })
+  check('and one past the interval records again', later !== null && net.readChannelHistory().length === 2,
+    JSON.stringify({ entries: net.readChannelHistory().length }))
+
+  // `force` is what the on-demand route uses: a user pressing a button is one probe, not a loop.
+  const forced = await net.recordChannelFailure('http://127.0.0.1:1/d', { timeoutMs: 500, force: true })
+  check('force bypasses the throttle for the on-demand route',
+    forced !== null && net.readChannelHistory().length === 3,
+    JSON.stringify({ entries: net.readChannelHistory().length }))
+
+  // A credential in the origin must never reach the disk.
+  await net.recordChannelFailure('http://user:sup3rsecret@127.0.0.1:1/e', { timeoutMs: 500, force: true })
+  const raw = readFileSync(join(dir, 'channel-probe.json'), 'utf8')
+  check('a password in the origin is not written down', !raw.includes('sup3rsecret'),
+    raw.includes('sup3rsecret') ? 'the secret is in the file' : 'absent')
+  check('and the origin is still recorded, just without the userinfo',
+    net.readChannelHistory().at(-1)?.origin === 'http://127.0.0.1:1',
+    String(net.readChannelHistory().at(-1)?.origin))
+
+  // Bounded, because an outage must not grow the file without limit.
+  net.setChannelRecorder({ dir, maxEntries: 2, minIntervalMs: 0, now: () => clock })
+  for (let index = 0; index < 5; index += 1) {
+    await net.recordChannelFailure('http://127.0.0.1:1/x', { timeoutMs: 500 })
+  }
+  check('the history is bounded to maxEntries, keeping the newest',
+    net.readChannelHistory().length === 2, String(net.readChannelHistory().length))
+
+  net.setChannelRecorder(null)
+  check('the recorder can be switched off, and then records nothing',
+    net.setChannelRecorder(null) === false
+    && await net.recordChannelFailure('http://127.0.0.1:1/y', { timeoutMs: 500 }) === null)
+  rmSync(dir, { recursive: true, force: true })
+}
+
 // --- tear down ---------------------------------------------------------------
 net.setTlsFragment({ mode: 'off' })
 for (const [name, value] of savedEnv) {
