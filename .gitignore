@@ -47,3 +47,4 @@ rustvy-uptime/
 # Продукты сборки Go-коллектора: бинарь не должен попасть ни сюда, ни куда-либо ещё
 *.exe
 rustvy-uptime/rustvy-uptime
+/agents

@@ -17,7 +17,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve, relative, isAbsolute, extname, sep } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -553,6 +553,37 @@ try {
     charset.describe(docsFindings.filter(one => one.kind === 'unexpected-character'), ROOT))
 } catch (error) {
   check('the character-set scanner imports', false, error.message)
+}
+
+/* ---------------------------- every lib file loads ---------------------------- */
+
+// A shipped file that does not parse is a release that cannot load, and nothing else in this
+// gate caught it: the module sections below import four lib files BY NAME, so a syntax error in
+// any other one — `lib/net.js`, `lib/host.js`, `lib/proxy.js` — sailed through at 149/149. That
+// is not hypothetical. An orphaned JSDoc tail left `lib/net.js` unparseable and this gate
+// reported green; `node --check` found it immediately.
+//
+// The directory is enumerated rather than files named, for the reason the discovery section
+// below gives: a list that omits a file still reports green, and the omitted file is exactly the
+// one that broke. Importing rather than shelling out to `node --check` keeps this gate free of
+// child processes and checks more than syntax — a module that parses but throws on load, or whose
+// imports do not resolve, is equally unshippable.
+try {
+  const libDir = join(ROOT, 'lib')
+  const modules = readdirSync(libDir).filter(name => name.endsWith('.js')).sort()
+  // Derived from the directory on both sides, so adding a module cannot quietly leave it
+  // unchecked. The floor is the count this release ships.
+  check('lib/ holds at least the modules this release ships', modules.length >= 8, `${modules.length}: ${modules.join(', ')}`)
+  for (const name of modules) {
+    try {
+      await import(pathToFileURL(join(libDir, name)).href)
+      check(`lib/${name} parses and loads`, true)
+    } catch (error) {
+      check(`lib/${name} parses and loads`, false, error instanceof Error ? error.message : String(error))
+    }
+  }
+} catch (error) {
+  check('the lib load section ran', false, error instanceof Error ? error.message : String(error))
 }
 
 /* ------------------------------- test discovery ------------------------------ */

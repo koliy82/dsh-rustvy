@@ -1124,6 +1124,85 @@ goes to the mirror at all. The collector's answer shape, its fields and the mirr
 contract are described
 in [`docs/uptime-view.md`](docs/uptime-view.md).
 
+## The stream idle timeout
+
+The `@deepseek-ai/dsh-llm-pi-ai` adapter arms a watchdog on every stream read: if no chunk
+arrives for `streamIdleTimeoutMs` milliseconds, the connection is torn down with an error like
+`pi-ai stream idle timeout after 300000ms`. The adapter's own default is 300000 ms — five
+minutes. A long-reasoning model (Claude Opus on high/max) is silent for longer than that before
+its first token, so the watchdog kills a live request mid-stream. The adapter itself lives in
+the harness bundle and cannot be changed; what can be changed is the route configuration it
+reads.
+
+The plugin **raises the value threefold, from 300000 to 900000 ms** — fifteen minutes — which is
+enough for the first token even from a very slow model. The value is configurable in the
+plugin's "Stream idle timeout" block: the presets are 5 minutes (the adapter's default),
+15 minutes (the default), 30 minutes, 1 hour, 48 hours and "reset", plus any whole number of
+milliseconds from 1 to 2147483647.
+
+The mechanism, which is the part worth getting right:
+
+- The plugin writes the value into the **route profiles** in `cordis.patch.yml` — into `rustvy`
+  and into the key-ring clones (`rustvy-k2`, `rustvy-k3`, and so on). Those are what the adapter
+  reads. It is **not** written into the plugin's own `config.json`: that file holds the intent,
+  not the result, which is why the "currently on the routes" row shows what the profiles really
+  carry rather than what the plugin means to apply.
+- It writes **only when the value differs** from what the profile already holds. A number set by
+  hand in `cordis.patch.yml` survives every mount, because the auto-apply compares first instead
+  of overwriting on each start.
+- "reset" (`null`) **deletes** the field from the profiles, returning the routes to the
+  adapter's own 300000 ms default. That is the supported way to undo the plugin's intervention.
+- `0` in the settings means "leave the routes alone entirely". It is not a timeout value but the
+  absence of an intent, and it never reaches a profile.
+- Zero cannot be written into a profile at all: the adapter's schema rejects non-positive values,
+  and a route with `streamIdleTimeoutMs: 0` would stop answering entirely. So the plugin accepts
+  `0` as a setting but refuses to write it as a value, and says so plainly rather than silently
+  substituting 1. Fractional values are refused for the same kind of reason: the adapter's
+  `setTimeout` would round them, and the field would mean something other than what was typed.
+
+No DSH restart is needed: the value applies to the next requests.
+
+## Against TSPU blocking
+
+The "Against TSPU blocking" block controls ClientHello fragmentation — splitting the first TLS
+handshake packet into pieces so the hostname (SNI) is not readable whole inside one packet. This
+is the plugin's transport layer; the model adapter is not involved.
+
+Three positions:
+
+- **off** — an ordinary transport.
+- **auto** — starts on the ordinary transport and switches to fragmentation only after two
+  consecutive *transport* failures. It costs nothing until it is needed: the expensive ~1.5 s is
+  paid inside a blocking window, not before it. A transport failure is a refused connection or a
+  timeout; an HTTP 4xx or 5xx is **not** one — a transport that delivered a 502 is working.
+- **always** — fragment immediately and always.
+
+Two numbers beside it: the fragment size in bytes (1..64, default 16) and the delay between
+fragments in milliseconds (0..100, default 3).
+
+**16 bytes is not a performance knob.** It is the size at which the hostname is provably split
+across packets. Raising it to 64 can leave the name intact inside a single packet and quietly
+stop working: the setting stays on and the effect disappears. Bigger is not better here.
+
+The measured cost on Windows is roughly **1.5 s per new connection** at 16 bytes and a 3 ms
+delay: the ClientHello is 1587 bytes here (TLS 1.3 with a post-quantum key share), which is 100
+fragments, and `setTimeout` granularity on Windows is about 15.6 ms. Keep-alive means this is
+paid once per connection, not once per request.
+
+The **"Also fragment ClientHello for model requests"** switch is off by default, and that is a
+substantive decision rather than caution for its own sake. Without it the rule covers only the
+plugin's own requests: catalogue, logos, uptime reports, key checks. Model requests go through
+the process's global `fetch`, which only the second level touches — it installs the plugin's
+origin factory as the global undici dispatcher. The second level is **experimental**: it affects
+the outbound traffic of the whole process, not just the plugin's.
+
+Fragmentation **composes with** a proxy rather than replacing it: for the same host, a configured
+proxy outranks fragmentation.
+
+The "transport now" row reports the live transport rather than the setting: `plain` or `frag`. In
+`auto`, before the first transport failure, it honestly says "on, but currently plain" — that is
+not a fault but the normal state in which fragmentation has not yet been needed.
+
 ## Routes
 
 One prefix registration on the harness's own web server. Plugin routes are not

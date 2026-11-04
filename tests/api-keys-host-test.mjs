@@ -226,7 +226,9 @@ check('a neighbouring provider was not touched', JSON.stringify(providers()['dee
   baseURL: 'https://api.deepseek.com',
   models: [{ id: 'deepseek-chat', name: 'deepseek-chat' }],
 }))
-check('one configuration write was spent', edits.length === 1, `${edits.length} edit(s)`)
+// Two, not one: the mount itself spends a write now that `streamIdleTimeout` defaults to
+// 900000 and the freshly created route carries no value yet. Adding the key spends the second.
+check('adding a key spent one configuration write of its own', edits.length === 2, `${edits.length} edit(s)`)
 check('the ring document holds no secret', existsSync(join(STATE, 'keys.json')) && !readFileSync(join(STATE, 'keys.json'), 'utf8').includes(SECRET_TWO))
 check('the ring document names the clone', JSON.parse(readFileSync(join(STATE, 'keys.json'), 'utf8')).keys.some(key => key.route === 'rustvy-k2'))
 
@@ -300,9 +302,15 @@ check('a rename is accepted', renamed.json?.ok === true, renamed.text.slice(0, 1
 check('a rename follows into the display name', providers()['rustvy-k2'].displayName === 'rustvy · Рабочий', String(providers()['rustvy-k2'].displayName))
 check('a rename keeps the reference', providers()['rustvy-k2'].apiKeyEnv === 'RUSTVY_API_KEY_2')
 
+// Stated as a delta rather than as a count, because that is the property: replacing a key's
+// value must not touch the route configuration at all. A bare `edits.length === 3` asserted the
+// same thing only while the mount spent exactly two writes, and it broke the moment
+// `streamIdleTimeout` defaulted to 900000 and the mount spent one more.
+const editsBeforeReplace = edits.length
 const replaced = await call('POST', '/dsh-rustvy/keys', { action: 'set', id: 'k2', key: 'sk-live-rotated-0003' })
 check('a value can be replaced', replaced.json?.ok === true && refs.get('RUSTVY_API_KEY_2') === 'sk-live-rotated-0003')
-check('replacing a value writes no configuration', edits.length === 3, `${edits.length} edit(s)`)
+check('replacing a value writes no configuration', edits.length === editsBeforeReplace,
+  `${edits.length} edit(s), was ${editsBeforeReplace}`)
 
 delete liveConfig.providers['rustvy-k2']
 entry.options.config = liveConfig

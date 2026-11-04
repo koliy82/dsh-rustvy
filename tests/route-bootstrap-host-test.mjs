@@ -250,7 +250,14 @@ const existing = await mount({ rows: existingRows })
 const existingState = await existing.state()
 const untouched = existing.row('llm-pi-ai').options.config.providers.rustvy
 check('an existing route reports exists', existingState?.routeBootstrap?.provider?.state === 'exists', JSON.stringify(existingState?.routeBootstrap?.provider))
-check('nothing was written at all', existing.edits.length === 0, JSON.stringify(existing.edits.map(e => e.id)))
+// Not "nothing was written at all", which asserted the old default. `streamIdleTimeout` is
+// 900000 now, so the first mount writes that one field even into a route the user wrote by
+// hand — and must, because that is the point of defaulting it on. What still has to hold is
+// that the timeout is the ONLY thing written and every hand-written field survives, which is
+// what the four checks below assert; they are the reason this one can be about the count.
+check('only the stream timeout was written to the hand-written route',
+  existing.edits.length === 1 && existing.edits[0].id === 'llm-pi-ai' && untouched.streamIdleTimeoutMs === 900000,
+  `${JSON.stringify(existing.edits.map(e => e.id))} timeout=${untouched.streamIdleTimeoutMs}`)
 check('the hand-written displayName survived', untouched.displayName === 'My hand-written name', String(untouched.displayName))
 check('the hand-written apiKeyEnv survived', untouched.apiKeyEnv === 'MY_OWN_VAR', String(untouched.apiKeyEnv))
 check('the hand-written baseURL survived', untouched.baseURL === 'https://my-gateway.example/v1', String(untouched.baseURL))
@@ -381,7 +388,12 @@ check('a second mount reports the route as existing', (await second.state())?.ro
 check('a second mount writes nothing', second.edits.length === 0, JSON.stringify(second.edits.map(e => e.id)))
 check('the route is byte-identical after a reload', JSON.stringify(second.row('llm-pi-ai').options.config.providers.rustvy) === firstWritten, JSON.stringify(second.row('llm-pi-ai').options.config.providers.rustvy))
 check('the default model is byte-identical after a reload', JSON.stringify(second.row('agent-default-model').options.config) === firstDefault, JSON.stringify(second.row('agent-default-model').options.config))
-check('the first mount wrote exactly two rows', firstEdits === 2, String(firstEdits))
+// Three edits over two rows: the route, the default model, and the stream timeout — which
+// lands on the route row again. Counting distinct rows is what keeps this from silently
+// accepting a fourth write to either.
+check('the first mount wrote the two rows it owns, the timeout being a second edit to one of them',
+  firstEdits === 3 && [...new Set(first.edits.map(e => e.id))].sort().join(',') === 'agent-default-model,llm-pi-ai',
+  `${firstEdits}: ${JSON.stringify(first.edits.map(e => e.id))}`)
 await second.handle.dispose()
 
 origin.close()

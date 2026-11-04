@@ -683,12 +683,20 @@ globalThis.window = {
  */
 let PROXY_ANSWER = { ok: true, tested: 'stored', connected: true, status: 200, elapsedMs: 340, masked: 'https://user:***@proxy.example:8080' }
 let PROXY_HTTP = 200
+/** What `/timeout` answers with: the value the routes carry, how many are in scope, and the POST result. */
+let TIMEOUT_VALUE = null
+let TIMEOUT_ROUTES = 2
+let TIMEOUT_ANSWER = { ok: true, applied: true, value: 3600000, routes: ['rustvy', 'rustvy-k2'], available: true, current: 3600000, routeCount: 2 }
 
 globalThis.fetch = async (url, init = {}) => {
   const path = String(url)
   const method = (init.method ?? 'GET').toUpperCase()
   requests.push({ path, method, body: init.body })
   if (path.includes('/models.yaml')) return { ok: true, status: 200, text: async () => YAML_TEXT }
+  if (path.endsWith('/timeout')) {
+    if (method === 'GET') return json({ ok: true, available: true, value: TIMEOUT_VALUE, routes: TIMEOUT_ROUTES })
+    return json(TIMEOUT_ANSWER)
+  }
   if (path.endsWith('/test-proxy') && method === 'POST') {
     if (PROXY_ANSWER === null) throw new Error('Failed to fetch')
     // `tested` is derived from the request the way the host derives it — a non-empty `proxySpec`
@@ -779,12 +787,27 @@ globalThis.fetch = async (url, init = {}) => {
 documentStub.execCommand = () => true
 
 /* --------------------- mini React, one hook store per component ---------- */
-// Keyed by component type plus its occurrence index within one render, not by a
-// global counter: the page's shape changes between its first render (no status
-// yet) and the next, so a positional counter would hand a CopyButton the cells
-// the page itself used a moment ago. Real React keys by instance identity.
+// Keyed by the component's **position in the tree**: its parent's key plus its index among
+// that parent's children of the same type. Real React keys by instance identity, and position
+// within a parent is the closest thing a synchronous stub can compute.
+//
+// It used to be keyed by a per-render count of same-named components, which is coarser than
+// React in a way that eventually bites: adding one `TextField` anywhere on the page shifted
+// the index of every later `TextField`, so unrelated components inherited each other's state.
+// That is exactly what happened when a seventh field was added to the settings box — the
+// proxy field's store slot moved onto one that had been created empty, and because
+// `TextField` skips its props re-sync when `saveOnBlur: false`, it never recovered the right
+// value. The old scheme only ever worked by landing on an index whose store happened to hold
+// the right value, so it was a recurring tax on every future settings addition rather than a
+// property of the page.
+//
+// Per-parent keying fixes the class, not the instance: a field added inside a key row is in a
+// different frame from the settings box's own fields and cannot shift them.
 const storesByKey = new Map()
-let occurrences = new Map()
+/** The frame stack: one entry per function component currently rendering. */
+let hookFrames = []
+/** The root frame, whose children are counted fresh on every render. */
+let rootFrame = { key: '', next: 0 }
 let activeHooks = []
 let hookIndex = 0
 let effects = []
@@ -792,20 +815,35 @@ const React = {
   createElement(type, props, ...children) {
     const flat = children.flat(Infinity).filter(child => child !== null && child !== undefined && child !== false)
     if (typeof type === 'function') {
-      const seen = occurrences.get(type) ?? 0
-      occurrences.set(type, seen + 1)
-      const key = `${type.name || 'anonymous'}#${seen}`
+      // Children created while this component renders are counted against *its* frame, which
+      // is what makes the key a position rather than a global tally. `createElement` calls a
+      // function component synchronously, so the frame is on the stack for exactly the span
+      // of that component's own children.
+      const parent = hookFrames.length === 0 ? rootFrame : hookFrames[hookFrames.length - 1]
+      // Counted against every sibling, not just siblings of the same type. React's implicit
+      // key is a component's index among all of its parent's children, so keying per type
+      // would let two different components at the same position collide and, worse, would
+      // still shift a field when an unrelated *different* component is inserted before it.
+      const seen = parent.next++
+      const key = `${parent.key}/${seen}:${type.name || 'anonymous'}`
       const store = storesByKey.get(key) ?? []
       storesByKey.set(key, store)
       const prevHooks = activeHooks
       const prevIndex = hookIndex
       activeHooks = store
       hookIndex = 0
+      hookFrames.push({ key, next: 0 })
       const rendered = type({ ...(props ?? {}), children: flat.length === 1 ? flat[0] : flat })
+      hookFrames.pop()
       activeHooks = prevHooks
       hookIndex = prevIndex
       return rendered
     }
+    // A host element consumes a sibling index as well. Its own children were already created
+    // before this call — argument evaluation happens first — so they took their indices in the
+    // enclosing frame, which is the source order React would see.
+    if (hookFrames.length === 0) rootFrame.next++
+    else hookFrames[hookFrames.length - 1].next++
     return { type, props: props ?? {}, children: flat }
   },
   useState(initial) {
@@ -913,7 +951,12 @@ async function settle() { for (let i = 0; i < 8; i++) await yieldTurn() }
  * @param props - the standard props the slot hands it, if any.
  */
 function renderComponent(component, props) {
-  occurrences = new Map()
+  // A fresh root frame per render, and an empty stack in case a previous render threw inside
+  // a component and left one pushed. The stores themselves persist — that is the point of a
+  // store, it is what makes state survive a re-render — but *which* slot a component gets is
+  // recomputed from its position every time.
+  rootFrame = { key: '', next: 0 }
+  hookFrames = []
   const tree = component(props ?? {})
   for (const fn of effects.splice(0)) {
     try {
@@ -983,14 +1026,16 @@ check('the route is editable', texts.some(item => item.props.value === 'rustvy')
 check('the profile row is editable', texts.some(item => item.props.value === 'llm-pi-ai'))
 check('the origin is editable', texts.some(item => item.props.value === 'https://rustvy.xyz'))
 check('the mark size is editable', numbers.length === 1 && numbers[0].props.value === '16', JSON.stringify(numbers.map(i => i.props.value)))
-// Four, not three: the proxy family selector is the fourth, and it is a select rather than two
-// buttons so that it shares the page's dropdown idiom and its disabled state.
-check('four dropdowns render', selects.length === 4, String(selects.length))
+// Five, not four: the proxy family selector is the fourth and the fragmentation mode is the
+// fifth. Both are selects rather than buttons so they share the page's dropdown idiom and its
+// disabled state.
+check('five dropdowns render', selects.length === 5, String(selects.length))
 check('auto-apply defaults to explicit', selectWith(tree, 'explicit')?.props.value === 'explicit',
   String(selectWith(tree, 'explicit')?.props.value))
 check('the name source defaults to the provider label', selectWith(tree, 'displayName')?.props.value === 'displayName',
   String(selectWith(tree, 'displayName')?.props.value))
-check('eleven switches render', boxes.length === 11, String(boxes.length))
+// Twelve, not eleven: the fragmentation block adds the switch that extends it to model traffic.
+check('twelve switches render', boxes.length === 12, String(boxes.length))
 
 // editing a field saves through /config; focusing first is what a real edit does,
 // and it is what keeps the field from re-syncing over the keystroke
@@ -1234,7 +1279,7 @@ text = allText(tree)
 // than by index, so a switch added above it cannot silently retarget this block at some other
 // checkbox.
 check('the master switch for the ring is offered',
-  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 11
+  collect(tree, 'input').filter(item => item.props.type === 'checkbox').length === 12
   && text.includes('Ключи на несколько чатов'))
 check('the key count is shown against the limit', text.includes('2 из 12'))
 check('each key reports how many models its route serves', text.includes('моделей: 12'))
@@ -3112,6 +3157,165 @@ check('unload left no key section or key row anywhere',
   menu.querySelectorAll('[data-dmi-keys], [data-dmi-key-row]').length === 0
   && modelPopup.querySelectorAll('[data-dmi-keys], [data-dmi-key-row]').length === 0)
 
+/* ------------- stream idle timeout: the controls the page grew -------------- */
+// These exist because a block of controls with no assertions is a block nobody can break
+// visibly. The host side is proven by `tests/stream-timeout-test.mjs`; what is proven here is
+// that the page wires the presets to the right values, reads the current value from the
+// server rather than from plugin config, and says out loud which routes a write touched.
+
+/** Let the queued microtasks of an async click handler run. */
+const flush = async () => { for (let pass = 0; pass < 6; pass += 1) await new Promise(resolve => setTimeout(resolve, 0)) }
+
+STATE.config.streamIdleTimeout = 0
+TIMEOUT_VALUE = null
+TIMEOUT_ROUTES = 2
+TIMEOUT_ANSWER = { ok: true, applied: true, value: 3600000, routes: ['rustvy', 'rustvy-k2'], available: true, current: 3600000, routeCount: 2 }
+{
+  const t = render()
+  const x = allText(t)
+  check('the timeout block is its own labelled block', x.includes('Таймаут простоя стрима'), 'missing')
+  // `STATE.config.streamIdleTimeout` is 0, the leave-alone sentinel, and the row must not show
+  // it: the value on the routes came from the server's `/timeout` answer, which said null.
+  check('the current value comes from the server, not from plugin config',
+    x.includes('не задан (дефолт адаптера 300000 мс = 5 минут)'), 'the row showed something else')
+  // The mount-once read is not asserted through `requests`, and the reason is worth keeping:
+  // with the effect guarded to run once, the fetch happens on the panel's first mount — long
+  // before this block runs, and `requests` has been reset in between. What *is* asserted, and
+  // is the stronger claim, is that the row shows the server's answer rather than the plugin's
+  // config: `STATE.config.streamIdleTimeout` is the sentinel `0` while `/timeout` answered
+  // `null`, and the row reads «не задан» — so it cannot have come from config.
+  // Six presets, and the "default" marking follows `DEFAULT_CONFIG.streamIdleTimeout` rather
+  // than being an opinion of the page: a fresh install carries 900000, so a page that marked a
+  // different number as the default would disagree with the very file it renders from.
+  const presets = [['5 мин (дефолт адаптера)', 300000], ['15 мин (по умолчанию)', 900000], ['30 мин', 1800000], ['1 час', 3600000], ['48 ч (почти выключено)', 172800000], ['сбросить', null]]
+  check('all six presets render under their own labels',
+    presets.every(preset => findButton(t, preset[0]) !== undefined),
+    JSON.stringify(presets.map(preset => preset[0]).filter(label => findButton(t, label) === undefined)))
+  // Asserted against the rendered buttons, not against `presets` above. A first version
+  // filtered the test's own array, and a removal probe that marked «1 час» as the default too
+  // left the suite green at 395/395 — the check was about a constant the test declared, so it
+  // could not see the client at all. Reading the tree is what makes it about the page.
+  const renderedPresets = collect(t, 'button').map(item => allText(item).trim())
+  const markedDefault = renderedPresets.filter(label => label.includes('по умолчанию'))
+  check('exactly one rendered preset is marked as the default, and it is the fifteen-minute one',
+    markedDefault.length === 1 && markedDefault[0].includes('15 мин'), JSON.stringify(markedDefault))
+  check('and no rendered preset still carries the superseded recommendation',
+    renderedPresets.every(label => !label.includes('рекомендуется')),
+    JSON.stringify(renderedPresets.filter(label => label.includes('рекомендуется'))))
+
+  requests.length = 0
+  findButton(t, '15 мин (по умолчанию)').props.onClick()
+  await flush()
+  const posted = requests.find(item => item.path === '/dsh-rustvy/timeout' && item.method === 'POST')
+  check('the default preset posts 900000 and nothing else',
+    posted !== undefined && posted.body === '{"value":900000}', String(posted?.body))
+
+  requests.length = 0
+  findButton(t, '1 час').props.onClick()
+  await flush()
+  const hourPost = requests.find(item => item.path === '/dsh-rustvy/timeout' && item.method === 'POST')
+  check('the unmarked one-hour preset still posts 3600000',
+    hourPost !== undefined && hourPost.body === '{"value":3600000}', String(hourPost?.body))
+
+  requests.length = 0
+  findButton(t, 'сбросить').props.onClick()
+  await flush()
+  const reset = requests.find(item => item.path === '/dsh-rustvy/timeout' && item.method === 'POST')
+  check('the reset preset posts an explicit null, not an absent key',
+    reset !== undefined && reset.body === '{"value":null}', String(reset?.body))
+
+  // The outcome has to name the routes, because "which routes did this touch" is the first
+  // question after pressing the button and the answer is not obvious from the page.
+  const after = allText(render())
+  check('the outcome sentence counts the routes it wrote', after.includes('маршрутов: 2'), after.slice(0, 160))
+  // Asserted on the rendered fragment, not on the two names appearing anywhere. A first
+  // version checked `includes('rustvy') && includes('rustvy-k2')` and a removal probe that
+  // replaced the names with a count still passed 392/392 — both substrings occur elsewhere on
+  // the page, in the build row and the key ring, so the check was green with the property
+  // removed. Naming the exact clause is what makes it about this sentence.
+  check('and names them in the outcome clause, so the scope is visible rather than implied',
+    after.includes('маршрутов: 2 (rustvy, rustvy-k2)'), after.slice(0, 220))
+}
+
+/* ------------- «Против блокировки ТСПУ»: mode, transport, and the copy ------- */
+// The transport line is the part worth asserting hardest, because "configured but currently
+// plain" has no field to come from: `/state` publishes only `transport.mode`, so the page has
+// to derive the difference by comparing the setting against the live mode. Get that wrong and
+// `auto` looks broken to everyone until a blocking window happens to arrive.
+STATE.config.tlsFragmentBytes = 16
+STATE.config.tlsFragmentDelayMs = 3
+STATE.config.tlsFragmentGlobal = false
+{
+  STATE.config.tlsFragment = 'auto'
+  STATE.transport = { mode: 'plain', since: '2026-11-04T00:00:00.000Z' }
+  const t = render()
+  const x = allText(t)
+  check('the fragmentation block is its own labelled block', x.includes('Против блокировки ТСПУ'), 'missing')
+  check('auto with a plain transport says it is on but not yet active',
+    x.includes('включено, но сейчас plain'), x.slice(0, 200))
+
+  STATE.transport = { mode: 'frag', since: '2026-11-04T00:00:00.000Z' }
+  check('a fragmented transport says so', allText(render()).includes('фрагментация активна'), 'missing')
+
+  STATE.config.tlsFragment = 'off'
+  STATE.transport = { mode: 'plain', since: '2026-11-04T00:00:00.000Z' }
+  const off = allText(render())
+  check('off with a plain transport reads as plain, not as a pending switch',
+    off.includes('обычный (plain)') && !off.includes('включено, но сейчас plain'), off.slice(0, 200))
+
+  STATE.config.tlsFragment = 'always'
+  const always = render()
+  // Scoped to this select rather than to every `option` on the page: other dropdowns also
+  // offer `off` and `always` (auto-apply does), so a page-wide count cannot tell this
+  // selector's three positions from somebody else's.
+  const fragSelect = collect(always, 'select')
+    .find(item => JSON.stringify((item.children ?? []).map(child => child.props?.value)) === '["off","auto","always"]')
+  check('the mode selector offers exactly the three positions the host validates',
+    fragSelect !== undefined,
+    JSON.stringify(collect(always, 'select').map(item => (item.children ?? []).map(child => child.props?.value))))
+
+  requests.length = 0
+  fragSelect.props.onChange({ target: { value: 'off' } })
+  await flush()
+  const modePost = requests.find(item => item.path === '/dsh-rustvy/config' && String(item.body).includes('tlsFragment'))
+  check('changing the mode posts only that setting',
+    modePost !== undefined && modePost.body === '{"tlsFragment":"off"}', String(modePost?.body))
+
+  requests.length = 0
+  const globalSwitch = switchNamed(allText(always), '') ?? collect(always, 'label')
+    .filter(item => allText(item).includes('Включить фрагментацию ClientHello'))
+    .map(item => collect(item, 'input').find(input => input.props.type === 'checkbox'))
+    .find(item => item !== undefined)
+  check('the model-traffic switch renders unchecked, because it defaults to off',
+    globalSwitch !== undefined && globalSwitch.props.checked === false, String(globalSwitch?.props.checked))
+  globalSwitch.props.onChange({ target: { checked: true } })
+  await flush()
+  const globalPost = requests.find(item => item.path === '/dsh-rustvy/config' && String(item.body).includes('tlsFragmentGlobal'))
+  check('and turning it on posts the boolean alone',
+    globalPost !== undefined && globalPost.body === '{"tlsFragmentGlobal":true}', String(globalPost?.body))
+
+  // The three sentences that stop the feature misleading someone. Each is a way a user draws
+  // the wrong conclusion, so each is asserted rather than left to the copy being present.
+  check('the copy says auto costs nothing until it is needed',
+    x.includes('ничего не стоит, пока не понадобится') && x.includes('двух подряд сбоев транспорта'), 'missing')
+  check('and that an HTTP 4xx/5xx is not a transport failure',
+    x.includes('4xx') && x.includes('не считается') && x.includes('доставивший 502, работает'), 'missing')
+  check('the copy says the global switch is what reaches model traffic, and that it is experimental',
+    x.includes('единственный, который дотягивается до запросов модели') && x.includes('экспериментально'), 'missing')
+  check('and that it composes with the proxy rather than replacing it',
+    x.includes('сочетается, а не заменяет') && x.includes('прокси важнее'), 'missing')
+  check('the copy says 16 bytes is not a speed knob and bigger can silently stop working',
+    x.includes('не регулятор скорости') && x.includes('тихо перестать работать') && x.includes('больше не значит лучше'), 'missing')
+  check('and it states the Windows cost, which is not the Linux figure in the task document',
+    x.includes('1,5 с') && x.includes('Windows') && x.includes('1587') && x.includes('раз на соединение'), 'missing')
+}
+
 const failed = results.filter(ok => !ok).length
 console.log(`\n${results.length - failed}/${results.length} passed`)
+// Explicit exit, and it is a workaround rather than a fix. Once the stream-timeout block
+// landed this suite prints its tally and then never returns, which would hang `npm test` for
+// everybody instead of failing loudly. The handle that keeps the loop alive is not yet
+// identified — it is reported as an open question rather than quietly absorbed by this line,
+// and removing this line is the check that the handle is gone.
+process.exit(failed > 0 ? 1 : 0)
 process.exitCode = failed === 0 ? 0 : 1

@@ -3767,7 +3767,174 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       }
 
       /**
-       * What one probe answer says, and in which colour.
+       * The stream idle timeout, read from the server on open rather than from the plugin config.
+       *
+       * The plugin's own `streamIdleTimeout` is only what it intends to apply on mount; the value
+       * that matters is the one in the route profiles, because that is what `dsh-llm-pi-ai` reads.
+       * Someone can set it by hand in `cordis.patch.yml`, and the page must show that rather than
+       * the plugin's intention — a field showing a number the adapter is not using would be worse
+       * than no field.
+       */
+      const [timeoutNow, setTimeoutNow] = React.useState(undefined)
+      const [timeoutBusy, setTimeoutBusy] = React.useState(false)
+      const [timeoutOutcome, setTimeoutOutcome] = React.useState(undefined)
+      const [timeoutDraft, setTimeoutDraft] = React.useState('')
+
+      /**
+       * Re-read what the routes carry.
+       *
+       * @returns a promise that settles once the state holds the fresh answer.
+       */
+      const loadStreamTimeout = async () => {
+        try {
+          const response = await fetch(`${API}/timeout`, { headers: { accept: 'application/json' } })
+          setTimeoutNow(await response.json().catch(() => ({})))
+        } catch (error) {
+          setTimeoutNow({ ok: false, error: error.message })
+        }
+      }
+      const [timeoutLoaded, setTimeoutLoaded] = React.useState(false)
+      React.useEffect(() => {
+        // Guarded rather than relying on the empty dependency array. This is a mount-once
+        // read, and a renderer that runs effects without comparing dependencies — which the
+        // page's own test stub does — would re-run it on every render: fetch, set state,
+        // re-render, fetch again, without ever settling. The flag makes "once" a property of
+        // this code rather than of the renderer's scheduling.
+        if (timeoutLoaded) return
+        setTimeoutLoaded(true)
+        void loadStreamTimeout()
+      }, [])
+
+      /**
+       * Write one timeout onto the routes this plugin speaks for.
+       *
+       * Its own fetch path rather than `post()`, for the same reason the probe has one: the page
+       * needs the response body to say which routes were touched, and this changes no plugin
+       * config, so the notice-and-reload that `post()` performs would be the wrong aftermath.
+       *
+       * @param value - milliseconds, or `null` to remove the field and return to the adapter default.
+       * @returns a promise that settles once the outcome is rendered.
+       */
+      const applyStreamTimeout = async value => {
+        setTimeoutBusy(true)
+        setTimeoutOutcome(undefined)
+        try {
+          const response = await fetch(`${API}/timeout`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify({ value }),
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || payload?.ok !== true) throw new Error(payload?.error ?? `HTTP ${response.status}`)
+          setTimeoutOutcome({ tone: C.ok, payload })
+          setTimeoutDraft('')
+          await loadStreamTimeout()
+        } catch (error) {
+          setTimeoutOutcome({ tone: C.warn, text: error.message })
+        } finally {
+          setTimeoutBusy(false)
+        }
+      }
+
+      /**
+       * What one write says, and in which colour.
+       *
+       * The route count is in the sentence because "which routes did this touch" is the first
+       * question after pressing the button, and the answer is not obvious: it is the base route
+       * plus every key-ring clone, which is the rustvy family and nothing else.
+       *
+       * @param outcome - the recorded outcome.
+       * @returns the text, or `null` when there is nothing to say.
+       */
+      const timeoutSentence = outcome => {
+        if (outcome === undefined) return null
+        if (outcome.text !== undefined) return outcome.text
+        const payload = outcome.payload
+        const where = Array.isArray(payload?.routes) && payload.routes.length > 0
+          ? `маршрутов: ${payload.routes.length} (${payload.routes.join(', ')})`
+          : 'маршрутов не найдено — значение никуда не записано'
+        const what = payload?.value === null || payload?.value === undefined
+          ? 'поле удалено, действует дефолт адаптера 300000 мс'
+          : `${payload.value} мс`
+        return payload?.applied === true ? `Записано ${what}; ${where}.` : `Нечего записывать: ${where}.`
+      }
+
+      /**
+       * How the current value is described.
+       *
+       * @param state - the last answer from `/timeout`.
+       * @returns the text for the current-value row.
+       */
+      const timeoutCurrent = state => {
+        if (state === undefined) return 'читаю…'
+        if (state?.available !== true) return state?.ok === false ? 'недоступно' : 'хост не отдаёт configEditor'
+        if (state.value === null || state.value === undefined) return 'не задан (дефолт адаптера 300000 мс = 5 минут)'
+        const minutes = state.value / 60000
+        return `${state.value} мс${minutes >= 1 ? ` (${minutes} мин)` : ''}`
+      }
+
+      /**
+       * The presets, including the reset.
+       *
+       * 900000 carries the "default" marking because that is what
+       * `DEFAULT_CONFIG.streamIdleTimeout` holds — fifteen minutes, three times the adapter's
+       * own 300000. The page must not disagree with the file about what a fresh install does,
+       * so the marking follows the constant rather than being a recommendation of its own.
+       * 3600000 stays offered, unmarked.
+       *
+       * 172800000 is the 48 hours the harness's own SDK profile uses — an already-exercised
+       * "effectively off" rather than a number invented here.
+       */
+      const TIMEOUT_PRESETS = [
+        [300000, '5 мин (дефолт адаптера)'],
+        [900000, '15 мин (по умолчанию)'],
+        [1800000, '30 мин'],
+        [3600000, '1 час'],
+        [172800000, '48 ч (почти выключено)'],
+        [null, 'сбросить'],
+      ]
+
+      /**
+       * The fragmentation settings, with anything absent or unrecognised read as the safe
+       * position rather than as a guess: `off`, and the defaults the host validates against.
+       */
+      const fragMode = ['off', 'auto', 'always'].includes(config.tlsFragment) ? config.tlsFragment : 'off'
+      const fragBytes = String(config.tlsFragmentBytes ?? 16)
+      const fragDelay = String(config.tlsFragmentDelayMs ?? 3)
+      const fragGlobal = config.tlsFragmentGlobal === true
+
+      /**
+       * The live transport, and the one sentence that has to be derived rather than read.
+       *
+       * `/state` publishes `transport.mode` as `plain | frag` and nothing about what was
+       * configured, so "the setting is on but the transport is currently plain" has no field
+       * to come from — it is the setting compared against the live mode. That case is the one
+       * worth naming out loud, because `auto` looks like nothing happened until a blocking
+       * window arrives, and a user who cannot see the difference will conclude the switch is
+       * broken and turn it off.
+       */
+      // `transport.since` is epoch milliseconds, measured live rather than read from a type:
+      // the host answers `{"mode":"frag","since":1793745545122}`. So `new Date(since)` is the
+      // branch that runs. The NaN fallback below is defensive against a shape that does not
+      // currently exist — nothing produces an unparseable `since` — and is kept only so an
+      // unexpected value renders as itself instead of as «Invalid Date». Do not go looking for
+      // the ISO producer; there isn't one.
+      const transportSince = (() => {
+        const since = status?.transport?.since
+        if (since === undefined || since === null || since === '') return ''
+        const date = new Date(since)
+        return Number.isNaN(date.getTime()) ? ` (с ${String(since)})` : ` (с ${date.toLocaleString('ru-RU')})`
+      })()
+      const transportLine = status?.transport?.mode === 'frag'
+        ? `фрагментация активна${transportSince}`
+        : status?.transport?.mode === 'plain'
+          ? fragMode === 'off'
+            ? `обычный (plain)${transportSince}`
+            : `включено, но сейчас plain${transportSince} — переключение происходит после сбоев транспорта, а не по одной настройке`
+          : 'транспорт ещё не сообщён'
+
+      /**
+       * The stream idle timeout the routes carry.
        *
        * The subject of the sentence is named — the typed address or the stored one — because
        * "the proxy works" about a string the user has not applied is a claim whose subject has
@@ -4174,6 +4341,103 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
               + 'определяется само, а не объявляется. '
               + '«Проверить прокси» отправляет один запрос к каталогу провайдера через прокси и ничего не сохраняет; '
               + 'любой ответ провайдера, включая 502, означает, что прокси работает, а сбоем считается только отсутствие ответа.')),
+          // The stream idle timeout. Its own block rather than a row, because it has a current
+          // value read from the server, five presets, a free field, and an outcome that names
+          // which routes were touched — and "which routes" is the first question after pressing
+          // the button.
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '12px 0 6px' } }, 'Таймаут простоя стрима'),
+          h(Row, { name: 'сейчас на маршрутах' }, timeoutCurrent(timeoutNow)),
+          h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '6px' } },
+            ...TIMEOUT_PRESETS.map(preset => h(Button, {
+              key: String(preset[0]),
+              disabled: busy !== '' || timeoutBusy,
+              onClick: () => { void applyStreamTimeout(preset[0]) },
+            }, preset[1])),          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' } },
+            h(TextField, {
+              value: timeoutDraft,
+              width: '170px',
+              saveOnBlur: false,
+              onDraft: setTimeoutDraft,
+              onSave: next => { void applyStreamTimeout(Number(next)) },
+            }),
+            // «Применить таймаут», not «Применить» and not «Проверить»: the page already carries
+            // four buttons labelled «Проверить», which is why the proxy one had to be named
+            // «Проверить прокси». A label that collides is a button the user cannot tell apart.
+            h(Button, {
+              variant: 'primary',
+              disabled: busy !== '' || timeoutBusy || timeoutDraft.trim() === '',
+              onClick: () => { void applyStreamTimeout(Number(timeoutDraft.trim())) },
+            }, timeoutBusy ? 'Запись…' : 'Применить таймаут')),
+          timeoutOutcome === undefined
+            ? null
+            : h('div', { style: { color: timeoutOutcome.tone, fontSize: '11.5px', lineHeight: 1.6, marginTop: '8px' } },
+                timeoutSentence(timeoutOutcome)),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+            'Адаптер llm-pi-ai обрывает стрим, если за это время по нему не пришёл ни один чанк. '
+            + 'Дефолт — 300000 мс (5 минут), а модель с долгим reasoning молчит до первого токена дольше, '
+            + 'поэтому живой запрос рвётся на середине. Значение пишется в профили маршрута rustvy и клонов '
+            + 'кольца ключей — только в них, больше никуда, и перезапуск DSH не нужен. '
+            + '«сбросить» удаляет поле и возвращает дефолт адаптера. '
+            + 'Ноль записать нельзя: схема адаптера отвергает неположительные значения, и маршрут перестал бы отвечать.')),
+          // «Против блокировки ТСПУ». Its own block, as the user asked, because it is a
+          // transport setting and not another row in a list: it has a mode, two numbers, a
+          // switch with a consequence worth stating, and a live transport line.
+          //
+          // The numeric fields are plain text inputs rather than `type: 'number'`. The host
+          // validates the ranges (1..64 and 0..100) and refuses with a sentence, and a second
+          // rule in the page is a second rule that can disagree with it — the same reason the
+          // proxy address is not validated client-side.
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '12px 0 6px' } }, 'Против блокировки ТСПУ'),
+          h(Row, { name: 'транспорт сейчас' }, transportLine),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px', flexWrap: 'wrap' } },
+            h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Фрагментация ClientHello'),
+            h(Select, {
+              value: fragMode,
+              options: [['off', 'выключена'], ['auto', 'auto — только при сбоях транспорта'], ['always', 'always — всегда']],
+              onChange: value => { void post('/config', { tlsFragment: value }, 'save') },
+            })),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' } },
+            h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Размер фрагмента, байт'),
+            h(TextField, {
+              value: fragBytes,
+              width: '90px',
+              saveOnBlur: false,
+              onSave: next => { void post('/config', { tlsFragmentBytes: Number(next) }, 'save') },
+            }),
+            h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Пауза, мс'),
+            h(TextField, {
+              value: fragDelay,
+              width: '90px',
+              saveOnBlur: false,
+              onSave: next => { void post('/config', { tlsFragmentDelayMs: Number(next) }, 'save') },
+            })),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '10px', cursor: 'pointer' } },
+            h('input', {
+              type: 'checkbox',
+              checked: fragGlobal,
+              onChange: event => { void post('/config', { tlsFragmentGlobal: event.target.checked }, 'save') },
+            }),
+            h('span', { style: { fontSize: '12.5px' } }, 'Включить фрагментацию ClientHello и для запросов модели')),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '8px' } },
+            'Разбивает ClientHello на части, чтобы имя хоста не читалось целиком в одном пакете. '
+            + '«auto» ничего не стоит, пока не понадобится: транспорт начинается обычным (plain) и переключается '
+            + 'только после двух подряд сбоев транспорта, поэтому дорогие ~1,5 с платятся внутри окна блокировки, '
+            + 'а не заранее. Сбой транспорта — это отказ соединения или таймаут; HTTP-ответ 4xx или 5xx им не '
+            + 'считается, потому что транспорт, доставивший 502, работает. '
+            + '«always» фрагментирует сразу и всегда. '
+            + 'Переключатель выше — единственный, который дотягивается до запросов модели, и он выключен не '
+            + 'случайно: без него правило касается только собственных запросов плагина (каталог, значки, отчёты '
+            + 'аптайма, проверка ключей), а запросы модели идут через глобальный fetch процесса, который трогает '
+            + 'только второй уровень — он ставит нашу фабрику маршрутов глобальным диспетчером. Это экспериментально. '
+            + 'Со прокси оно сочетается, а не заменяет его: для одного и того же хоста настроенный прокси важнее '
+            + 'фрагментации. '
+            + '16 байт — не регулятор скорости, а размер, при котором имя хоста гарантированно разрывается между '
+            + 'пакетами: подняв его до 64, можно оставить имя целым внутри одного пакета и тихо перестать работать, '
+            + 'поэтому больше не значит лучше. '
+            + 'Замеренная цена на Windows — около 1,5 с на каждое новое соединение при 16 байт и паузе 3 мс: '
+            + 'ClientHello здесь 1587 байт (TLS 1.3 с постквантовым ключевым материалом), то есть 100 фрагментов, '
+            + 'а гранулярность setTimeout на Windows около 15,6 мс. Keep-alive означает, что это раз на соединение, '
+            + 'а не раз на запрос.'),
           h(Row, { name: 'сборка' }, `${status?.build ?? '—'} (ревизия ${status?.revision ?? '—'})`),
           status?.error === undefined
             ? null

@@ -218,6 +218,62 @@ check('a scheme with no transport delegates instead of building a connector',
   fake.log.length === 0 && retiredDispatcher?.delegated === true, JSON.stringify(fake.log))
 check('and no constructor in the factory still names socks4', !fake.log.some(entry => /socks4/iu.test(entry.kind)), JSON.stringify(fake.log))
 
+// --- level 2: fragmenting our own https origin, and what it must not touch -----
+// `fragment` is the undici-shaped `connect` that `lib/net.js` exports as `fragmentedConnector`.
+// It performs its own TLS and returns the negotiated socket, so handing it to a plaintext origin
+// would attempt a handshake against a port that is not speaking TLS. The collector is
+// `http://<ip>:3789`, so that mistake would break the plugin's own error reports — during a
+// blocking window, which is the only moment the user turned fragmentation on.
+const fragConnect = () => {}
+const fragSpec = parseProxySpec('proxy.example:8080', 'http')
+const fragmenting = await createOriginFactory({
+  loadUndici: async () => fake.module,
+  spec: fragSpec,
+  enabled: false,
+  proxiedHosts: HOSTS,
+  fragment: fragConnect,
+  delegate: (origin) => ({ delegated: true, origin: String(origin) }),
+})
+fake.log.length = 0
+const fragDispatcher = fragmenting.factory(RUSTVY)
+const fragEntry = fake.log.find(entry => entry.kind === 'Pool')
+check('with fragmentation on, our own https origin gets a Pool carrying the connect function',
+  fragEntry !== undefined && fragEntry.connect === 'function' && fragEntry.origin === RUSTVY,
+  JSON.stringify(fake.log))
+check('and it is not delegated, so fragmentation is actually on the path',
+  fragDispatcher?.delegated === undefined, JSON.stringify(fragDispatcher))
+check('and the Pool is tracked, so switching off closes it instead of leaking a socket pool',
+  fragmenting.created.includes(fragDispatcher), `created=${fragmenting.created.length}`)
+
+fake.log.length = 0
+const plainScoped = fragmenting.factory('http://rustvy.xyz')
+check('an in-scope but PLAINTEXT origin is never given a TLS connect — that is the collector',
+  fake.log.some(entry => entry.kind === 'Pool') === false && plainScoped?.delegated === true,
+  JSON.stringify(fake.log))
+
+fake.log.length = 0
+const foreignFrag = fragmenting.factory('https://registry.npmjs.org')
+check('and a foreign https origin is delegated rather than fragmented',
+  fake.log.some(entry => entry.kind === 'Pool' && entry.connect === 'function') === false
+  && foreignFrag?.delegated === true, JSON.stringify(fake.log))
+
+// A proxy the user configured is a route he chose deliberately, so it outranks fragmentation —
+// the same rule the environment proxy gets.
+const both = await createOriginFactory({
+  loadUndici: async () => fake.module,
+  spec: fragSpec,
+  enabled: true,
+  proxiedHosts: HOSTS,
+  fragment: fragConnect,
+  delegate: () => ({ delegated: true }),
+})
+fake.log.length = 0
+both.factory(RUSTVY)
+check('with a proxy installed, the proxy wins over fragmentation for the same origin',
+  fake.log.some(entry => entry.kind === 'ProxyAgent')
+  && fake.log.some(entry => entry.kind === 'Pool' && entry.connect === 'function') === false,
+  JSON.stringify(fake.log))
+
 // --- close-on-disable: a privacy property, not tidiness ----------------------
 const closable = await createOriginFactory({
   loadUndici: async () => fake.module,
