@@ -288,7 +288,7 @@ const composing = await createOriginFactory({
   proxiedHosts: HOSTS,
   fragment: fragConnect,
   fragmentSocket: composeSocket,
-  fragmentBytes: 16,
+  fragmentCount: 4,
   fragmentDelayMs: 3,
   delegate: () => ({ delegated: true }),
 })

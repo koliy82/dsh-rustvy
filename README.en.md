@@ -1177,17 +1177,36 @@ Three positions:
   timeout; an HTTP 4xx or 5xx is **not** one — a transport that delivered a 502 is working.
 - **always** — fragment immediately and always.
 
-Two numbers beside it: the fragment size in bytes (1..64, default 16) and the delay between
-fragments in milliseconds (0..100, default 3).
+Two numbers beside it: the **fragment count** (2..64, default 4) and the delay between fragments
+in milliseconds (0..100, default 3). The fragment size in bytes is no longer a setting — one knob
+per property, because two settings for one property is how "I turned on everything available"
+stops meaning anything.
 
-**16 bytes is not a performance knob.** It is the size at which the hostname is provably split
-across packets. Raising it to 64 can leave the name intact inside a single packet and quietly
-stop working: the setting stays on and the effect disappears. Bigger is not better here.
+**The fragment count is neither a speed dial nor a protection dial.** The protection is
+structural rather than a number you have to pick correctly: one cut is always placed inside the
+hostname, so the name is never whole in a single segment whatever the count. That is precisely
+why the setting is safe to touch at all. More pieces is not better: a cut placed outside the
+hostname costs the same as not fragmenting and buys nothing.
 
-The measured cost on Windows is roughly **1.5 s per new connection** at 16 bytes and a 3 ms
-delay: the ClientHello is 1587 bytes here (TLS 1.3 with a post-quantum key share), which is 100
-fragments, and `setTimeout` granularity on Windows is about 15.6 ms. Keep-alive means this is
-paid once per connection, not once per request.
+Measured on the live channel, five attempts per strategy:
+
+| strategy | result | average |
+|---|---|---|
+| one piece (a true plain control) | 5/5 | 162 ms |
+| 2 pieces, cut inside the SNI, 3 ms delay | 5/5 | 145 ms |
+| 8 pieces, 3 ms delay | 5/5 | 273 ms |
+| 16 bytes (the former default, ~92 pieces) | 5/5 | 1626 ms |
+
+A cut placed inside the hostname costs the same as not fragmenting at all. The former 16-byte
+default cost **1626 ms and bought no additional protection**, because protection comes from
+*where* the cut falls relative to the hostname, not from how many pieces there are. The cost
+grows at roughly **(N − 1) × 15 ms** on Windows, where `setTimeout` granularity is about
+15.6 ms. Keep-alive means this is paid once per connection, not once per request.
+
+Upgrading from a version where the size was set in bytes: a byte value set by hand is no longer
+read, and the default of **4 fragments** applies instead. Bytes cannot be converted into a count
+without also knowing where the cut fell, and a count nobody chose is safer than one derived from
+a setting whose meaning is gone.
 
 ### How fragmentation reaches model requests
 

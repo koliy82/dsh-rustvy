@@ -37,57 +37,106 @@ function check(label, ok, detail) {
   console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${detail === undefined ? '' : `  — ${detail}`}`)
 }
 
-// --- the slicing helper and its boundaries ----------------------------------
-// The three cases the spec names, plus two that the arithmetic makes easy to get wrong.
-const sixteen = Buffer.alloc(16, 0x16)
-const seventeen = Buffer.alloc(17, 0x16)
+// --- the cut planner and the SNI guarantee ----------------------------------
+// The contract changed from a byte size to a piece count, and with it the property under test.
+// Protection does not come from the number of pieces; it comes from one cut landing strictly
+// inside the hostname. A naive equal split does NOT provide that: in a real 1587-byte hello the
+// SNI sits at offset 200, so at count 8 the step is ~198 and `rustvy.xyz` lands whole inside one
+// piece — the evasion silently does not happen while the panel says fragmentation is on.
+//
+// These are invariants, not live timings. This box has intermittent network windows and a single
+// failed run here is evidence of nothing, so nothing below touches the network.
+const SNI = 'rustvy.xyz'
+/** A record shaped like a real ClientHello: the SNI at offset 200, 1587 bytes in total. */
+const hello = Buffer.concat([Buffer.alloc(200, 0x16), Buffer.from(SNI, 'utf8'), Buffer.alloc(1377, 0x41)])
 
-const oddSlices = net.fragmentSlices(seventeen, 16)
-check('17 bytes at 16 is two pieces', oddSlices.length === 2, String(oddSlices.length))
-check('and the split is 16 then 1', oddSlices[0]?.length === 16 && oddSlices[1]?.length === 1,
-  JSON.stringify(oddSlices.map(piece => piece.length)))
-check('and the pieces concatenate back to the input byte for byte',
-  Buffer.concat(oddSlices).equals(seventeen), `${Buffer.concat(oddSlices).length} vs ${seventeen.length}`)
+check('the synthetic hello is the measured size with the SNI where the real one has it',
+  hello.length === 1587 && hello.indexOf(Buffer.from(SNI, 'utf8')) === 200,
+  JSON.stringify({ length: hello.length, sniAt: hello.indexOf(Buffer.from(SNI, 'utf8')) }))
 
-const exactSlices = net.fragmentSlices(sixteen, 16)
-check('exactly 16 bytes at 16 is one piece, not two', exactSlices.length === 1, String(exactSlices.length))
-check('and that piece is the whole buffer', exactSlices[0]?.length === 16, String(exactSlices[0]?.length))
+for (const count of [2, 3, 4, 8, 16, 64]) {
+  const planned = net.fragmentSlices(hello, count, SNI)
+  const lengths = planned.pieces.map(piece => piece.length)
+  check(`count ${count}: the hostname is split across a piece boundary`,
+    planned.sniCut === true && !planned.pieces.some(piece => piece.includes(Buffer.from(SNI, 'utf8'))),
+    JSON.stringify({ sniCut: planned.sniCut, lengths }))
+  check(`count ${count}: the piece count is what was asked for`,
+    planned.pieces.length === count, `${planned.pieces.length} vs ${count}`)
+  check(`count ${count}: no piece is empty`,
+    lengths.every(length => length > 0), JSON.stringify(lengths))
+  check(`count ${count}: concatenating the pieces reproduces the record byte for byte`,
+    Buffer.concat(planned.pieces).equals(hello),
+    `${Buffer.concat(planned.pieces).length} vs ${hello.length}`)
+  check(`count ${count}: the order is preserved, so the first piece still starts the record`,
+    planned.pieces[0].subarray(0, 8).equals(hello.subarray(0, 8)),
+    planned.pieces[0].subarray(0, 8).toString('hex'))
+}
 
-check('an empty buffer yields no pieces at all', net.fragmentSlices(Buffer.alloc(0), 16).length === 0,
-  JSON.stringify(net.fragmentSlices(Buffer.alloc(0), 16)))
-check('a non-buffer yields no pieces rather than throwing', net.fragmentSlices('not a buffer', 16).length === 0)
-check('a buffer shorter than the piece size yields the buffer itself',
-  net.fragmentSlices(Buffer.alloc(3, 0x16), 16).length === 1)
+// The control that makes the guarantee mean something: an equal split of the same record at the
+// same count leaves the name intact. Without this, "the name is split" could be passing because
+// the record is small rather than because the planner placed a cut.
+{
+  const step = Math.round(hello.length / 8)
+  const naive = []
+  for (let offset = 0; offset < hello.length; offset += step) naive.push(hello.subarray(offset, offset + step))
+  check('an equal 8-way split of the same record leaves the hostname whole in one piece',
+    naive.some(piece => piece.includes(Buffer.from(SNI, 'utf8'))),
+    JSON.stringify(naive.map(piece => piece.length)))
+}
 
-// The real ClientHello is 1587 bytes on this platform, not the ~500 the spec assumed. The helper
-// is checked against that size too, because 1587 at 16 is 100 pieces and a remainder of 3 — the
-// arithmetic the mode's cost model depends on.
-const hello = Buffer.alloc(1587, 0x16)
-const helloSlices = net.fragmentSlices(hello, 16)
-check('the measured 1587-byte ClientHello cuts into 100 pieces', helloSlices.length === 100,
-  String(helloSlices.length))
-check('with the last piece holding the 3-byte remainder', helloSlices[99]?.length === 3,
-  String(helloSlices[99]?.length))
+// The fallback has to be *reported*, not silent: a caller that cannot locate the SNI must be able
+// to tell that the guarantee was not honoured rather than assume it was.
+{
+  const absent = net.fragmentSlices(hello, 4, 'not-present.example')
+  check('a hostname that is not in the record still yields pieces',
+    absent.pieces.length === 4, String(absent.pieces.length))
+  check('but reports that the SNI cut was not placed', absent.sniCut === false, String(absent.sniCut))
+  check('and says why, so the reason is not a guess',
+    typeof absent.fallback === 'string' && absent.fallback.includes('not found'), absent.fallback)
+  check('an empty buffer yields no pieces rather than one empty one',
+    net.fragmentSlices(Buffer.alloc(0), 4, SNI).pieces.length === 0,
+    String(net.fragmentSlices(Buffer.alloc(0), 4, SNI).pieces.length))
+  const tiny = net.fragmentSlices(Buffer.from([0x16, 0x03, 0x01]), 8, SNI)
+  check('a record shorter than the requested count yields fewer pieces and no empties',
+    tiny.pieces.length > 0 && tiny.pieces.length <= 3 && tiny.pieces.every(piece => piece.length > 0),
+    JSON.stringify(tiny.pieces.map(piece => piece.length)))
+  check('and it reports that the name could not be split inside a record that does not hold it',
+    tiny.sniCut === false, String(tiny.sniCut))
+}
+
+// The name is required, and the enforcement is a throw rather than a silent even split: a call
+// that cannot locate the SNI cannot honour the guarantee, and returning pieces anyway would let
+// the feature report itself as working while providing nothing.
+check('calling the planner without a hostname throws rather than guessing',
+  (() => {
+    try { net.fragmentSlices(hello, 4); return false } catch { return true }
+  })())
+check('and a non-buffer is not thrown on, because that is data rather than a programming error',
+  net.fragmentSlices('not a buffer', 4, SNI).pieces.length === 0,
+  JSON.stringify(net.fragmentSlices('not a buffer', 4, SNI).pieces.length))
+check('a one-byte hostname cannot be split strictly inside itself and says so',
+  net.fragmentSlices(Buffer.concat([Buffer.alloc(8, 0x16), Buffer.from('x', 'utf8')]), 4, 'x').sniCut === false,
+  String(net.fragmentSlices(Buffer.concat([Buffer.alloc(8, 0x16), Buffer.from('x', 'utf8')]), 4, 'x').sniCut))
 
 // --- the settings API --------------------------------------------------------
-check('the default piece size is 16, which is the size that splits the SNI',
-  net.getTlsFragment().fragmentBytes === 16, String(net.getTlsFragment().fragmentBytes))
+check('the default piece count is 4, the point that splits the SNI at near-plain cost',
+  net.getTlsFragment().fragmentCount === 4, String(net.getTlsFragment().fragmentCount))
 check('and the default mode is off, so nothing changes until asked',
   net.getTlsFragment().mode === 'off', net.getTlsFragment().mode)
 
 net.setTlsFragment({ mode: 'auto', host: ORIGIN_HOST })
 check('an unknown mode is read as off rather than honoured',
   net.setTlsFragment({ mode: 'sideways' }).mode === 'off', net.getTlsFragment().mode)
-check('a piece size above 64 falls back to 16 rather than being honoured',
-  net.setTlsFragment({ mode: 'auto', fragmentBytes: 128 }).fragmentBytes === 16,
-  String(net.getTlsFragment().fragmentBytes))
-check('a piece size of 0 falls back too, rather than producing zero-length pieces',
-  net.setTlsFragment({ mode: 'auto', fragmentBytes: 0 }).fragmentBytes === 16,
-  String(net.getTlsFragment().fragmentBytes))
+check('a count above 64 falls back to 4 rather than being honoured',
+  net.setTlsFragment({ mode: 'auto', fragmentCount: 128 }).fragmentCount === 4,
+  String(net.getTlsFragment().fragmentCount))
+check('a count below 2 falls back too, because one cut is the minimum that splits a name',
+  net.setTlsFragment({ mode: 'auto', fragmentCount: 0 }).fragmentCount === 4,
+  String(net.getTlsFragment().fragmentCount))
 check('a negative delay falls back, because a negative sleep is not a delay',
   net.setTlsFragment({ mode: 'auto', delayMs: -1 }).delayMs === 3, String(net.getTlsFragment().delayMs))
-check('a valid byte size and delay are honoured',
-  net.setTlsFragment({ mode: 'always', fragmentBytes: 32, delayMs: 7 }).fragmentBytes === 32
+check('a valid count and delay are honoured',
+  net.setTlsFragment({ mode: 'always', fragmentCount: 32, delayMs: 7 }).fragmentCount === 32
   && net.getTlsFragment().delayMs === 7, JSON.stringify(net.getTlsFragment()))
 check('hosts are lowercased and brackets stripped so scope matching cannot miss',
   JSON.stringify(net.setTlsFragment({ mode: 'auto', hosts: ['[Rustvy.XYZ]'] }).hosts) === JSON.stringify([ORIGIN_HOST]),
@@ -359,10 +408,10 @@ async function bench(options) {
   // nonsense local port. The protocol decides the default instead.
   const seen = []
   net.setFragmentTransport(async request => {
-    seen.push({ host: request.host, port: request.port, bytes: request.fragmentBytes })
+    seen.push({ host: request.host, port: request.port, count: request.fragmentCount })
     throw new Error('probe: recorded, not connected')
   })
-  const connector = net.fragmentedConnector({ fragmentBytes: 16 })
+  const connector = net.fragmentedConnector({ fragmentCount: 16 })
   const dial = options => new Promise(resolve => { connector(options, () => resolve()) })
   await dial({ hostname: ORIGIN_HOST, port: '', protocol: 'https:' })
   await dial({ hostname: ORIGIN_HOST, port: '8443', protocol: 'https:' })

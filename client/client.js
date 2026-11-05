@@ -3899,7 +3899,12 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
        * position rather than as a guess: `off`, and the defaults the host validates against.
        */
       const fragMode = ['off', 'auto', 'always'].includes(config.tlsFragment) ? config.tlsFragment : 'off'
-      const fragBytes = String(config.tlsFragmentBytes ?? 16)
+      // The count of fragments, not a byte size: one knob for one property. A config still
+      // carrying the retired `tlsFragmentBytes` reads as absent here and gets the default, which
+      // is the intended upgrade behaviour — the byte size cannot be converted into a count
+      // without also knowing where the cut fell, and a count nobody chose is safer than one
+      // derived from a setting whose meaning is gone.
+      const fragCount = String(config.tlsFragmentCount ?? 4)
       const fragDelay = String(config.tlsFragmentDelayMs ?? 3)
       const fragGlobal = config.tlsFragmentGlobal === true
       // Absent reads as `true`, matching `DEFAULT_CONFIG`: an older host half publishes no such
@@ -3974,7 +3979,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         ['dns', 'DNS', ['addresses']],
         ['tcp', 'TCP-соединение', []],
         ['tls', 'TLS-рукопожатие обычное', ['protocol', 'authorized']],
-        ['frag', 'TLS-рукопожатие фрагментированное', ['protocol', 'authorized', 'pieces']],
+        ['frag', 'TLS-рукопожатие фрагментированное', ['protocol', 'authorized', 'pieces', 'sniCut', 'sniFallback']],
         ['http', 'HTTP-запрос обычный', ['status', 'bytes']],
         ['httpFrag', 'HTTP-запрос фрагментированный', ['status', 'bytes']],
       ]
@@ -4036,6 +4041,10 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           return { text: `не проверялось — ${entry.skipped}`, skipped: true }
         }
         const parts = []
+        // Set when the fragments went out but the hostname was whole inside one of them: the
+        // single most misleading state this feature can display, because every other signal on
+        // the panel says the block is being bypassed while nothing was actually evaded.
+        let wasted = false
         if (typeof entry.ok === 'boolean') parts.push(entry.ok ? 'успех' : 'отказ')
         if (Number.isFinite(entry.ms)) parts.push(`${Math.round(entry.ms)} мс`)
         if (entry.code !== undefined && entry.code !== null) parts.push(`код ${String(entry.code)}`)
@@ -4050,6 +4059,17 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           const label = DIAG_FIELDS[field] ?? field
           if (field === 'authorized') {
             parts.push(value === true ? 'сертификат проверен' : 'сертификат НЕ проверен')
+          } else if (field === 'sniCut') {
+            // Never rendered as a bare boolean: `false` here means the fragmentation was wasted,
+            // and a `false` in a row of otherwise-green measurements reads as a detail.
+            if (value === true) parts.push('разрез внутри имени хоста поставлен')
+            else {
+              parts.push('РАЗРЕЗ МИМО ИМЕНИ ХОСТА — фрагментация впустую, обхода нет')
+              wasted = true
+            }
+          } else if (field === 'sniFallback') {
+            // Only meaningful as the reason for a missed cut; empty means the cut was placed.
+            if (typeof value === 'string' && value !== '') parts.push(`причина: ${value}`)
           } else if (Array.isArray(value)) {
             const shown = value.slice(0, 4).map(item => String(item)).join(', ')
             parts.push(`${label}: ${shown}${value.length > 4 ? ` и ещё ${value.length - 4}` : ''}`)
@@ -4057,7 +4077,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             parts.push(`${label}: ${String(value)}`)
           }
         }
-        return parts.length === 0 ? null : { text: parts.join(', '), skipped: false }
+        return parts.length === 0 ? null : { text: parts.join(', '), skipped: false, wasted }
       }
 
       /**
@@ -4587,33 +4607,42 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             + 'отчёты аптайма, проверки ключей. Запросы модели он не затрагивает — для них отдельный '
             + 'переключатель ниже.'),
           // The cost warning belongs beside `always` and appears when `always` is chosen, because
-          // that is the moment the decision is being made. The numbers are measured on this
-          // machine, not estimated: plain 8/8 at a 353 ms average against fragmented 8/8 at
-          // 1658 ms — 4.7x — with one fragmented attempt timing out at 30005 ms while plain kept
-          // succeeding. `always` has no plain fallback at all, so that cost is standing.
+          // that is the moment the decision is being made. The numbers are the five-attempt
+          // measurement on the live channel, not an estimate: plain 5/5 at 162 ms, two pieces cut
+          // inside the hostname 5/5 at 145 ms, eight pieces 5/5 at 273 ms, and the retired
+          // 16-byte default (~92 pieces) 5/5 at 1626 ms. `always` has no plain fallback at all, so
+          // whatever a count costs is paid on every connection rather than only inside a block.
           fragMode === 'always'
             ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
-                '«always» фрагментирует каждое новое соединение сразу и не имеет запасного обычного пути. '
-                + 'Замер на этой машине: обычный транспорт 8 из 8, в среднем 353 мс; фрагментированный '
-                + '8 из 8, в среднем 1658 мс — в 4,7 раза дороже, и одна попытка ушла в таймаут на '
-                + '30005 мс, пока обычный транспорт продолжал отвечать. Причина в арифметике: при 16 байтах '
-                + 'ClientHello занимает 1587 байт, то есть распадается на сто частей. '
+                '«always» фрагментирует каждое новое соединение сразу и не имеет запасного обычного пути, '
+                + 'поэтому плата за фрагментацию становится постоянной, а не платится только внутри окна '
+                + 'блокировки. Замер на живом канале, по пять попыток на стратегию: один кусок (настоящий '
+                + 'plain) 5 из 5, 162 мс; две части с разрезом внутри имени хоста 5 из 5, 145 мс; восемь '
+                + 'частей 5 из 5, 273 мс; прежний дефолт в 16 байт (~92 куска) 5 из 5, 1626 мс. Цена растёт '
+                + 'примерно как (N − 1) × 15 мс на Windows, потому что гранулярность setTimeout здесь около '
+                + '15,6 мс. '
                 + '«auto» даёт ту же защиту без этой постоянной платы — оно переключается только после сбоев '
                 + 'транспорта. «always» стоит выбирать тогда, когда вы замерили, что обычный транспорт не работает.')
             : null,
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' } },
-            h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Размер фрагмента, байт'),
+            h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Число фрагментов'),
             h(TextField, {
-              value: fragBytes,
+              value: fragCount,
               width: '90px',
-              saveOnBlur: false,
-              onSave: next => { void post('/config', { tlsFragmentBytes: Number(next) }, 'save') },
+              // No `saveOnBlur: false` here, and that is a fix rather than a preference: with it
+              // set, `commit()` returns early and Enter only blurs, so `onSave` is never reached
+              // from the field at all. These two numbers have no Apply button beside them — the
+              // proxy address and the timeout field do, which is why *they* keep the flag — so
+              // with the flag on, typing a number here did nothing and the setting silently
+              // stayed at whatever it was. Blurring or pressing Enter now saves, like the seven
+              // other fields on the page that pass no `saveOnBlur`.
+              onSave: next => { void post('/config', { tlsFragmentCount: Number(next) }, 'save') },
             }),
             h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Пауза, мс'),
             h(TextField, {
               value: fragDelay,
               width: '90px',
-              saveOnBlur: false,
+              // See the count field above: without this the field had no commit path at all.
               onSave: next => { void post('/config', { tlsFragmentDelayMs: Number(next) }, 'save') },
             })),
           h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '10px', cursor: 'pointer' } },
@@ -4640,8 +4669,8 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
               + 'не трогает: фрагментация остаётся только на собственных запросах плагина. ')
             + 'Этот переключатель — принудительное включение для случая, когда ждать замера не нужно. '
             + 'Повышение срабатывает только по замеру, поэтому в положении «always» его не происходит: '
-            + 'иначе рукопожатие в 1658 мс встало бы на каждый запрос модели только потому, что вы щёлкнули '
-            + 'выключателем, — цену, которую вы уже заплатили один раз. '
+            + 'иначе фрагментация встала бы на каждый запрос модели только потому, что вы щёлкнули '
+            + 'выключателем, — плату, которую вы уже внесли один раз, брали бы на каждом запросе. '
             + 'Важное следствие: сигнал дают собственные запросы плагина. Если прокси включён и работает, они '
             + 'проходят и повышения не происходит — это правильно, значит ничего не заблокировано. Поэтому '
             + 'строка «транспорт сейчас» может показывать plain, а трафик модели при этом не фрагментируется, '
@@ -4709,7 +4738,7 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                     return h(Row, {
                       key: layer[0],
                       name: layer[1],
-                      tone: line.skipped ? C.labelSecondary : line.text.startsWith('отказ') ? C.warn : undefined,
+                      tone: line.skipped ? C.labelSecondary : line.text.startsWith('отказ') || line.wasted === true ? C.warn : undefined,
                     }, line.text)
                   }),
                   Array.isArray(diagResult.history) && diagResult.history.length > 0
@@ -4719,19 +4748,24 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '8px' } },
             'Разбивает ClientHello на части, чтобы имя хоста не читалось целиком в одном пакете. '
             + '«auto» ничего не стоит, пока не понадобится: транспорт начинается обычным (plain) и переключается '
-            + 'только после двух подряд сбоев транспорта, поэтому дорогие ~1,5 с платятся внутри окна блокировки, '
+            + 'только после двух подряд сбоев транспорта, поэтому плата за фрагментацию возникает внутри окна '
+            + 'блокировки, '
             + 'а не заранее. Сбой транспорта — это отказ соединения или таймаут; HTTP-ответ 4xx или 5xx им не '
             + 'считается, потому что транспорт, доставивший 502, работает. '
             + 'С прокси фрагментация теперь сочетается: plaintext-прокси туннелирует запрос, а ClientHello '
             + 'фрагментируется внутри туннеля — туннель CONNECT не шифрует то, что по нему передают, поэтому DPI '
             + 'видит ClientHello там же, где увидел бы его без прокси. Сочетается только plaintext-прокси: прокси '
             + 'с https:// и SOCKS5 по-прежнему идут на собственных агентах undici, и фрагментации внутри них нет. '
-            + '16 байт — не регулятор скорости, а размер, при котором имя хоста гарантированно разрывается между '
-            + 'пакетами: подняв его до 64, можно оставить имя целым внутри одного пакета и тихо перестать работать, '
-            + 'поэтому больше не значит лучше. '
-            + 'Замеренная цена на Windows — около 1,5 с на каждое новое соединение при 16 байт и паузе 3 мс: '
-            + 'ClientHello здесь 1587 байт (TLS 1.3 с постквантовым ключевым материалом), то есть 100 фрагментов, '
-            + 'а гранулярность setTimeout на Windows около 15,6 мс. Keep-alive означает, что это раз на соединение, '
+            + 'Число фрагментов — не регулятор скорости и не регулятор защиты. Защита обеспечивается '
+            + 'конструкцией, а не правильно подобранным числом: один разрез всегда ставится внутри имени хоста, '
+            + 'поэтому имя никогда не лежит целиком в одном сегменте — при любом количестве частей. Именно '
+            + 'поэтому настройку вообще безопасно трогать. Больше частей не значит лучше: разрез, поставленный '
+            + 'мимо имени хоста, обходится столько же, сколько отсутствие фрагментации, и не даёт ничего взамен. '
+            + 'Цена растёт с числом частей — примерно (N − 1) × 15 мс на Windows, где гранулярность setTimeout '
+            + 'около 15,6 мс. Замер по пять попыток на живом канале: один кусок 162 мс, две части с разрезом '
+            + 'внутри имени 145 мс, восемь частей 273 мс, прежний дефолт в 16 байт (~92 куска) 1626 мс — старый '
+            + 'дефолт платил 1626 мс и не давал дополнительной защиты, потому что защита зависит от того, где '
+            + 'падает разрез, а не от того, сколько частей. Keep-alive означает, что это раз на соединение, '
             + 'а не раз на запрос. '
             + '«Диагностика канала» измеряет канал по слоям — DNS, TCP, обычное и фрагментированное TLS-рукопожатие, '
             + 'HTTP по каждому из них — и полезна именно во время блокировки: после неё измерять уже нечего, '

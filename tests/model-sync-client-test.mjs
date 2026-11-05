@@ -843,6 +843,21 @@ const storesByKey = new Map()
 let hookFrames = []
 /** The root frame, whose children are counted fresh on every render. */
 let rootFrame = { key: '', next: 0 }
+/** Set only around a window in which no deliberate typing happens; see the guard below. */
+let fieldGuardArmed = false
+/** Every `saveOnBlur: false` field seen during an armed pass: what it showed and what it was given. */
+const fieldObservations = []
+/**
+ * What *every* TextField was given during that pass.
+ *
+ * Separate from `fieldObservations` and not derivable from it, which is what made the guard
+ * unable to fire. The value a field inherits comes from the slot of a *sibling*, and that
+ * sibling usually carries no `saveOnBlur: false` — the delay field does not, the count field
+ * did. Comparing only against other observed fields therefore compared against a set that
+ * never contained the owner of the inherited value, so the signature could not match however
+ * wrong the keying was.
+ */
+const fieldGivens = []
 let activeHooks = []
 let hookIndex = 0
 let effects = []
@@ -869,6 +884,24 @@ const React = {
       hookIndex = 0
       hookFrames.push({ key, next: 0 })
       const rendered = type({ ...(props ?? {}), children: flat.length === 1 ? flat[0] : flat })
+      // A harness guard compensating for a limitation this stub cannot fix. `createElement`
+      // renders function components eagerly, so sibling indices are consumed while the parent's
+      // arguments are still being evaluated; a conditional sibling that yields `null` therefore
+      // consumes no index and shifts the store slot of every later sibling, where React would
+      // hold the slot open. Fixing that properly needs rendering deferred until the parent's
+      // child list is known — a reconciler, not a tweak.
+      //
+      // The visible damage is confined to `saveOnBlur: false` fields, because those skip the
+      // props re-sync and keep whatever value the inherited slot holds; that is how a field
+      // rendered from `config.tlsFragmentCount ?? 4` came out showing '3'. For the other fields
+      // a rendered value differing from `props.value` is just the user typing, so the guard is
+      // scoped to that flag and armed only around a window with no deliberate typing.
+      if (fieldGuardArmed && type.name === 'TextField') {
+        fieldGivens.push(String(props?.value ?? ''))
+        if (props?.saveOnBlur === false) {
+          fieldObservations.push({ rendered: String(rendered?.props?.value ?? ''), given: String(props?.value ?? '') })
+        }
+      }
       hookFrames.pop()
       activeHooks = prevHooks
       hookIndex = prevIndex
@@ -3281,13 +3314,32 @@ TIMEOUT_ANSWER = { ok: true, applied: true, value: 3600000, routes: ['rustvy', '
 // plain" has no field to come from: `/state` publishes only `transport.mode`, so the page has
 // to derive the difference by comparing the setting against the live mode. Get that wrong and
 // `auto` looks broken to everyone until a blocking window happens to arrive.
-STATE.config.tlsFragmentBytes = 16
+STATE.config.tlsFragmentCount = 4
 STATE.config.tlsFragmentDelayMs = 3
 STATE.config.tlsFragmentGlobal = false
 {
   STATE.config.tlsFragment = 'auto'
   STATE.transport = { mode: 'plain', since: '2026-11-04T00:00:00.000Z' }
+  // Armed for exactly one render pass and disarmed immediately, because a `saveOnBlur: false`
+  // field is *supposed* to diverge from `props.value` while the user is editing it — the proxy
+  // address holds a draft. Guarding a single pass with no interaction in it keeps the check about
+  // the harness's keying rather than about draft behaviour.
+  fieldObservations.length = 0
+  fieldGivens.length = 0
+  fieldGuardArmed = true
   const t = render()
+  fieldGuardArmed = false
+  // The signature of a store slot inherited from a sibling is *not* "the rendered value differs
+  // from the one it was handed" — that is what a draft field does on purpose, and the proxy
+  // address legitimately holds one. It is "the rendered value is exactly what a different field
+  // was handed", which no amount of typing can produce. That is how a field rendered from
+  // `config.tlsFragmentCount ?? 4` came out showing the delay's '3'.
+  const inheritedSlots = fieldObservations.filter(seen =>
+    seen.rendered !== seen.given
+    && fieldGivens.some(given => given === seen.rendered && given !== seen.given))
+  check('no saveOnBlur:false field showed a value inherited from another field\'s store slot',
+    inheritedSlots.length === 0,
+    `наблюдений ${fieldObservations.length}, переданных значений ${fieldGivens.length}: ${JSON.stringify(inheritedSlots)}`)
   const x = allText(t)
   check('the fragmentation block is its own labelled block', x.includes('Против блокировки ТСПУ'), 'missing')
   check('auto with a plain transport says it is on but not yet active',
@@ -3357,8 +3409,8 @@ STATE.config.tlsFragmentGlobal = false
   check('the switch reads as an override, not as the only way in',
     x.includes('принудительное включение для случая, когда ждать замера не нужно'), 'missing')
   check('promotion does not fire under always, and the page says what that would have cost',
-    x.includes('в положении «always» его не происходит') && x.includes('1658 мс')
-    && x.includes('цену, которую вы уже заплатили'), 'missing')
+    x.includes('в положении «always» его не происходит')
+    && x.includes('плату, которую вы уже внесли один раз'), 'missing')
   check('the signal comes from the plugin\'s own requests, so a working proxy means no promotion',
     x.includes('сигнал дают собственные запросы плагина') && x.includes('Если прокси включён и работает'), 'missing')
   check('and plain transport with unfragmented model traffic is named as a correct state, not a failure',
@@ -3366,12 +3418,13 @@ STATE.config.tlsFragmentGlobal = false
 
   // --- the `always` cost warning, at `always` and only there ------------------
   check('auto carries no standing-cost warning, because it has no standing cost',
-    !x.includes('в 4,7 раза дороже'), 'the always warning rendered while the mode is auto')
+    !x.includes('не имеет запасного обычного пути'), 'the always warning rendered while the mode is auto')
   STATE.config.tlsFragment = 'always'
   const alwaysText = allText(render())
   check('always warns with the measured numbers rather than an adjective',
-    alwaysText.includes('353 мс') && alwaysText.includes('1658 мс')
-    && alwaysText.includes('в 4,7 раза дороже') && alwaysText.includes('30005 мс'), 'missing')
+    alwaysText.includes('162 мс') && alwaysText.includes('145 мс')
+    && alwaysText.includes('273 мс') && alwaysText.includes('1626 мс')
+    && alwaysText.includes('(N − 1) × 15 мс'), 'missing')
   check('and it says auto gives the same protection without the standing cost',
     alwaysText.includes('ту же защиту без этой постоянной платы'), 'missing')
   check('and that always has no plain fallback, which is why the cost is standing',
@@ -3441,7 +3494,7 @@ STATE.config.tlsFragmentGlobal = false
   DIAG_ANSWER = {
     ...DIAG_ANSWER,
     verdict: 'tls-plain-blocked',
-    frag: { ok: true, ms: 1628, protocol: 'TLSv1.3', authorized: true, pieces: 100 },
+    frag: { ok: true, ms: 1628, protocol: 'TLSv1.3', authorized: true, pieces: 100, sniCut: true, sniFallback: '' },
     http: { ok: false, skipped: 'tls failed' },
   }
   findButton(render(), 'Диагностика канала').props.onClick()
@@ -3458,6 +3511,36 @@ STATE.config.tlsFragmentGlobal = false
   check('a measured fragment layer reports its piece count',
     String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')).includes('фрагментов: 100'),
     String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')))
+  // `sniCut` is the difference between «фрагментировано» and «фрагментировано впустую», and it is
+  // the number to look at when a block is not being bypassed. Asserted in both directions: a
+  // placed cut says so in words, and a missed cut has to be loud and carry its reason, because
+  // every other signal on the panel would otherwise read as a working bypass.
+  check('a placed cut is reported in words, not as a bare boolean',
+    String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')).includes('разрез внутри имени хоста поставлен')
+    && !String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')).includes('sniCut'),
+    String(rowValue(skipped, 'TLS-рукопожатие фрагментированное')))
+  DIAG_ANSWER = {
+    ...DIAG_ANSWER,
+    frag: { ok: true, ms: 1628, protocol: 'TLSv1.3', authorized: true, pieces: 100, sniCut: false, sniFallback: 'hostname not present in the ClientHello' },
+  }
+  findButton(render(), 'Диагностика канала').props.onClick()
+  await flush()
+  const wastedRow = String(rowValue(render(), 'TLS-рукопожатие фрагментированное'))
+  check('a missed cut is loud, because it means the fragmentation achieved nothing',
+    wastedRow.includes('РАЗРЕЗ МИМО ИМЕНИ ХОСТА') && wastedRow.includes('фрагментация впустую'), wastedRow)
+  check('and it carries the reason the probe gave',
+    wastedRow.includes('причина: hostname not present in the ClientHello'), wastedRow)
+  check('while still reporting that the pieces went out, so the two facts are not conflated',
+    wastedRow.includes('успех') && wastedRow.includes('фрагментов: 100'), wastedRow)
+  // The colour, not just the words. A removal probe that deleted the `wasted` flag left the suite
+  // green at 446/446, because nothing asserted the tone the flag drives — the all-caps text would
+  // have carried the meaning and the branch would have been dead code nobody could miss. A row
+  // that is loud in words but ordinary in colour is exactly how a wasted bypass gets skimmed past.
+  const warnSpans = collect(render(), 'span')
+    .filter(item => String(item.props?.style?.color ?? '').includes('state-warn'))
+  check('and the wasted row is coloured as a warning rather than left ordinary',
+    warnSpans.some(item => allText(item).includes('РАЗРЕЗ МИМО ИМЕНИ ХОСТА')),
+    JSON.stringify(warnSpans.map(item => allText(item).slice(0, 48))))
   check('the TSPU signature verdict is named as such, because it is the informative one during a block',
     skippedText.includes('подпись блокировки ТСПУ'), skippedText.slice(0, 200))
   DIAG_ANSWER = { ok: false, error: 'probe unavailable' }
@@ -3509,10 +3592,49 @@ STATE.config.tlsFragmentGlobal = false
     && x.includes('SOCKS5'), 'missing')
   check('and no longer claims the proxy outranks fragmentation',
     !x.includes('важнее фрагментации'), 'the superseded claim is still on the page')
-  check('the copy says 16 bytes is not a speed knob and bigger can silently stop working',
-    x.includes('не регулятор скорости') && x.includes('тихо перестать работать') && x.includes('больше не значит лучше'), 'missing')
-  check('and it states the Windows cost, which is not the Linux figure in the task document',
-    x.includes('1,5 с') && x.includes('Windows') && x.includes('1587') && x.includes('раз на соединение'), 'missing')
+  check('the copy says the count is neither a speed dial nor a protection dial, and why it is safe to touch',
+    x.includes('не регулятор скорости и не регулятор защиты')
+    && x.includes('один разрез всегда ставится внутри имени хоста')
+    && x.includes('Больше частей не значит лучше'), 'missing')
+  check('the guarantee reads as structural rather than as a number to pick correctly',
+    x.includes('Защита обеспечивается конструкцией') && x.includes('при любом количестве частей'), 'missing')
+  check('a cut missing the hostname is named as worthless, which is the point of the measurement',
+    x.includes('разрез, поставленный мимо имени хоста') && x.includes('не даёт ничего взамен'), 'missing')
+  check('the latency shape is stated with the measurement behind it, and the retired figures are gone',
+    x.includes('(N − 1) × 15 мс') && x.includes('Windows') && x.includes('1626 мс')
+    && x.includes('раз на соединение') && !x.includes('1587') && !x.includes('1658'), 'a retired figure survived')
+  check('and the old byte-size paragraph is gone from the copy',
+    !x.includes('16 байт — не регулятор скорости') && !x.includes('Размер фрагмента, байт'), 'the byte setting survived')
+  check('the field on the page is the fragment count', x.includes('Число фрагментов'), 'missing')
+  // The commit path, taken the way a user takes it: change the text, re-render, then blur. The
+  // re-render in between is not incidental — `commit()` closes over the `value` of its own
+  // render, so blurring the same node without a pass between compares the old text with itself
+  // and never saves.
+  //
+  // This is reachable at all only because the two number fields no longer pass
+  // `saveOnBlur: false`. With that flag `commit()` returns early, Enter only blurs, and `onSave`
+  // was never called from the field — so these two had no commit path whatsoever and typing a
+  // number did nothing. That also removes the store-inheritance artifact noted earlier: without
+  // the flag, `TextField` re-syncs from `props.value` on every render, so a slot inherited from a
+  // sibling self-corrects instead of showing the wrong field's number.
+  //
+  // Asserted on the exact POST body, because the failure this catches is a renamed key: the page
+  // would look right and write a field the host never reads.
+  const textFieldsOf = tree => collect(tree, 'input').filter(item => item.props.type === 'text')
+  const fragValues = textFieldsOf(t).map(item => item.props.value)
+  check('the count and the delay render as fields, the count showing the configured 4',
+    fragValues.includes('4') && fragValues.includes('3'), JSON.stringify(fragValues))
+  const typed = textFieldsOf(render()).find(item => item.props.value === '4')
+  check('the count field is reachable by the value it shows', typed !== undefined,
+    JSON.stringify(textFieldsOf(render()).map(item => item.props.value)))
+  typed.props.onChange({ target: { value: '8' } })
+  await flush()
+  requests.length = 0
+  textFieldsOf(render()).find(item => item.props.value === '8').props.onBlur()
+  await flush()
+  const countPost = requests.find(item => item.path === '/dsh-rustvy/config')
+  check('editing the count posts tlsFragmentCount, the key the host reads',
+    countPost !== undefined && countPost.body === '{"tlsFragmentCount":8}', String(countPost?.body))
 }
 
 const failed = results.filter(ok => !ok).length
