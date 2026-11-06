@@ -586,6 +586,47 @@ try {
   check('the lib load section ran', false, error instanceof Error ? error.message : String(error))
 }
 
+/* -------------------------- bundled third-party notices ------------------------ */
+
+// The packet-level bypass redistributes binaries from two upstream projects, and the notices are
+// OURS to supply: the upstream release archive carries no licence file at all, so nothing else
+// puts them on disk. A notice that stops shipping is a compliance failure with no runtime
+// symptom whatsoever — the plugin keeps working, the binaries keep working, and the only person
+// who notices is a lawyer. So the gate asserts the three things that can silently go wrong:
+// the file exists, `package.json` `files` lists it (an unlisted file is simply not published),
+// and it still contains the markers both licences require rather than having been truncated.
+try {
+  const noticeName = 'NOTICE-zapret.txt'
+  const noticePath = join(ROOT, noticeName)
+  check(`${noticeName} exists`, existsSync(noticePath), noticePath)
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  const files = Array.isArray(manifest.files) ? manifest.files : []
+  check(`${noticeName} is listed in package.json "files"`, files.includes(noticeName), files.join(', '))
+  const notice = existsSync(noticePath) ? readFileSync(noticePath, 'utf8') : ''
+  check('the notice is not a stub', notice.length > 10_000, `${notice.length} bytes`)
+  // Each marker is something a licence actually requires, not decoration: the MIT permission
+  // notice, the copyright holders, the GPLv2 text we elected for WinDivert, and the upstream URL
+  // that stands in for the corresponding source offer.
+  for (const [label, marker] of [
+    ['carries the MIT permission notice', 'Permission is hereby granted, free of charge'],
+    ['names bol-van and Flowseal as copyright holders', 'bol-van'],
+    ['carries the GPLv2 text', 'GNU GENERAL PUBLIC LICENSE'],
+    ['names the WinDivert source location', 'basil00/WinDivert'],
+    ['records which of the dual licences was elected', 'elects'],
+  ]) {
+    check(`the notice ${label}`, notice.includes(marker), marker.slice(0, 40))
+  }
+  // The module that reads it must find it by the same name, or the gate would be checking a file
+  // the code never opens.
+  const zapret = await import(pathToFileURL(join(ROOT, 'lib', 'zapret.js')).href)
+  check('lib/zapret.js points at the same notice file', zapret.ZAPRET_NOTICE_SOURCE === noticeName,
+    String(zapret.ZAPRET_NOTICE_SOURCE))
+  check('and can actually read it', typeof zapret.zapretNoticeText() === 'string' && zapret.zapretNoticeText().length > 10_000,
+    String(zapret.zapretNoticeText().length))
+} catch (error) {
+  check('the notices section ran', false, error instanceof Error ? error.message : String(error))
+}
+
 /* ------------------------------- test discovery ------------------------------ */
 
 // The defect this section exists to prevent is silent, which is why it survived four

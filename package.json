@@ -1,7 +1,7 @@
 {
   "name": "dsh-rustvy",
-  "version": "1.6.1",
-  "description": "Rustvy for DeepSeek Harness: vendor marks in the model picker, a model list kept in step with what the provider actually serves, a raised stream idle timeout so long-reasoning models are not cut off by the adapter's watchdog, a ClientHello-fragmenting transport that reaches model traffic when a DPI filter is measured to be blocking, an optional HTTP(S)/SOCKS5 proxy scoped to rustvy traffic alone and switchable without a restart, and a ring of API keys that lets each chat send its requests with a key of its own — the host half mirrors the catalog and logos to loopback, regenerates the pi-ai route's models from the route's own endpoint with the drift shown before anything is written, and clones that route once per key, so a key value stays in the harness credential store and never in the plugin's files.",
+  "version": "1.6.2",
+  "description": "Rustvy for DeepSeek Harness: vendor marks in the model picker, a model list kept in step with what the provider actually serves, a raised stream idle timeout so long-reasoning models are not cut off by the adapter's watchdog, a ClientHello-fragmenting transport that reaches model traffic when a DPI filter is measured to be blocking, an optional packet-level bypass that downloads zapret's winws and registers it as a service — the only way to defeat a filter that reassembles TCP, since injecting a decoy packet or overlapping sequence numbers is not expressible through a socket, an optional HTTP(S)/SOCKS5 proxy scoped to rustvy traffic alone and switchable without a restart, and a ring of API keys that lets each chat send its requests with a key of its own — the host half mirrors the catalog and logos to loopback, regenerates the pi-ai route's models from the route's own endpoint with the drift shown before anything is written, and clones that route once per key, so a key value stays in the harness credential store and never in the plugin's files.",
   "type": "module",
   "license": "MIT",
   "main": "lib/index.js",
@@ -53,6 +53,7 @@
     "install.ps1",
     "README.md",
     "README.en.md",
+    "NOTICE-zapret.txt",
     "LICENSE"
   ],
   "scripts": {

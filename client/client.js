@@ -3909,7 +3909,153 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
       const fragGlobal = config.tlsFragmentGlobal === true
       // Absent reads as `true`, matching `DEFAULT_CONFIG`: an older host half publishes no such
       // key, and the behaviour it has is the automatic one.
+      // Absent reads as `true`, matching `DEFAULT_CONFIG`: an older host half publishes no such
+      // key, and the behaviour it has is the automatic one.
       const fragGlobalAuto = config.tlsFragmentGlobalAuto !== false
+
+      /**
+       * Packet-level bypass (zapret).
+       *
+       * Both routes answer `{ ok, action, state, detail, reason, progress }` and nothing else is
+       * assumed; unknown keys are ignored rather than rendered. `state` is a string and `detail`
+       * is the rich object — an object in `state` would render as «неизвестно» for every state,
+       * because the page keys its sentences off one value.
+       *
+       * Until the status read has answered there is no measurement to show, and «неизвестно» is
+       * not the same sentence as «не скачано»: one says "look again", the other says "download
+       * it", and collapsing them sends the user to the wrong remedy. That is the mistake the
+       * layered diagnosis view exists to avoid.
+       */
+      const [zapAnswer, setZapAnswer] = React.useState(undefined)
+      const [zapBusy, setZapBusy] = React.useState('')
+      // The second step of a two-step install under a foreign packet engine. A single press must
+      // not install: the cost of being wrong here is a second engine capturing TCP 443, so the
+      // first press only surfaces the route's own reason and asks for confirmation.
+      const [zapConfirm, setZapConfirm] = React.useState(false)
+      const [zapLoaded, setZapLoaded] = React.useState(false)
+      /**
+       * The state names the route actually emits, and what each means to the user.
+       *
+       * There is no `installed`. It would mean "exists but was never started", and `sc query`
+       * answers STOPPED both for that and for a service the user stopped — so emitting the word
+       * would claim a distinction the code cannot see. `unknown` is real and reachable: it is
+       * what the route answers when `sc` cannot be read, and what the status GET answers when
+       * the read throws. It is mapped explicitly rather than left to arrive as a name the page
+       * has never heard of, because those are two different reasons to render the same word and
+       * the page should not depend on the accident.
+       */
+      const ZAP_STATES = {
+        absent: 'не скачано',
+        downloaded: 'скачано, служба не установлена',
+        stopped: 'установлена, не запущена',
+        running: 'работает',
+        'foreign-running': 'работает чужая служба zapret',
+        unknown: 'неизвестно',
+      }
+      const zapState = zapAnswer?.state
+      // Anything else — an absent state, or a name this page has never heard of — is also
+      // «неизвестно», never a guess at one of the known ones.
+      const zapStateText = typeof zapState === 'string' && ZAP_STATES[zapState] !== undefined
+        ? ZAP_STATES[zapState]
+        : 'неизвестно'
+      // A foreign packet-level engine already desyncing the same traffic is the one state in
+      // which installing ours must not be offered at all: two engines overlap sequence numbers
+      // on one stream and break each other's handshakes, and the user would be left debugging a
+      // broken connection instead of being told why. So the button is refused here rather than
+      // merely warned about — and the route refuses the install too, naming the foreign service
+      // in `reason`, which is why that string is part of the contract and not incidental copy.
+      const zapBlocked = zapState === 'foreign-running'
+      /**
+       * Download progress, or `null` when there is none to show.
+       *
+       * `progress` is either `null` or `{ received, total }`, and it arrives only on a response
+       * that downloaded something: the route is one-shot, so there is no live progress to render
+       * and none is promised. Both numbers have to be finite, because a real `received` beside a
+       * `null` total would render as a fraction of nothing — and a plausible-looking default is
+       * worse than an admitted absence.
+       */
+      const zapProgress = Number.isFinite(zapAnswer?.progress?.received) && Number.isFinite(zapAnswer?.progress?.total)
+        ? `${Math.round(zapAnswer.progress.received)} из ${Math.round(zapAnswer.progress.total)} байт`
+        : null
+      /**
+       * The rich half of the answer, as one line.
+       *
+       * Every field of `detail` is either a real value or `null`, and `null` renders as an
+       * omission rather than as a plausible default. The one that matters most is `covered`:
+       * `false` means the hostlist was read and `rustvy.xyz` is not in it, while `null` means
+       * there is no hostlist and nobody checked. Rendering the second as the first would tell
+       * the user their host is uncovered when nothing was ever looked at.
+       *
+       * @param detail - the `detail` object, or whatever else the route sent.
+       * @returns the line, or `null` when there is nothing to show.
+       */
+      const zapDetailLine = detail => {
+        if (detail === null || detail === undefined || typeof detail !== 'object') return null
+        const parts = []
+        if (typeof detail.version === 'string' && detail.version !== '') parts.push(`версия ${detail.version}`)
+        if (Array.isArray(detail.missing) && detail.missing.length > 0) parts.push(`не хватает: ${detail.missing.join(', ')}`)
+        if (Array.isArray(detail.notices) && detail.notices.length > 0) parts.push(`уведомления на диске: ${detail.notices.join(', ')}`)
+        if (detail.service === 'unknown') parts.push('состояние службы не читается')
+        else if (typeof detail.service === 'string' && detail.service !== '') parts.push(`служба: ${detail.service}`)
+        if (detail.covered === true) parts.push('rustvy.xyz в списке хостов')
+        else if (detail.covered === false) parts.push('rustvy.xyz НЕ в списке хостов')
+        if (typeof detail.foreignName === 'string' && detail.foreignName !== '') parts.push(`чужая служба: ${detail.foreignName}`)
+        if (typeof detail.hostlist === 'string' && detail.hostlist !== '') parts.push(`список хостов: ${detail.hostlist}`)
+        return parts.length === 0 ? null : parts.join(' · ')
+      }
+      const zapDetail = zapDetailLine(zapAnswer?.detail)
+
+      /**
+       * Read what zapret is doing, once, when the panel opens.
+       *
+       * Its own fetch path rather than `post()`: this changes no setting, and the page needs the
+       * body. Guarded by a flag rather than by the dependency array, because a renderer that runs
+       * effects without comparing dependencies — which this page's own test stub does — would
+       * otherwise re-run it on every render: fetch, set state, re-render, fetch, without settling.
+       *
+       * @returns a promise that settles once the answer is in state.
+       */
+      const loadZapret = async () => {
+        try {
+          const response = await fetch(`${API}/zapret`, { headers: { accept: 'application/json' } })
+          const payload = await response.json().catch(() => ({}))
+          setZapAnswer(payload?.ok === false ? { ...payload, reason: payload?.reason ?? `HTTP ${response.status}` } : payload)
+        } catch (error) {
+          setZapAnswer({ ok: false, action: 'status', reason: error.message })
+        }
+      }
+      React.useEffect(() => {
+        if (zapLoaded) return
+        setZapLoaded(true)
+        void loadZapret()
+      }, [])
+
+      /**
+       * Run one zapret action and keep whatever the route answered.
+       *
+       * @param action - `install`, `start`, `stop`, `restart` or `uninstall`.
+       * @returns a promise that settles once the outcome is rendered.
+       */
+      const runZapret = async (action, extra) => {
+        setZapBusy(action)
+        try {
+          const response = await fetch(`${API}/zapret`, {
+            method: 'POST',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify(extra === undefined ? { action } : { action, ...extra }),
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || payload?.ok === false) {
+            setZapAnswer({ ...payload, ok: false, reason: payload?.reason ?? payload?.error ?? `HTTP ${response.status}` })
+          } else {
+            setZapAnswer(payload)
+          }
+        } catch (error) {
+          setZapAnswer({ ok: false, action, reason: error.message })
+        } finally {
+          setZapBusy('')
+        }
+      }
 
       /**
        * The channel diagnosis, and why the button exists.
@@ -4770,6 +4916,98 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
             + '«Диагностика канала» измеряет канал по слоям — DNS, TCP, обычное и фрагментированное TLS-рукопожатие, '
             + 'HTTP по каждому из них — и полезна именно во время блокировки: после неё измерять уже нечего, '
             + 'происходящее недоступно ни вам, ни тому, кто будет разбирать жалобу.'),
+          // «Обход на уровне пакетов». Its own block, after the fragmentation one, because it is
+          // the only control on this page that changes the machine rather than a setting: it
+          // registers a kernel driver. The provenance, the elevation prompt and the limits live
+          // here rather than in a file nobody opens, because this is the feature a user enables
+          // on trust.
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '12px 0 6px' } }, 'Обход на уровне пакетов'),
+          h(Row, { name: 'zapret' }, zapStateText),
+          // The detail line is a row of its own and is omitted entirely when `detail` carries
+          // nothing, rather than rendered empty: an empty row reads as a measurement that came
+          // back blank.
+          zapDetail === null
+            ? null
+            : h(Row, { name: 'что на диске' }, zapDetail),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '6px' } },
+            h(Button, {
+              variant: 'primary',
+              // Not disabled under a foreign engine, and that is a change of ruling rather than an
+              // oversight. The two hostlists are disjoint, so the conflict is at the capture layer
+              // and is a hypothesis nobody has measured; a permanent refusal would settle that for
+              // the user. The two-step confirm makes the cost legible and leaves him the decision.
+              disabled: busy !== '' || zapBusy !== '',
+              onClick: () => {
+                if (zapBlocked && !zapConfirm) {
+                  setZapConfirm(true)
+                  return
+                }
+                const override = zapBlocked
+                setZapConfirm(false)
+                void runZapret('install', override ? { ignoreForeign: true } : undefined)
+              },
+              // A plain pending state, not a spinner and not a byte count. The route is one-shot,
+              // so `progress` describes what a finished answer downloaded rather than a transfer
+              // in flight; showing it here would quote the previous answer's numbers while the
+              // current one is still running. And a spinner that cannot fail would tell the user
+              // a download is progressing when the answer may already have come back refused.
+            }, zapBusy === 'install'
+              ? 'Скачивание…'
+              : zapBlocked && zapConfirm ? 'Установить всё равно' : 'Скачать zapret'),
+            h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('start') } },
+              zapBusy === 'start' ? 'Запуск…' : 'Запустить'),
+            h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('stop') } },
+              zapBusy === 'stop' ? 'Остановка…' : 'Остановить'),
+            h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('restart') } },
+              zapBusy === 'restart' ? 'Перезапуск…' : 'Перезапустить'),
+            h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('uninstall') } },
+              zapBusy === 'uninstall' ? 'Удаление…' : 'Удалить службу и файлы')),
+          // «Внимание», not an error, and not red: this is a decision the user is entitled to make
+          // rather than a failure of the plugin. The mechanism is stated as a hypothesis with the
+          // absence of measurement named, because the earlier wording asserted an unmeasured
+          // behaviour as fact — «two engines break each other's handshakes» — which is the same
+          // overclaim this release has been hunting in other people's code.
+          zapBlocked
+            ? h('div', { style: { color: C.warn, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+                'На машине уже работает чужая служба zapret. Списки хостов у неё и у нас разные, поэтому на уровне '
+                + 'политики два движка не действуют на одно и то же имя. Совпадает уровень перехвата: оба открывают '
+                + 'дескриптор WinDivert с фильтром по TCP 443 и видят каждый пакет на этом порту, а движок, который '
+                + 'решил пакет не трогать, всё равно возвращает его в стек — и целый ClientHello может оказаться в '
+                + 'сети рядом с нашим разделённым. Измерено это не было: выше предположение о поведении WinDivert с '
+                + 'двумя дескрипторами, а не установленный факт. Проверьте, что в конфигурации вашей службы zapret '
+                + 'нет rustvy, и только затем подтверждайте установку. '
+                + (zapConfirm
+                  ? 'Первое нажатие ничего не установило. Следующее — «Установить всё равно» — скачает файлы и '
+                    + 'поставит службу рядом с уже работающей чужой.'
+                  : 'Сейчас «Скачать zapret» ничего не устанавливает: первое нажатие показывает это предупреждение '
+                    + 'и просит подтверждение.'))
+            : null,
+          zapProgress === null
+            ? null
+            : h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+                `Скачано ${zapProgress}.`),
+          zapAnswer === undefined || zapAnswer.reason === undefined || zapAnswer.reason === null || zapAnswer.reason === ''
+            ? null
+            : h('div', { style: { color: zapAnswer.ok === false ? C.warn : C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
+                String(zapAnswer.reason)),
+          h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '8px' } },
+            'Фильтр, который собирает TCP-поток заново, нельзя обойти средствами сокета. Приёмы, которые '
+            + 'действительно работают, требуют управления пакетами: --dpi-desync=fake отправляет подставной пакет '
+            + 'в том же соединении до настоящего ClientHello, а --dpi-desync-split-seqovl перекрывает номера '
+            + 'последовательности TCP, чтобы фильтр и сервер расходились в том, что содержит поток. Номера '
+            + 'последовательности присваивает ядро, поэтому ни один сокетный API не может выразить ни то, ни другое. '
+            + 'Собственная фрагментация плагина относится к семейству multisplit, и в опубликованных замерах zapret '
+            + '(21 файл результатов, сведённый по конфигурациям) это семейство худшее: 31,1 % успеха у '
+            + 'multisplit+seqovl против 78,6 % у fake,fakedsplit. Поэтому здесь не обещается, что фрагментации '
+            + 'плагина достаточно, — фильтру со сборкой потока нужен пакетный уровень, и кнопка выше ставит его. '
+            + 'Windows один раз спросит права администратора — при установке, потому что регистрируется драйвер ядра. '
+            + 'После этого служба запускается при старте системы, и больше ничего не спрашивается. '
+            + 'Плагин ставит и обслуживает собственную копию: он не использует, не меняет и не предполагает zapret, '
+            + 'который у вас уже может быть установлен. '
+            + 'Состав: winws — MIT (bol-van, Flowseal), WinDivert — LGPLv3/GPLv2; обе части распространяются без '
+            + 'изменений и со своими уведомлениями об авторстве. '
+            + '«Удалить службу и файлы» убирает и службу, и скачанные файлы. '
+            + 'Это не VPN: покрывается только TCP 443 до rustvy.xyz, трафик не шифруется и ничего другого это не открывает.'),
           h(Row, { name: 'сборка' }, `${status?.build ?? '—'} (ревизия ${status?.revision ?? '—'})`),
           status?.error === undefined
             ? null

@@ -721,12 +721,21 @@ let DIAG_ANSWER = {
   },
   history: [{ ok: false, ms: 30005, error: 'ECONNRESET', token: 'token-must-not-render' }],
 }
+/**
+ * What `/zapret` answers with.
+ *
+ * Only `ok`, `action`, `state`, `reason` and `progress` are named in the contract, so the
+ * fixture invents nothing else: a field the page tolerates but the route does not send is
+ * exactly the case the «неизвестно» assertion has to cover.
+ */
+let ZAP_ANSWER = { ok: true, action: 'install', state: 'downloaded' }
 
 globalThis.fetch = async (url, init = {}) => {
   const path = String(url)
   const method = (init.method ?? 'GET').toUpperCase()
   requests.push({ path, method, body: init.body })
   if (path.includes('/models.yaml')) return { ok: true, status: 200, text: async () => YAML_TEXT }
+  if (path.endsWith('/zapret')) return json(ZAP_ANSWER)
   if (path.endsWith('/diagnose')) return json(DIAG_ANSWER)
   if (path.endsWith('/timeout')) {
     if (method === 'GET') return json({ ok: true, available: true, value: TIMEOUT_VALUE, routes: TIMEOUT_ROUTES })
@@ -3635,6 +3644,222 @@ STATE.config.tlsFragmentGlobal = false
   const countPost = requests.find(item => item.path === '/dsh-rustvy/config')
   check('editing the count posts tlsFragmentCount, the key the host reads',
     countPost !== undefined && countPost.body === '{"tlsFragmentCount":8}', String(countPost?.body))
+}
+
+/* ------------- «Обход на уровне пакетов»: states, actions, and the copy ------- */
+// The copy carries more weight here than anywhere else on the page: this control registers a
+// kernel driver, so the elevation prompt, the provenance and the limits are asserted rather
+// than trusted to having been written.
+{
+  const before = render()
+  // The panel now reads the status when it opens, so the row reflects the GET rather than
+  // waiting for a button. The mount-once effect means the answer captured here is the one the
+  // stub held at the run's first render: state `downloaded`.
+  check('the status row on open reflects the GET the panel makes, not a guess',
+    rowValue(before, 'zapret') === 'скачано, служба не установлена', String(rowValue(before, 'zapret')))
+  // Not asserted through `requests`: the status GET is mount-once, so it happens at the run's
+  // first render — long before this block — and `requests` has been reset by every test since.
+  // The row value above is the evidence the GET landed, because nothing else could have put the
+  // stub's answer there: this block has not posted yet.
+  check('the row on open is the route\'s answer and not a page-side default',
+    rowValue(before, 'zapret') === 'скачано, служба не установлена'
+    && rowValue(before, 'zapret') !== 'неизвестно', String(rowValue(before, 'zapret')))
+
+  const install = findButton(before, 'Скачать zapret')
+  check('the download button is there', install !== undefined, 'missing')
+  requests.length = 0
+  install.props.onClick()
+  await flush()
+  const installPost = requests.find(item => item.path === '/dsh-rustvy/zapret')
+  check('it posts the install action and nothing else',
+    installPost !== undefined && installPost.method === 'POST' && installPost.body === '{"action":"install"}',
+    String(installPost?.body))
+  check('and the row reports the state the route answered',
+    rowValue(render(), 'zapret') === 'скачано, служба не установлена', String(rowValue(render(), 'zapret')))
+
+  /**
+   * Drive one action and return what the row shows afterwards.
+   *
+   * @param label - the button's caption.
+   * @param state - the state the route should answer with.
+   * @param detail - the `detail` object, if the case needs one.
+   * @returns a promise of the rendered row value.
+   */
+  const driveState = async (label, state, detail) => {
+    ZAP_ANSWER = { ok: true, action: 'install', state, detail: detail ?? null, reason: null, progress: null }
+    findButton(render(), label).props.onClick()
+    await flush()
+    return rowValue(render(), 'zapret')
+  }
+  check('absent is its own sentence', (await driveState('Скачать zapret', 'absent')) === 'не скачано', 'collapsed')
+  check('stopped is its own sentence', (await driveState('Остановить', 'stopped')) === 'установлена, не запущена', 'collapsed')
+  check('running is its own sentence', (await driveState('Запустить', 'running')) === 'работает', 'collapsed')
+  // `installed` is never emitted: `sc query` answers STOPPED both for a service that was never
+  // started and for one the user stopped, so the word would claim a distinction the code cannot
+  // see. Asserting a sentence for it would assert a state that cannot occur — green by
+  // construction, the shape that has fooled this suite three times. What is asserted instead is
+  // that the page does not invent one.
+  check('installed gets no sentence of its own, because the route never emits it',
+    (await driveState('Запустить', 'installed')) === 'неизвестно', 'the page invented a state the route cannot emit')
+  check('unknown — a real state, answered when sc cannot be read — renders as unknown',
+    (await driveState('Перезапустить', 'unknown')) === 'неизвестно', 'collapsed')
+  check('a name this page has never heard of renders the same word, by fallback rather than by mapping',
+    (await driveState('Перезапустить', 'half-broken')) === 'неизвестно', 'an unknown state was mapped onto a known one')
+  check('and «неизвестно» is a different sentence from «не скачано»',
+    (await driveState('Скачать zapret', 'absent')) !== 'неизвестно', 'the two states were collapsed')
+
+  // `detail`, and the nullability that matters most in it: `covered: false` means the hostlist
+  // was read and `rustvy.xyz` is not in it, while `covered: null` means there is no hostlist and
+  // nobody checked. Rendering the second as the first would report an uncovered host that was
+  // never looked at, which sends the user to edit a file that does not exist.
+  await driveState('Перезапустить', 'running', {
+    version: '1.10.4', downloaded: true, missing: [], notices: ['LICENSE.txt'],
+    service: 'running', covered: true, foreignRunning: false, foreignName: null, hostlist: 'C:\\zapret\\hostlist.txt',
+  })
+  const complete = String(rowValue(render(), 'что на диске'))
+  check('the pinned version is shown when the download is complete', complete.includes('версия 1.10.4'), complete)
+  check('the notices are shown because the file is actually on disk', complete.includes('уведомления на диске: LICENSE.txt'), complete)
+  check('and a covered host is said to be covered', complete.includes('rustvy.xyz в списке хостов'), complete)
+
+  await driveState('Перезапустить', 'downloaded', {
+    version: null, downloaded: false, missing: ['winws.exe', 'cygwin1.dll'], notices: [],
+    service: 'absent', covered: null, foreignRunning: false, foreignName: null, hostlist: null,
+  })
+  const partial = String(rowValue(render(), 'что на диске'))
+  check('what is missing is named', partial.includes('не хватает: winws.exe, cygwin1.dll'), partial)
+  check('a null version is omitted rather than shown as a default', !partial.includes('версия'), partial)
+  check('empty notices are omitted, because no notice file is on disk', !partial.includes('уведомления'), partial)
+  check('and covered: null is omitted, not reported as uncovered',
+    !partial.includes('НЕ в списке') && !partial.includes('в списке хостов'), partial)
+
+  await driveState('Перезапустить', 'running', {
+    version: null, downloaded: true, missing: [], notices: [], service: 'running',
+    covered: false, foreignRunning: false, foreignName: null, hostlist: 'C:\\zapret\\hostlist.txt',
+  })
+  check('covered: false IS reported, because the hostlist was read and the host is not in it',
+    String(rowValue(render(), 'что на диске')).includes('rustvy.xyz НЕ в списке хостов'),
+    String(rowValue(render(), 'что на диске')))
+
+  // `progress` is `null` or `{ received, total }` and arrives only on an answer that downloaded
+  // something. Both numbers have to be finite: a real `received` beside a null total would
+  // render as a fraction of nothing.
+  ZAP_ANSWER = { ok: true, action: 'install', state: 'downloaded', detail: null, reason: null, progress: { received: 1518649, total: 1518649 } }
+  findButton(render(), 'Скачать zapret').props.onClick()
+  await flush()
+  check('a completed download reports the bytes it wrote',
+    allText(render()).includes('Скачано 1518649 из 1518649 байт'), 'missing')
+  ZAP_ANSWER = { ok: true, action: 'install', state: 'downloaded', detail: null, reason: null, progress: { received: 4096, total: null } }
+  findButton(render(), 'Скачать zapret').props.onClick()
+  await flush()
+  check('and a half-known progress is treated as absent rather than as a fraction of nothing',
+    !allText(render()).includes('Скачано'), 'a partial progress was rendered')
+
+  // The four control actions, each its own POST body: a mis-wired button that posts `start`
+  // twice would otherwise look identical on the page.
+  for (const [label, action] of [['Запустить', 'start'], ['Остановить', 'stop'], ['Перезапустить', 'restart'], ['Удалить службу и файлы', 'uninstall']]) {
+    ZAP_ANSWER = { ok: true, action, state: 'running' }
+    requests.length = 0
+    findButton(render(), label).props.onClick()
+    await flush()
+    const sent = requests.find(item => item.path === '/dsh-rustvy/zapret')
+    check(`«${label}» posts its own action`, sent !== undefined && sent.body === `{"action":"${action}"}`, String(sent?.body))
+  }
+
+  // The conflict state, under a changed ruling: a warning with an explicit override, not a
+  // refusal. The hostlists are disjoint, so the overlap is at the capture layer — both open a
+  // WinDivert handle matching TCP 443 — and whether an engine that declines to touch a packet
+  // still puts the intact ClientHello back on the wire is a hypothesis nobody has measured. The
+  // property worth pinning is therefore the *inverse* of the old one: a single press must not
+  // install, and the confirmation text must be the route's own reason rather than the page's.
+  ZAP_ANSWER = {
+    ok: false,
+    action: 'install',
+    state: 'foreign-running',
+    reason: 'работает служба ZapretUser; списки хостов разные, перехват совпадает. Измерено это не было. '
+      + 'Проверьте, что в вашей конфигурации нет rustvy, и повторите с подтверждением.',
+  }
+  requests.length = 0
+  findButton(render(), 'Скачать zapret').props.onClick()
+  await flush()
+  const refused = requests.filter(item => item.path === '/dsh-rustvy/zapret' && item.method === 'POST')
+  check('a first press that does not yet know the state posts a plain install, with no override in it',
+    refused.length === 1 && refused[0].body === '{"action":"install"}', JSON.stringify(refused.map(item => item.body)))
+  const conflicted = render()
+  check('a foreign service already running is named as such',
+    rowValue(conflicted, 'zapret') === 'работает чужая служба zapret', String(rowValue(conflicted, 'zapret')))
+  check('the install button is NOT permanently disabled, because the decision is the user\'s',
+    findButton(conflicted, 'Скачать zapret').props.disabled === false,
+    String(findButton(conflicted, 'Скачать zapret').props.disabled))
+  const conflictText = allText(conflicted)
+  check('the refusal surfaces the route\'s reason verbatim, not a paraphrase the page invented',
+    conflictText.includes('работает служба ZapretUser') && conflictText.includes('нет rustvy')
+    && conflictText.includes('с подтверждением'), 'missing')
+  // Asserted on the page's own sentence, not on the bare phrase: the route's `reason` also
+  // contains «Измерено это не было», so a check for that phrase alone would stay green with the
+  // page's own admission deleted — the assertion satisfied by the fixture instead of the product.
+  check('the page states the overlap as an unmeasured hypothesis rather than as fact',
+    conflictText.includes('Измерено это не было: выше предположение о поведении WinDivert')
+    && conflictText.includes('а не установленный факт'), 'missing')
+  check('the superseded claim that two engines break each other\'s handshakes is gone',
+    !conflictText.includes('сломать рукопожатия') && !conflictText.includes('ломают рукопожатия'), 'the overclaim came back')
+  check('and it no longer reads as a refusal', !conflictText.includes('установка нашей отклоняется'), 'still worded as a refusal')
+  check('the warning is coloured as attention rather than as an error',
+    collect(conflicted, 'div').some(item => allText(item).includes('чужая служба zapret')
+      && String(item.props?.style?.color ?? '').includes('state-warn')), 'no attention-coloured explanation')
+
+  // Now the page knows the state, so the next press is the confirm step and must post nothing.
+  // This is the property that stands between a user and a second packet engine installed by
+  // accident, and it is the inverse of the assertion this block used to make.
+  requests.length = 0
+  findButton(render(), 'Скачать zapret').props.onClick()
+  await flush()
+  check('once the state is known, a single press installs nothing at all',
+    requests.filter(item => item.path === '/dsh-rustvy/zapret' && item.method === 'POST').length === 0,
+    JSON.stringify(requests.map(item => `${item.method} ${item.path} ${item.body ?? ''}`)))
+  const confirmStep = render()
+  check('and the button turns into the override rather than staying a download',
+    findButton(confirmStep, 'Установить всё равно') !== undefined, 'the confirm step did not appear')
+  check('the confirm step says plainly that the first press installed nothing',
+    allText(confirmStep).includes('Первое нажатие ничего не установило'), 'missing')
+
+  // The second press posts the override, and the body is asserted exactly: a confirm step that
+  // posted `ignoreForeign` on the first press would be indistinguishable from a working one.
+  requests.length = 0
+  findButton(render(), 'Установить всё равно').props.onClick()
+  await flush()
+  const override = requests.find(item => item.path === '/dsh-rustvy/zapret' && item.method === 'POST')
+  check('the confirmed press posts the override, and only that press does',
+    override !== undefined && override.body === '{"action":"install","ignoreForeign":true}', String(override?.body))
+
+  // Driven through «Запустить» rather than the install button: the state is still
+  // `foreign-running` here, so a press on «Скачать zapret» would be consumed by the confirm step
+  // and post nothing, and the reason would never arrive. The ungated button isolates what this
+  // check is about — that a `reason` from the route reaches the user verbatim.
+  ZAP_ANSWER = { ok: false, action: 'start', state: 'absent', reason: 'нет прав администратора' }
+  findButton(render(), 'Запустить').props.onClick()
+  await flush()
+  check('a reason from the route is shown to the user', allText(render()).includes('нет прав администратора'), 'missing')
+
+  const copy = allText(render())
+  check('the elevation prompt is stated exactly: once, at install, because a kernel driver is registered',
+    copy.includes('один раз спросит права администратора') && copy.includes('регистрируется драйвер ядра')
+    && copy.includes('больше ничего не спрашивается'), 'missing')
+  check('the licence and provenance are on the page rather than in a file nobody opens',
+    copy.includes('winws — MIT (bol-van, Flowseal)') && copy.includes('WinDivert — LGPLv3/GPLv2')
+    && copy.includes('без изменений') && copy.includes('уведомлениями об авторстве'), 'missing')
+  check('the copy says why a socket cannot do this, naming both packet-level techniques',
+    copy.includes('--dpi-desync=fake') && copy.includes('--dpi-desync-split-seqovl')
+    && copy.includes('Номера последовательности присваивает ядро'), 'missing')
+  check('and it does not claim the plugin\'s own fragmentation was enough',
+    copy.includes('семейству multisplit') && copy.includes('31,1 %') && copy.includes('78,6 %')
+    && copy.includes('не обещается, что фрагментации плагина достаточно'), 'missing')
+  check('uninstall says it removes the service and the files',
+    copy.includes('убирает и службу, и скачанные файлы'), 'missing')
+  check('the limit is stated: TCP 443 to rustvy.xyz only, and it is not a VPN',
+    copy.includes('Это не VPN') && copy.includes('TCP 443 до rustvy.xyz'), 'missing')
+  check('and the plugin keeps to its own copy rather than the user\'s zapret',
+    copy.includes('не использует, не меняет и не предполагает zapret'), 'missing')
+  ZAP_ANSWER = { ok: true, action: 'install', state: 'downloaded' }
 }
 
 const failed = results.filter(ok => !ok).length

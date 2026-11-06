@@ -1279,6 +1279,68 @@ The "transport now" row reports the live transport rather than the setting: `pla
 `auto`, before the first transport failure, it honestly says "on, but currently plain" — that is
 not a fault but the normal state in which fragmentation has not yet been needed.
 
+### "Packet-level bypass": zapret
+
+The "Download zapret" button in the "Against TSPU blocking" section installs packet-level bypass. It
+is the only control on the plugin's page that changes the machine rather than a setting: it registers
+a kernel driver and shows one administrator prompt.
+
+**Why fragmentation alone is not enough.** The techniques that actually defeat a filter which
+*reassembles the TCP stream* need packet control no socket API offers. `--dpi-desync=fake` injects a
+decoy packet onto the same connection before the real ClientHello — through an ordinary socket that
+packet would simply be part of the real stream and would corrupt it. `--dpi-desync-split-seqovl`
+overlaps TCP sequence numbers so the filter and the server reconstruct different streams; sequence
+numbers are assigned by the kernel, so nothing expressible through a socket can do this at all.
+
+Our own fragmentation belongs to the `multisplit` family, and in zapret's published results (21 files,
+aggregated per configuration) that family is the **weakest**: 31.1 % success for the default
+`multisplit`+`seqovl` configuration against 78.6 % for `fake,fakedsplit`. These numbers are not
+softened on purpose — they are the reason the button exists. A reader who concludes fragmentation was
+"nearly good enough" will not understand why a driver is being installed.
+
+**Exactly what pressing it does.** The plugin downloads the pinned release **1.10.4** from
+`github.com/Flowseal/zapret-discord-youtube`, verifies the byte length and sha256 against pinned
+constants, extracts **six files by allowlist** — `winws.exe`, `WinDivert.dll`, `WinDivert64.sys`,
+`cygwin1.dll` and two decoy ClientHello payloads — into the plugin's own state directory, writes a
+hostlist containing the provider hostname from the settings, and registers the service
+`dsh-rustvy-zapret`. On disk that is roughly **3.2 MB**. Nothing outside the allowlist is extracted.
+
+**One prompt, and why it is needed at all.** `winws.exe` carries a manifest requiring administrator,
+so registering the driver and the service needs one elevated call — no kernel driver can avoid this.
+After that the service auto-starts at boot, and starting, stopping and querying it need no elevation,
+because the install step grants your SID control rights in the service's security descriptor. If the
+dialog is not expected it is easy to read as the plugin misbehaving, which is why it is described here
+rather than discovered on screen.
+
+**Provenance and licences.** `winws` is MIT (bol-van, Flowseal). WinDivert is LGPLv3-or-GPLv2 and
+GPLv2 is the elected option; the reasoning is in `NOTICE-zapret.txt`. The plugin does not link
+WinDivert into itself — it runs `winws.exe` as a separate process — so this is aggregation of separate
+programs rather than a derivative work. The notices are supplied by the plugin and written beside the
+binaries, because the upstream release archive contains no licence file at all: all 63 of its entries
+were enumerated.
+
+**If zapret is already installed and running.** This is a warning, not an asserted fact, and not a
+refusal: the plugin warns and requires an explicit confirmation. The two engines' hostlists are
+disjoint, so at the policy level neither acts on the other's hostnames. The capture layer is what
+overlaps: both see every TCP 443 packet, and an engine that decides not to touch a packet still returns
+it to the stack — which may put an intact ClientHello on the wire beside our split one. **This was not
+measured**: the above is a hypothesis about WinDivert's behaviour with two handles, not an established
+fact. Before confirming, check that rustvy is not already in your zapret configuration's lists.
+
+**What it does not do.** It covers TCP 443 to the provider hostname from the settings, and nothing
+else. It is not a VPN, it does not encrypt traffic, and it makes nothing else reachable.
+
+**How to remove it.** The uninstall action removes both the service and the files. Deleting a service
+requires elevation, so this one prompts again — deliberately, because what is being removed is a
+kernel driver.
+
+**The honest gap.** The install path has **never been executed on any machine**: the test suite does
+not run it, because doing so would download an archive and show an administrator prompt to everyone
+running the tests. What *is* verified is the download and extraction against the real published
+artifact (size, sha256, the six files at their exact published sizes, nothing outside the allowlist)
+and every route and state. The elevated half is **reasoned from how Windows works, not run**, and a
+reader is entitled to know that.
+
 ## Routes
 
 One prefix registration on the harness's own web server. Plugin routes are not
