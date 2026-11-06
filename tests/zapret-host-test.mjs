@@ -13,6 +13,14 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { exit } from 'node:process'
+import {
+  ZAPRET_DEFAULT_STRATEGY,
+  ZAPRET_STRATEGIES,
+  zapretArgs,
+  zapretInstallerScript,
+  zapretPaths,
+  zapretStrategy,
+} from '../lib/zapret.js'
 
 let passed = 0
 let failed = 0
@@ -90,7 +98,44 @@ function call(method, path, body) {
   })
 }
 
-console.log('=== GET /dsh-rustvy/zapret ===')
+console.log('\n=== скрипт установщика (чистая функция) ===')
+const paths = zapretPaths(state)
+const script = zapretInstallerScript({ paths, args: zapretArgs(paths, 'rustvy.xyz', 'fake-badseq'), userSid: 'S-1-5-21-1-2-3-1001' })
+const lines = script.split('\r\n')
+check('sc create есть', lines.some(l => l.startsWith(`sc create ${'dsh-rustvy-zapret'}`)), '')
+// Без этой строки смена стратегии после первой установки недостижима: `sc create` на существующее
+// имя отвечает 1073, и значение настройки сохранялось бы, не будучи применимым ни к чему.
+check('при существующей службе binPath перезаписывается через sc config',
+  lines.some(l => l.startsWith('if errorlevel 1 sc config dsh-rustvy-zapret binPath= ')), '')
+const stopAt = lines.findIndex(l => l.startsWith('sc stop '))
+const startAt = lines.findIndex(l => l.startsWith('sc start '))
+check('stop идёт до start, иначе новый binPath не подхватится', stopAt > -1 && startAt > stopAt, `stop:${stopAt} start:${startAt}`)
+check('sdset даёт право смены конфигурации (CC)', script.includes('CCLCSWRPWPDTLOCRRC'), '')
+check('и не даёт права удаления службы (DC)', !script.includes('DC;;;'), '')
+const create = lines.find(l => l.startsWith('sc create '))
+check('в binPath нет удвоенных обратных слэшей', create !== undefined && !create.includes('\\\\'), '')
+check('аргументы выбранной стратегии доходят до binPath',
+  create !== undefined && create.includes('--dpi-desync-fooling=badseq,datanoack'), '')
+check('автозапуск, чтобы после установки больше не спрашивало', create !== undefined && create.includes('start= auto'), '')
+
+console.log('\n=== пресеты стратегий ===')
+check('дефолт — split', ZAPRET_DEFAULT_STRATEGY === 'split', String(ZAPRET_DEFAULT_STRATEGY))
+check('пресетов три', ZAPRET_STRATEGIES.length === 3, ZAPRET_STRATEGIES.map(s => s.id).join(','))
+check('безопасным помечен только split',
+  ZAPRET_STRATEGIES.filter(s => s.safe).map(s => s.id).join(',') === 'split',
+  ZAPRET_STRATEGIES.map(s => `${s.id}:${s.safe}`).join(' '))
+// Различие между split и fake — содержательное, а не косметическое: split не добавляет в
+// соединение посторонних байт, поэтому сервер не может ответить алертом. Если у всех пресетов
+// аргументы совпадут, «безопасный по построению» станет меткой без содержания.
+const argSets = ZAPRET_STRATEGIES.map(s => zapretArgs(paths, 'rustvy.xyz', s.id).join(' '))
+check('аргументы всех трёх пресетов различаются', new Set(argSets).size === ZAPRET_STRATEGIES.length, '')
+check('split не содержит подставных ClientHello',
+  !zapretArgs(paths, 'rustvy.xyz', 'split').some(a => a.includes('fake-tls')), '')
+check('и не содержит fooling', !zapretArgs(paths, 'rustvy.xyz', 'split').some(a => a.includes('fooling')), '')
+check('неизвестный id откатывается на безопасный', zapretStrategy('мусор').id === 'split', zapretStrategy('мусор').id)
+check('а не бросает', typeof zapretStrategy(null).id === 'string', '')
+
+console.log('\n=== GET /dsh-rustvy/zapret ===')
 const read = await call('GET', '/dsh-rustvy/zapret')
 check('отвечает 200', read.status === 200, String(read.status))
 check('и ok:true', read.json?.ok === true, JSON.stringify(read.json?.ok))
@@ -174,6 +219,30 @@ writeFileSync(hostlist, '# только комментарий\n\n', 'utf8')
 const commentsOnly = await call('GET', '/dsh-rustvy/zapret')
 check('комментарии и пустые строки не считаются покрытием', commentsOnly.json?.detail?.covered === false,
   JSON.stringify(commentsOnly.json?.detail?.covered))
+
+console.log('\n=== стратегия: безопасный дефолт и правило трёх мест ===')
+const stratRead = await call('GET', '/dsh-rustvy/zapret')
+check('по умолчанию стратегия — безопасная split', stratRead.json?.detail?.strategy === 'split',
+  String(stratRead.json?.detail?.strategy))
+const offered = stratRead.json?.detail?.strategies
+check('предложены три пресета', Array.isArray(offered) && offered.length === 3, JSON.stringify(offered))
+// Безопасность — свойство по построению, и оно должно быть видно на странице: ровно один пресет
+// не может сломать рукопожатие, потому что меняет только нарезку сегментов.
+check('безопасным помечен ровно один', Array.isArray(offered) && offered.filter(s => s.safe === true).length === 1,
+  JSON.stringify(offered?.filter(s => s.safe)))
+check('и это split', offered?.find(s => s.safe)?.id === 'split', String(offered?.find(s => s.safe)?.id))
+// Правило трёх мест: DEFAULT_CONFIG, чтение с диска и валидация записи. Пропущенная строка в
+// любом из них даёт настройку, которая «сохраняется» и ничего не меняет, — ровно тот дефект,
+// что был у двух полей фрагментации в 1.6.0.
+await call('POST', '/dsh-rustvy/config', { zapretStrategy: 'fake-badseq' })
+const afterWrite = await call('GET', '/dsh-rustvy/zapret')
+check('выбранная стратегия доходит до состояния', afterWrite.json?.detail?.strategy === 'fake-badseq',
+  String(afterWrite.json?.detail?.strategy))
+await call('POST', '/dsh-rustvy/config', { zapretStrategy: 'не-стратегия' })
+const afterBad = await call('GET', '/dsh-rustvy/zapret')
+check('неизвестная стратегия отклонена, прежняя сохранена', afterBad.json?.detail?.strategy === 'fake-badseq',
+  String(afterBad.json?.detail?.strategy))
+await call('POST', '/dsh-rustvy/config', { zapretStrategy: 'split' })
 
 console.log('\n=== install: предупреждение при чужом движке, не запрет ===')
 const foreignRunning = read.json?.detail?.foreignRunning === true

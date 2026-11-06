@@ -151,6 +151,96 @@ const CLAIMS = [
     ru: ['скачивание и распаковка на настоящем опубликованном артефакте', 'точными опубликованными размерами'],
     en: ['download and extraction against the real published artifact', 'exact published sizes'],
   },
+  {
+    // The distinction 1.6.2 was missing, and the framing is the point: "weaker/stronger" is what
+    // led to hardcoding the highest-scoring strategy, while "can it break the handshake" is what a
+    // user needs in order to choose.
+    label: 'split and fake are distinguished by whether they can break the handshake, not by strength',
+    ru: ['Семейства `split` и `fake` отличаются не силой, а тем, способны ли они сломать рукопожатие',
+      'байт в байт тот же ClientHello', 'добавляют в соединение чужие байты'],
+    en: ['differ not in strength but in whether they can break the handshake at',
+      'byte-identical ClientHello', 'puts foreign bytes onto the connection'],
+  },
+  {
+    label: 'and a success percentage is said not to show that difference',
+    ru: ['Процент успеха в чужих замерах этого различия не показывает',
+      'а не в пользу какой-либо конкретной стратегии'],
+    en: ["success percentage measured against somebody else's providers does not show that difference",
+      'not for any particular strategy'],
+  },
+  {
+    // The measured regression, with the alert named: a user who hits it has to be able to find the
+    // exact string their browser showed.
+    label: 'the 1.6.2 regression is recorded with the alert the user actually saw',
+    ru: ['SSL_ERROR_INTERNAL_ERROR_ALERT', 'internal_error', '--dpi-desync-fooling=ts', 'одиночный VPS'],
+    en: ['SSL_ERROR_INTERNAL_ERROR_ALERT', 'internal_error', '--dpi-desync-fooling=ts', 'single VPS'],
+  },
+  {
+    label: 'the mechanism is stated as measured, including the SNI the server saw',
+    ru: ['www.google.com', 'не нашёл такого vhost', 'Механизм измерен, а не предположен'],
+    en: ['www.google.com', 'found no such vhost', 'The mechanism is measured rather than supposed'],
+  },
+  {
+    label: 'and the corroborating measurement, so the alert is not a one-off',
+    ru: ['на ClientHello вовсе без SNI'],
+    en: ['a ClientHello with no SNI at all'],
+  },
+  {
+    label: "the user's own working zapret is said to prove nothing about this server",
+    ru: ['Собственный zapret пользователя', 'про rustvy это не говорит ничего', 'сервер другой'],
+    en: ["The user's own zapret", 'says nothing about rustvy', 'the server is different'],
+  },
+  {
+    // Naming the actual error: not the parameters chosen, but having chosen them for the user.
+    label: 'the error is named as choosing for the user, with the twenty-two presets as the reason',
+    ru: ['Ошибка была не в выборе параметров, а в том, что выбор вообще был сделан за пользователя',
+      'двадцать два пресета'],
+    en: ['The error was not the choice of parameters but that a choice was made for the user at all',
+      'twenty-two presets'],
+  },
+  {
+    label: 'and the three rules the fix rests on, including that a rollback is the protection working',
+    ru: ['безопасным по умолчанию `split`', 'проверяет сама себя и откатывается',
+      'как сработавшая защита, а не как ошибка'],
+    en: ['a safe default of `split`', 'verifies itself and rolls back',
+      'as the protection working, not as a failure'],
+  },
+  {
+    // 1.6.2 is published and breaks access for a user on a clean machine, so the recovery has to be
+    // in the README rather than only in the notes for a version they have not got yet. Asserted on
+    // the named control and on the promise that the plugin's own setting survives removal.
+    label: 'a user stranded on 1.6.2 is told how to get access back right now',
+    ru: ['Если вы на 1.6.2 и rustvy.xyz перестал открываться', '«Удалить службу и файлы»',
+      'настройка фрагментации в плагине при этом не трогается'],
+    en: ['If you are on 1.6.2 and rustvy.xyz stopped opening', 'Remove the service and files',
+      "plugin's own fragmentation setting is untouched"],
+  },
+  {
+    // The three preset ids, named, with the safe one marked as the default. A reader choosing
+    // between them needs the ids to exist in the document at all.
+    label: 'all three presets are named, with split as the safe default',
+    ru: ['**`split`**', 'split2 --split-pos=1', '**`fake-ts`**', '**`fake-badseq`**',
+      'безопасен по устройству и стоит по умолчанию'],
+    en: ['**`split`**', 'split2 --split-pos=1', '**`fake-ts`**', '**`fake-badseq`**',
+      'safe by construction, and the default'],
+  },
+  {
+    label: 'fake-badseq is distinguished from fake-ts by what it does not depend on',
+    ru: ['неверным номером последовательности, а не меткой времени', 'учитывает ли сервер timestamps'],
+    en: ['wrong sequence number rather than by timestamp', 'honouring timestamps'],
+  },
+  {
+    // The discipline that 1.6.2 broke: no preset may be presented as known to work against this
+    // filter, because there has never been a blocking window to measure in.
+    label: 'no preset is claimed to defeat this filter, and the absence of measurement is stated',
+    ru: ['Ни один из них не заявлен как обходящий этот фильтр', 'окна блокировки для замера не было'],
+    en: ['None of them is claimed to defeat this filter', 'never been a blocking window to measure in'],
+  },
+  {
+    label: 'the picker is documented as built from the host, and self-verification with rollback',
+    ru: ['страница строит их список из ответа хоста', 'проверяет сама себя', 'сработавшая защита'],
+    en: ['builds its list from the host\'s answer', 'verifies itself', 'protection working'],
+  },
 ]
 
 for (const claim of CLAIMS) {

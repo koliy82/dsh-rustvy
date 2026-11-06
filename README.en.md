@@ -1298,6 +1298,39 @@ aggregated per configuration) that family is the **weakest**: 31.1 % success for
 softened on purpose — they are the reason the button exists. A reader who concludes fragmentation was
 "nearly good enough" will not understand why a driver is being installed.
 
+Those numbers have an other side to them, and in 1.6.2 it cost a real user access to the site. **The
+`split` and `fake` families differ not in strength but in whether they can break the handshake at
+all.** A `split`-family strategy changes only how the stream is segmented: the server reassembles a
+byte-identical ClientHello, so it cannot emit an alert — at worst the evasion simply does not work. A
+`fake`-family strategy puts foreign bytes onto the connection and relies on the server discarding
+them; if the server does not discard them, it processes a decoy ClientHello as the real one and the
+handshake breaks.
+
+A success percentage measured against somebody else's providers does not show that difference: it
+says how often a strategy defeats a filter, not what it does to a server that behaves differently
+from the one in somebody else's test. So the figures above are an argument for packet-level bypass in
+general, and not for any particular strategy.
+
+There are three presets, and the page builds its list from the host's answer rather than from a list
+of its own — two lists drift, and a drifted picker offers a strategy the host would silently fall back
+from:
+
+- **`split`** (`split2 --split-pos=1`) — safe by construction, and the default. It changes only how the
+  bytes are segmented, the server reassembles a byte-identical ClientHello, so it cannot answer with a
+  TLS alert; the worst case is that the filter is not defeated and access stays exactly as broken as it
+  was.
+- **`fake-ts`** (`fake,fakedsplit` with `fooling ts`) — the one 1.6.2 hardcoded. It fools the filter
+  with a forged TCP timestamp option and relies on the server treating the decoy segments as stale.
+  rustvy's server did not.
+- **`fake-badseq`** (`fooling badseq,datanoack`) — the same decoy packets, but fooling by wrong
+  sequence number rather than by timestamp, so it does not depend on the server honouring timestamps.
+
+None of them is claimed to defeat this filter: there has never been a blocking window to measure in,
+and there is now a measured case of a preset breaking a connection that worked. What is known is which
+presets are safe by construction and which can break access. The install then verifies itself: if the
+handshake no longer completes, the service is stopped, and the rollback is reported as the protection
+working.
+
 **Exactly what pressing it does.** The plugin downloads the pinned release **1.10.4** from
 `github.com/Flowseal/zapret-discord-youtube`, verifies the byte length and sha256 against pinned
 constants, extracts **six files by allowlist** — `winws.exe`, `WinDivert.dll`, `WinDivert64.sys`,
@@ -1340,6 +1373,29 @@ running the tests. What *is* verified is the download and extraction against the
 artifact (size, sha256, the six files at their exact published sizes, nothing outside the allowlist)
 and every route and state. The elevated half is **reasoned from how Windows works, not run**, and a
 reader is entitled to know that.
+
+That caveat has now arrived. Release 1.6.2 hardcoded a single strategy — `fake,fakedsplit` with
+`--dpi-desync-fooling=ts` — chosen for the best aggregate score in somebody else's measurements
+against somebody else's providers. On a clean machine, after the user pressed "Download zapret",
+rustvy.xyz stopped opening in Firefox with `SSL_ERROR_INTERNAL_ERROR_ALERT`: the server sent a TLS
+`internal_error` alert. The mechanism is measured rather than supposed: `fooling ts` forges the TCP
+timestamp option on the assumption that the server will treat the decoy segments as stale and drop
+them, but rustvy is a single VPS rather than a CDN and does not honour timestamps, so the server
+processed one of the six decoy ClientHellos as the real handshake, saw SNI `www.google.com`, found no
+such vhost and answered with the alert. The same server was independently measured emitting exactly
+that alert in another case — a ClientHello with no SNI at all. The user's own zapret runs the same
+parameters successfully for Discord and Telegram, and that says nothing about rustvy: the server is
+different.
+
+**If you are on 1.6.2 and rustvy.xyz stopped opening** — this is it. Press "Remove the service and
+files" in the "Packet-level bypass" section, or stop the `dsh-rustvy-zapret` service, and access comes
+back: the packet level is removed entirely, and the plugin's own fragmentation setting is untouched.
+
+The error was not the choice of parameters but that a choice was made for the user at all: zapret
+ships twenty-two presets precisely because the working strategy depends on both the ISP and the
+server. Three rules follow, and they are what the fix is built on: the strategy becomes a choice with
+a safe default of `split`; the install verifies itself and rolls back if the handshake no longer
+completes; and a rollback is shown to the user as the protection working, not as a failure.
 
 ## Routes
 

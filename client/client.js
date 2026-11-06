@@ -4004,6 +4004,66 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
         return parts.length === 0 ? null : parts.join(' · ')
       }
       const zapDetail = zapDetailLine(zapAnswer?.detail)
+      /**
+       * The strategy picker, built from what the host sent rather than from a list kept here.
+       *
+       * Two lists drift, and a drifted picker offers a strategy the host would silently fall back
+       * from — the same class of defect as a settings field that saves and changes nothing. So the
+       * *set* of options and each one's `safe` flag come from `detail.strategies`, and this file
+       * contributes only the Russian sentence that explains a flag. A preset the host adds tomorrow
+       * appears in the picker with its own safety marking and needs no change here.
+       *
+       * Absent is absent: with no `strategies` in the answer there is no picker at all, rather than
+       * a picker of one hardcoded default that pretends to be a choice.
+       */
+      const zapStrategies = Array.isArray(zapAnswer?.detail?.strategies)
+        ? zapAnswer.detail.strategies.filter(item => item !== null && typeof item === 'object' && typeof item.id === 'string')
+        : null
+      // The setting, not the installed strategy: the picker edits what the next install will use,
+      // and `detail.strategy` is reported separately as what is in force.
+      const zapStrategyValue = typeof config.zapretStrategy === 'string' && config.zapretStrategy !== ''
+        ? config.zapretStrategy
+        : 'split'
+      const zapStrategyEntry = zapStrategies === null ? undefined : zapStrategies.find(item => item.id === zapStrategyValue)
+      // `null` and not `false` when the host has not said: an unknown preset must not be reported
+      // as unsafe, and a known-unsafe one must not be reported as safe.
+      const zapStrategySafe = zapStrategyEntry === undefined ? null : zapStrategyEntry.safe === true
+      /**
+       * What the install verification said.
+       *
+       * `null` means the probe never ran because installation failed earlier, which is a different
+       * fact from `false` — the probe ran and the handshake broke. Rendering the first as the
+       * second would tell a user their access is broken when nothing was ever installed.
+       */
+      const zapVerified = zapAnswer?.verified === true ? true : zapAnswer?.verified === false ? false : null
+      const zapRolledBack = zapAnswer?.rolledBack === true
+      /**
+       * Display names for the presets the host offers.
+       *
+       * The set and each entry's `safe` flag come from `detail.strategies`; this map contributes
+       * only wording. An id the page has not heard of is shown as itself rather than dropped, so a
+       * preset the host adds still appears — with its safety marking, which is the part that must
+       * not come from here. The id stays in the label because the host's own `reason` quotes it
+       * («стратегия «fake-ts» сломала рукопожатие»), and a picker showing only a Russian name would
+       * leave the user unable to match the two.
+       */
+      const ZAPRET_STRATEGY_NAMES = {
+        split: 'Разрез',
+        'fake-ts': 'Обманка + метка времени',
+        'fake-badseq': 'Обманка + неверный sequence',
+      }
+      /**
+       * What the status row says, with the precedence the ruling requires.
+       *
+       * `verified === false` outranks `state`, always. The dangerous combination is a service that
+       * is `running` while the handshake is broken and the rollback did not take — a row reading
+       * «работает» there would report health over a site the user cannot open. A successful rollback
+       * leaves `state: 'stopped'`, which is true but is not the sentence the user needs, so the
+       * rollback leads instead.
+       */
+      const zapRowText = zapVerified === false
+        ? zapRolledBack ? 'откат: доступ восстановлен' : 'доступ сломан стратегией'
+        : zapStateText
 
       /**
        * Read what zapret is doing, once, when the panel opens.
@@ -4922,13 +4982,56 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
           // here rather than in a file nobody opens, because this is the feature a user enables
           // on trust.
           h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', margin: '12px 0 6px' } }, 'Обход на уровне пакетов'),
-          h(Row, { name: 'zapret' }, zapStateText),
+          h(Row, { name: 'zapret' }, zapRowText),
           // The detail line is a row of its own and is omitted entirely when `detail` carries
           // nothing, rather than rendered empty: an empty row reads as a measurement that came
           // back blank.
           zapDetail === null
             ? null
             : h(Row, { name: 'что на диске' }, zapDetail),
+          // The strategy picker, in its own row above the buttons: what is chosen decides whether
+          // pressing «Скачать zapret» can break access, so the choice and its risk have to be
+          // legible before the button is pressed rather than explained afterwards.
+          zapStrategies === null || zapStrategies.length === 0
+            ? null
+            : h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' } },
+                h('span', { style: { fontSize: '12.5px', color: C.labelSecondary } }, 'Стратегия'),
+                h(Select, {
+                  value: zapStrategyValue,
+                  options: zapStrategies.map(item => [item.id, `${ZAPRET_STRATEGY_NAMES[item.id] ?? item.id} (${item.id})${item.safe === true ? ' — безопасна по устройству' : ' — может сломать рабочее соединение'}`]),
+                  onChange: value => { void post('/config', { zapretStrategy: value }, 'save') },
+                })),
+          // Said next to the selector rather than in the install outcome, because the misleading
+          // moment is the one where the dropdown has just been changed: the value saves, and a
+          // user who stops reading there believes the running service changed. It did not — the
+          // strategy's arguments live in the service's binPath, so re-applying means re-running
+          // the installer, which stops, reconfigures, restarts and re-verifies the service.
+          zapStrategies === null || zapStrategies.length === 0
+            ? null
+            : h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '4px' } },
+                'Сохранение выбора само по себе работающую службу не перенастраивает: аргументы стратегии лежат в '
+                + 'binPath службы. Чтобы применить другой пресет, нажмите «Скачать zapret» ещё раз — установщик '
+                + 'остановит службу, перенастроит её, запустит и проверит рукопожатие. Это один запрос прав '
+                + 'администратора.'),
+          // The risk of the *selected* preset, shown while it is still only selected. Framed by
+          // what can go wrong rather than by strength: «сильнее» is the framing that produced
+          // 1.6.2, where a user picked the highest-scoring preset and lost access to the site the
+          // plugin exists to reach.
+          zapStrategySafe === null
+            ? null
+            : h('div', { style: { color: zapStrategySafe === true ? C.labelSecondary : C.warn, fontSize: '11.5px', lineHeight: 1.6, marginTop: '4px' } },
+                zapStrategySafe === true
+                  ? 'Стратегия из семейства split меняет только разбиение на сегменты: сервер собирает байт в байт '
+                    + 'тот же ClientHello, поэтому ответить TLS-alert он не может в принципе. Худший исход — фильтр '
+                    + 'не обойдён и доступ остаётся ровно таким же сломанным, каким был. Деградация в «обхода нет» '
+                    + 'приемлема, деградация в «доступа нет» — нет.'
+                  : 'Выбранная стратегия добавляет в соединение чужие байты и полагается на то, что сервер их '
+                    + 'отбросит. Только такие стратегии способны обходить фильтр, собирающий TCP-поток заново, — и '
+                    + 'только они способны сломать работающее соединение. «fake-badseq» обманывает неверным номером '
+                    + 'последовательности, а не опцией TCP timestamp, поэтому не зависит от того, учитывает ли сервер '
+                    + 'timestamps; именно этого сервер rustvy, как выяснилось, не делает. Ни один пресет здесь не '
+                    + 'заявлен как обходящий этот фильтр: окна блокировки для замера не было, а случай, когда пресет '
+                    + 'сломал работающее соединение, был. Известно лишь то, какие пресеты безопасны по устройству.'),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '6px' } },
             h(Button, {
               variant: 'primary',
@@ -4958,8 +5061,11 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
               zapBusy === 'start' ? 'Запуск…' : 'Запустить'),
             h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('stop') } },
               zapBusy === 'stop' ? 'Остановка…' : 'Остановить'),
-            h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('restart') } },
-              zapBusy === 'restart' ? 'Перезапуск…' : 'Перезапустить'),
+            // No «Перезапустить». The host's action set is install | start | stop | uninstall |
+            // status, and anything else is answered «неизвестное действие «restart»» — so the
+            // button that used to sit here always failed. A control that cannot succeed is worse
+            // than no control: it looks like the feature and reports a host error instead. Stop
+            // then start is the same thing with two answers the user can read.
             h(Button, { disabled: busy !== '' || zapBusy !== '', onClick: () => { void runZapret('uninstall') } },
               zapBusy === 'uninstall' ? 'Удаление…' : 'Удалить службу и файлы')),
           // «Внимание», not an error, and not red: this is a decision the user is entitled to make
@@ -4982,11 +5088,35 @@ body[${HIDE_FLAG}] [${ROW_FLAG}] .dsh-claude-model-combine,body[${HIDE_FLAG}] [$
                   : 'Сейчас «Скачать zapret» ничего не устанавливает: первое нажатие показывает это предупреждение '
                     + 'и просит подтверждение.'))
             : null,
+          // The install verification. `rolledBack: true` is the feature working rather than a
+          // failure to hide: the strategy broke the handshake, the service was stopped, access is
+          // back. `verified: false` with `rolledBack: false` is the genuinely bad case — the
+          // handshake broke and the stop did not take — and there the host's `reason` names the
+          // manual `sc stop dsh-rustvy-zapret`, so it is rendered verbatim instead of being
+          // paraphrased into something vaguer. `verified: null` renders nothing at all: the probe
+          // never ran because installation failed earlier, and that is not the same claim as
+          // "the probe ran and failed".
+          zapVerified === null && !zapRolledBack
+            ? null
+            : h('div', {
+                style: {
+                  color: zapRolledBack || zapVerified === false ? C.warn : C.ok,
+                  fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px',
+                },
+              }, zapRolledBack
+                ? `Откат — это сработавшая защита, а не сбой установки: стратегия сломала рукопожатие, служба остановлена, доступ восстановлен. ${zapAnswer?.reason === undefined || zapAnswer?.reason === null ? '' : String(zapAnswer.reason)}`
+                : zapVerified === true
+                  ? `Установка проверена: рукопожатие проходит (стратегия «${String(zapAnswer?.strategy ?? '—')}»).`
+                  : `Проверка после установки не прошла, и откатить не удалось. ${zapAnswer?.reason === undefined || zapAnswer?.reason === null ? '' : String(zapAnswer.reason)}`),
           zapProgress === null
             ? null
             : h('div', { style: { color: C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
                 `Скачано ${zapProgress}.`),
+          // Suppressed when the verification line above already carries it: the rollback and the
+          // failed-verification sentences quote `reason` verbatim, and printing it twice would
+          // read as two different problems rather than one.
           zapAnswer === undefined || zapAnswer.reason === undefined || zapAnswer.reason === null || zapAnswer.reason === ''
+            || zapVerified !== null || zapRolledBack
             ? null
             : h('div', { style: { color: zapAnswer.ok === false ? C.warn : C.labelSecondary, fontSize: '11.5px', lineHeight: 1.6, marginTop: '6px' } },
                 String(zapAnswer.reason)),

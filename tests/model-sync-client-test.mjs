@@ -4,7 +4,11 @@
 const results = []
 function check(label, ok, detail) {
   results.push(ok === true)
-  console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${detail === undefined ? '' : `  — ${detail}`}`)
+  // The detail prints only on FAIL. Printing it on PASS as well is the trap AGENTS.md names: the
+  // string is the caller's *failure* explanation, so a passing check read
+  // `PASS … — picker not found` and sent the reader looking for a bug that was not there. Matches
+  // `readme-zapret-test.mjs`, which has always printed details on FAIL only.
+  console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${ok === true || detail === undefined ? '' : `  — ${detail}`}`)
 }
 
 /* ------------------------------- DOM stub ------------------------------- */
@@ -3687,7 +3691,14 @@ STATE.config.tlsFragmentGlobal = false
    */
   const driveState = async (label, state, detail) => {
     ZAP_ANSWER = { ok: true, action: 'install', state, detail: detail ?? null, reason: null, progress: null }
-    findButton(render(), label).props.onClick()
+    const button = findButton(render(), label)
+    // Asserted before it is dereferenced. A missing label used to make the next line throw a
+    // TypeError, which kills the suite with a stack trace instead of naming the check that failed:
+    // everything above the throw is real evidence, everything below it never runs, and the block
+    // prints no summary. One renamed button cost the whole block that way.
+    check(`the button «${label}» exists before it is driven`, button !== undefined, 'label not found')
+    if (button === undefined) return 'кнопка не найдена'
+    button.props.onClick()
     await flush()
     return rowValue(render(), 'zapret')
   }
@@ -3702,9 +3713,9 @@ STATE.config.tlsFragmentGlobal = false
   check('installed gets no sentence of its own, because the route never emits it',
     (await driveState('Запустить', 'installed')) === 'неизвестно', 'the page invented a state the route cannot emit')
   check('unknown — a real state, answered when sc cannot be read — renders as unknown',
-    (await driveState('Перезапустить', 'unknown')) === 'неизвестно', 'collapsed')
+    (await driveState('Остановить', 'unknown')) === 'неизвестно', 'collapsed')
   check('a name this page has never heard of renders the same word, by fallback rather than by mapping',
-    (await driveState('Перезапустить', 'half-broken')) === 'неизвестно', 'an unknown state was mapped onto a known one')
+    (await driveState('Остановить', 'half-broken')) === 'неизвестно', 'an unknown state was mapped onto a known one')
   check('and «неизвестно» is a different sentence from «не скачано»',
     (await driveState('Скачать zapret', 'absent')) !== 'неизвестно', 'the two states were collapsed')
 
@@ -3712,7 +3723,7 @@ STATE.config.tlsFragmentGlobal = false
   // was read and `rustvy.xyz` is not in it, while `covered: null` means there is no hostlist and
   // nobody checked. Rendering the second as the first would report an uncovered host that was
   // never looked at, which sends the user to edit a file that does not exist.
-  await driveState('Перезапустить', 'running', {
+  await driveState('Остановить', 'running', {
     version: '1.10.4', downloaded: true, missing: [], notices: ['LICENSE.txt'],
     service: 'running', covered: true, foreignRunning: false, foreignName: null, hostlist: 'C:\\zapret\\hostlist.txt',
   })
@@ -3721,7 +3732,7 @@ STATE.config.tlsFragmentGlobal = false
   check('the notices are shown because the file is actually on disk', complete.includes('уведомления на диске: LICENSE.txt'), complete)
   check('and a covered host is said to be covered', complete.includes('rustvy.xyz в списке хостов'), complete)
 
-  await driveState('Перезапустить', 'downloaded', {
+  await driveState('Остановить', 'downloaded', {
     version: null, downloaded: false, missing: ['winws.exe', 'cygwin1.dll'], notices: [],
     service: 'absent', covered: null, foreignRunning: false, foreignName: null, hostlist: null,
   })
@@ -3732,7 +3743,7 @@ STATE.config.tlsFragmentGlobal = false
   check('and covered: null is omitted, not reported as uncovered',
     !partial.includes('НЕ в списке') && !partial.includes('в списке хостов'), partial)
 
-  await driveState('Перезапустить', 'running', {
+  await driveState('Остановить', 'running', {
     version: null, downloaded: true, missing: [], notices: [], service: 'running',
     covered: false, foreignRunning: false, foreignName: null, hostlist: 'C:\\zapret\\hostlist.txt',
   })
@@ -3756,7 +3767,7 @@ STATE.config.tlsFragmentGlobal = false
 
   // The four control actions, each its own POST body: a mis-wired button that posts `start`
   // twice would otherwise look identical on the page.
-  for (const [label, action] of [['Запустить', 'start'], ['Остановить', 'stop'], ['Перезапустить', 'restart'], ['Удалить службу и файлы', 'uninstall']]) {
+  for (const [label, action] of [['Запустить', 'start'], ['Остановить', 'stop'], ['Удалить службу и файлы', 'uninstall']]) {
     ZAP_ANSWER = { ok: true, action, state: 'running' }
     requests.length = 0
     findButton(render(), label).props.onClick()
@@ -3764,6 +3775,12 @@ STATE.config.tlsFragmentGlobal = false
     const sent = requests.find(item => item.path === '/dsh-rustvy/zapret')
     check(`«${label}» posts its own action`, sent !== undefined && sent.body === `{"action":"${action}"}`, String(sent?.body))
   }
+  // There is no restart. The host's action set is install | start | stop | uninstall | status and
+  // answers anything else «неизвестное действие» — so the button that used to sit here always
+  // failed, which is worse than no button: it looks like the feature and reports a host error. Its
+  // absence is asserted, because "we removed it" is exactly the kind of thing that comes back.
+  check('there is no restart button, because the host has no restart action',
+    findButton(render(), 'Перезапустить') === undefined, 'a button that always fails is still offered')
 
   // The conflict state, under a changed ruling: a warning with an explicit override, not a
   // refusal. The hostlists are disjoint, so the overlap is at the capture layer — both open a
@@ -3860,6 +3877,144 @@ STATE.config.tlsFragmentGlobal = false
   check('and the plugin keeps to its own copy rather than the user\'s zapret',
     copy.includes('не использует, не меняет и не предполагает zapret'), 'missing')
   ZAP_ANSWER = { ok: true, action: 'install', state: 'downloaded' }
+
+  /* ---- the strategy picker, the verification, and the rollback ------------- */
+  // Driven through an ungated button so the answer arrives without the foreign-service confirm
+  // step swallowing the press. `detail` is the host's own shape including `strategies`: the picker
+  // must be built from that list, because a second list kept in the page drifts and then offers a
+  // preset the host would silently fall back from.
+  const withStrategies = extra => ({
+    ok: true,
+    action: 'start',
+    state: 'running',
+    reason: null,
+    progress: null,
+    detail: {
+      version: '1.10.4', downloaded: true, missing: [], notices: ['LICENSE.txt'], service: 'running',
+      covered: true, foreignRunning: false, foreignName: null, hostlist: 'C:\\zapret\\hostlist.txt',
+      strategy: 'split',
+      strategies: [{ id: 'split', safe: true }, { id: 'fake-ts', safe: false }, { id: 'fake-badseq', safe: false }],
+    },
+    ...extra,
+  })
+  /**
+   * Post an ungated action and return the page text afterwards.
+   *
+   * @param answer - what the route should answer with.
+   * @returns a promise of the rendered text.
+   */
+  const drive = async answer => {
+    ZAP_ANSWER = answer
+    findButton(render(), 'Запустить').props.onClick()
+    await flush()
+    return allText(render())
+  }
+
+  STATE.config.zapretStrategy = 'split'
+  const safeText = await drive(withStrategies({ verified: true, rolledBack: false, strategy: 'split' }))
+  // Relabelled after probe P2: this proves the rendered options carry the ids, NOT that they came
+  // from the host. A hardcoded client-side list of the same three ids satisfies it — P2 confirmed
+  // it stayed green under exactly that substitution — so the source of the list is pinned by the
+  // absence case further down, and this check must not be trusted for that.
+  check('the rendered options carry every id in the list',
+    ['split', 'fake-ts', 'fake-badseq'].every(id => safeText.includes(id)), 'a preset is missing')
+  check('and it marks the safety difference the host reports rather than a strength ranking',
+    safeText.includes('безопасна по устройству') && safeText.includes('может сломать рабочее соединение')
+    && !safeText.includes('сильнее') && !safeText.includes('слабее'), 'the framing drifted back to strength')
+  check('the safe preset explains that it cannot produce an alert at all',
+    safeText.includes('байт в байт тот же ClientHello') && safeText.includes('Деградация в «обхода нет» приемлема'), 'missing')
+  check('a verified install says so, and names the strategy that was installed',
+    safeText.includes('Установка проверена') && safeText.includes('стратегия «split»'), 'missing')
+
+  STATE.config.zapretStrategy = 'fake-ts'
+  const riskText = await drive(withStrategies({ verified: true, rolledBack: false, strategy: 'fake-ts' }))
+  check('choosing a fake preset states the risk before anything is installed',
+    riskText.includes('добавляет в соединение чужие байты') && riskText.includes('способны сломать работающее соединение'), 'missing')
+  check('and it says why fake-badseq does not depend on timestamps, which is what rustvy broke on',
+    riskText.includes('неверным номером последовательности') && riskText.includes('не зависит от того, учитывает ли сервер'), 'missing')
+  check('no preset is claimed to defeat this filter',
+    riskText.includes('Ни один пресет здесь не заявлен как обходящий этот фильтр')
+    && riskText.includes('окна блокировки для замера не было'), 'an unmeasured claim of success')
+
+  // Two fixtures rather than one, because these are different states and they prove different
+  // things: a successful rollback leaves the service `stopped`, a failed rollback leaves it
+  // `running`. Collapsing them is what made the rollback case borrow the failed-rollback state, and
+  // an assertion whose label rules out a sentence its fixture never produces is the defect this
+  // release has been hunting, one level down.
+  const rolledBackText = await drive(withStrategies({
+    ok: false, state: 'stopped', verified: false, rolledBack: true, strategy: 'fake-ts',
+    reason: 'стратегия «fake-ts» сломала рукопожатие (internal_error); служба остановлена и доступ восстановлен. Попробуйте другую стратегию или оставьте «split»',
+  }))
+  check('a rollback is reported as the protection working, not as a failure',
+    rolledBackText.includes('сработавшая защита, а не сбой установки') && rolledBackText.includes('доступ восстановлен'), 'missing')
+  check('and the host reason is rendered verbatim exactly once, not twice',
+    rolledBackText.split('Попробуйте другую стратегию').length - 1 === 1,
+    String(rolledBackText.split('Попробуйте другую стратегию').length - 1))
+
+  const notRolledBack = await drive(withStrategies({
+    ok: false, state: 'running', verified: false, rolledBack: false, strategy: 'fake-ts',
+    reason: 'стратегия «fake-ts» сломала рукопожатие, и остановить службу не удалось; остановите вручную: sc stop dsh-rustvy-zapret',
+  }))
+  check('verification failing without a rollback is named as the genuinely bad case',
+    notRolledBack.includes('откатить не удалось'), 'missing')
+  check('and the manual recovery command reaches the user verbatim',
+    notRolledBack.includes('sc stop dsh-rustvy-zapret'), 'missing')
+  // The precedence ruling: `verified === false` outranks `state`, always. Two fixtures, because the
+  // two cases prove different things — and the combination a user actually fears is the second:
+  // running, handshake broken, rollback did not take. That is the row that must never say «работает».
+  ZAP_ANSWER = withStrategies({ ok: false, state: 'stopped', verified: false, rolledBack: true, strategy: 'fake-ts', reason: 'r' })
+  findButton(render(), 'Запустить').props.onClick()
+  await flush()
+  check('after a successful rollback the row leads with the rollback, not with «установлена, не запущена»',
+    rowValue(render(), 'zapret') === 'откат: доступ восстановлен', String(rowValue(render(), 'zapret')))
+  // The counterfactual the label names, asserted directly: `state: 'stopped'` on its own renders
+  // «установлена, не запущена», so without the precedence rule that is exactly what would appear.
+  check('and it does not read as a service merely waiting to be started',
+    rowValue(render(), 'zapret') !== 'установлена, не запущена', String(rowValue(render(), 'zapret')))
+  ZAP_ANSWER = withStrategies({ ok: false, state: 'running', verified: false, rolledBack: false, strategy: 'fake-ts', reason: 'r' })
+  findButton(render(), 'Запустить').props.onClick()
+  await flush()
+  check('a running service whose handshake broke reads as broken access, never as «работает»',
+    rowValue(render(), 'zapret') === 'доступ сломан стратегией', String(rowValue(render(), 'zapret')))
+  check('the selector says that saving alone does not re-apply the running service',
+    safeText.includes('само по себе работающую службу не перенастраивает')
+    && safeText.includes('нажмите «Скачать zapret» ещё раз'), 'missing')
+  check('and it names the presets in words while keeping the host id matchable against its reason',
+    safeText.includes('Разрез (split)') && safeText.includes('Обманка + метка времени (fake-ts)')
+    && safeText.includes('Обманка + неверный sequence (fake-badseq)'), 'missing')
+
+  const unverified = await drive(withStrategies({ verified: null, rolledBack: false, strategy: 'split' }))
+  check('verified:null renders nothing, because the probe never ran',
+    !unverified.includes('Установка проверена') && !unverified.includes('откатить не удалось'),
+    'a probe that never ran was reported as a result')
+
+  ZAP_ANSWER = { ok: true, action: 'start', state: 'running', reason: null, progress: null, detail: { service: 'running' } }
+  findButton(render(), 'Запустить').props.onClick()
+  await flush()
+  check('with no strategies in the answer there is no picker at all, rather than a hardcoded one',
+    !allText(render()).includes('Стратегия'), 'a picker rendered from a list the page invented')
+
+  // Strategies restored first: the case immediately above removes them on purpose, and with no
+  // `strategies` in the answer there is no picker — looking one up there would test the absence
+  // twice and report the second time as a failure. Matched on text rather than on an
+  // `<option value>` this suite has never verified `Select` emits; the label carries the id, so
+  // the text is what the user actually reads.
+  await drive(withStrategies({ verified: true, rolledBack: false, strategy: 'split' }))
+  const picker = collect(render(), 'select').find(item => allText(item).includes('fake-badseq'))
+  check('the picker is a real select over the presets the host sent', picker !== undefined, 'picker not found')
+  if (picker !== undefined) {
+    requests.length = 0
+    // `Select` renders `onChange: event => props.onChange(event.target.value)`, so the stub has to
+    // hand it an event and not a bare string — passing the value directly threw inside the client
+    // and took the suite down with it, which is the third time a lookup-or-shape mistake crashed
+    // the run instead of naming a failed check.
+    picker.props.onChange({ target: { value: 'fake-badseq' } })
+    await flush()
+    const strategyPost = requests.find(item => item.path === '/dsh-rustvy/config')
+    check('choosing a preset posts zapretStrategy and only that field',
+      strategyPost !== undefined && strategyPost.body === '{"zapretStrategy":"fake-badseq"}', String(strategyPost?.body))
+  }
+  STATE.config.zapretStrategy = 'split'
 }
 
 const failed = results.filter(ok => !ok).length
